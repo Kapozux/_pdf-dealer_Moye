@@ -241,7 +241,7 @@ function assembleResult(title, mode, pageCount, pages, startedMs) {
   const aiPages = pages.filter((page) => page.method === "ai").length;
   const provenance =
     mode === "ai"
-      ? `先在本机生成初稿，再由视觉模型精校 ${aiPages}/${pageCount} 页；未通过校验的页面自动保留本地初稿。`
+      ? `由视觉模型直接识别 ${aiPages}/${pageCount} 页；PDF 文字层作为提示与回退，识别未通过校验的页面回退文字层。`
       : mode === "fast"
         ? "直接读取 PDF 文字层，文件未上传。"
         : "使用本机 Surya 解析版面与公式，文件未上传。";
@@ -302,6 +302,8 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
     if (!settings.aiConfigured) {
       throw new Error("AI 精校尚未配置。请点击右上角“设置”，填写当前服务的 API Key。");
     }
+    // 注意：初稿现在来自文字层，大多数页会是 "good"。若仍按 review 过滤，
+    // 选了 AI 却几乎没有页面被精校，所以 aiScope=all 时一律精校。
     const targets = drafts.filter(
       (draft) =>
         settings.aiScope === "all" ||
@@ -371,7 +373,12 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
           rawMarkdown: draft.markdown,
           aiAttempted: true,
           status: "review",
-          reasons: [...draft.reasons, `AI 精校失败，已保留本地初稿：${error?.message ?? "未知错误"}`],
+          reasons: [
+            ...draft.reasons,
+            draft.markdown
+              ? `AI 识别失败，已回退 PDF 文字层：${error?.message ?? "未知错误"}`
+              : `AI 识别失败，且此页没有文字层可回退：${error?.message ?? "未知错误"}`,
+          ],
         });
       }
       onProgress(index + 1, drafts.length, `第 ${draft.page} 页精校完成`);
@@ -387,9 +394,16 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
     let pages;
     if (mode === "fast") {
       pages = await extractFastPages(pdfDoc, onProgress);
+    } else if (mode === "ai") {
+      // AI 模式直接让视觉模型读页面，**不再先跑一遍慢的 Surya**：
+      // 既然要用更强的模型，为了一份会被覆盖的初稿等上几分钟没有意义。
+      // 改用 PDF 文字层当提示 + 回退——几乎零成本，电子版 PDF 质量也够；
+      // 扫描件没有文字层时提示为空，就是纯视觉识别（本来也该如此）。
+      onProgress(0, total, "读取文字层作为提示，随后交给视觉模型");
+      const hints = await extractFastPages(pdfDoc, () => {});
+      pages = await refineWithAi(pdfPath, hints, onProgress);
     } else {
-      const drafts = await convertWithSurya(pdfPath, total, onProgress);
-      pages = mode === "ai" ? await refineWithAi(pdfPath, drafts, onProgress) : drafts;
+      pages = await convertWithSurya(pdfPath, total, onProgress);
     }
     return assembleResult(title, mode, total, pages, started);
   }

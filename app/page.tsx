@@ -35,7 +35,7 @@ const modeDescriptions: Record<ConversionMode, string> = {
   fast: "直接读取 PDF 文字层，适合普通电子文档。",
   balanced: "本机 Surya 逐页识别版面、表格与公式，速度较慢。",
   math: "本机 Surya 逐页识别版面、表格与公式。",
-  ai: "本地初稿后发送选定页面图像给视觉模型精校，公式效果最好。",
+  ai: "直接把页面图像交给视觉模型识别（不跑本地 Surya），文字层作提示与回退。",
 };
 
 const modelPresets: Record<AiProvider, { value: string; label: string }[]> = {
@@ -188,6 +188,8 @@ export default function Home() {
   const [remoteModels, setRemoteModels] = useState<{ provider: AiProvider; models: AiModelOption[] } | null>(null);
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
+  // 选好的文件先暂存，等用户按「开始转换」再提交——不再一选中就自动跑
+  const [staged, setStaged] = useState<File[]>([]);
 
   useEffect(() => () => { if (sourceUrl) URL.revokeObjectURL(sourceUrl); }, [sourceUrl]);
   useEffect(() => {
@@ -402,7 +404,18 @@ export default function Home() {
     event.preventDefault();
     setDragging(false);
     const selected = Array.from(event.dataTransfer.files);
-    if (selected.length) void processFiles(selected);
+    if (selected.length) addStaged(selected);
+  }
+
+  function addStaged(incoming: File[]) {
+    const pdfs = incoming.filter((f) => f.name.toLowerCase().endsWith(".pdf") || f.type === "application/pdf");
+    if (!pdfs.length) { setError("请选择 PDF 文件。"); setStatus("error"); return; }
+    setError("");
+    setStatus("idle");
+    setStaged((prev) => {
+      const seen = new Set(prev.map((f) => `${f.name}:${f.size}:${f.lastModified}`));
+      return [...prev, ...pdfs.filter((f) => !seen.has(`${f.name}:${f.size}:${f.lastModified}`))];
+    });
   }
 
   function reset() {
@@ -565,25 +578,49 @@ export default function Home() {
           <section className="hero">
             <div className="eyebrow">VERIFIABLE PDF CONVERTER</div>
             <h1>让 PDF 变成<br /><em>可靠的 Markdown</em></h1>
-            <p>本地识别先产出逐页初稿；需要时再让视觉模型精校公式，并保留前后结果供你核对。</p>
+            <p>选好文件再确认开始。转换在本机服务里排队执行，关掉页面也会继续。</p>
           </section>
           <section className="converter-card" aria-label="PDF 转换器">
             <button className={`dropzone ${dragging ? "is-dragging" : ""}`} type="button" onClick={() => inputRef.current?.click()} onDragEnter={() => setDragging(true)} onDragLeave={() => setDragging(false)} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
               <span className="paper-icon"><b>PDF</b><i /></span><strong>拖放一个或多个 PDF</strong><span>或点击批量选择文件</span>
-              <small>{mode === "ai" ? "AI 精校会把选定页面图像发送给你配置的模型" : "当前模式全程在本机处理"}</small>
+              <small>{mode === "ai" ? "AI 模式会把页面图像发送给你配置的模型" : "当前模式全程在本机处理"}</small>
             </button>
-            <input ref={inputRef} type="file" accept="application/pdf,.pdf" multiple hidden onChange={(event) => { const selected = Array.from(event.target.files || []); if (selected.length) void processFiles(selected); }} />
+            <input ref={inputRef} type="file" accept="application/pdf,.pdf" multiple hidden onChange={(event) => { const selected = Array.from(event.target.files || []); if (selected.length) addStaged(selected); event.target.value = ""; }} />
             <div className="profile-row" aria-label="转换模式">
               <div><span className="field-label">转换模式</span><strong>{modeNames[mode]}</strong><small>{modeDescriptions[mode]}</small></div>
               <div className="profile-options">
                 {visibleModes.map((item) => <button key={item} type="button" className={mode === item ? "active" : ""} onClick={() => { setMode(item); if (item === "ai" && !settings.aiConfigured) openSettings(); }}>{modeNames[item]}</button>)}
               </div>
             </div>
+            {staged.length > 0 && (
+              <div className="staged-panel" aria-label="待转换文件">
+                <div className="staged-head">
+                  <strong>已选 {staged.length} 份，待转换</strong>
+                  <button type="button" onClick={() => setStaged([])}>清空</button>
+                </div>
+                <ul className="staged-list">
+                  {staged.map((f) => (
+                    <li key={`${f.name}:${f.size}:${f.lastModified}`}>
+                      <span>{f.name}</span>
+                      <span className="staged-size">{formatSize(f.size)}</span>
+                      <button type="button" aria-label={`移除 ${f.name}`} onClick={() => setStaged((prev) => prev.filter((x) => x !== f))}>移除</button>
+                    </li>
+                  ))}
+                </ul>
+                <button
+                  className="primary-button staged-start"
+                  type="button"
+                  onClick={() => { const files = staged; setStaged([]); void processFiles(files); }}
+                >
+                  开始转换 · {modeNames[mode]}
+                </button>
+              </div>
+            )}
           </section>
           <section className="feature-grid" aria-label="产品特点">
-            <article><span>01</span><h2>两阶段识别</h2><p>Surya 做本地初稿，视觉模型只精校需要的页面。</p></article>
+            <article><span>01</span><h2>按需选路</h2><p>本地高精度走 Surya；选 AI 则直接交给视觉模型，不再空跑一遍本地识别。</p></article>
             <article><span>02</span><h2>结果可验证</h2><p>程序检查公式与选项是否丢失，失败时自动回退。</p></article>
-            <article><span>03</span><h2>批量队列</h2><p>一次加入多份 PDF，逐份处理并自动写入 Library。</p></article>
+            <article><span>03</span><h2>批量并发</h2><p>一次加入多份 PDF：AI 任务并发跑，本地识别按机器能力限流。</p></article>
           </section>
         </>
       ) : status === "batch" ? (

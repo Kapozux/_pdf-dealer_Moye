@@ -15,13 +15,21 @@ export class JobQueue extends EventEmitter {
    * @param {object} opts
    * @param {import('./jobstore.mjs').JobStore} opts.store
    * @param {(job: object, onProgress: Function, signal: {cancelled: boolean}) => Promise<object>} opts.run
-   * @param {number} opts.concurrency 同时跑几个任务
+   * @param {Record<string, number>} opts.concurrency 每种模式各自的并发上限
    */
-  constructor({ store, run, concurrency = 1 }) {
+  constructor({ store, run, concurrency = {} }) {
     super();
     this.store = store;
     this.run = run;
-    this.concurrency = Math.max(1, concurrency);
+    // 按模式分别限流：三种模式的瓶颈完全不同，用一个数字管所有模式，
+    // 要么把本机 CPU 打爆（Surya 开多路），要么让纯网络任务白白排队（AI）。
+    this.limits = {
+      fast: 4,       // 只读文字层，几乎不耗资源
+      balanced: 1,   // 本机 Surya，吃满 CPU/GPU
+      math: 1,
+      ai: 4,         // 主要在等远端模型；内层还有 Surya 闸兜底（见 convert 的 suryaGate）
+      ...concurrency,
+    };
     this.pending = [];        // 等待中的 job id
     this.active = new Map();  // job id → { cancelled }
   }
@@ -55,8 +63,22 @@ export class JobQueue extends EventEmitter {
     return {
       active: [...this.active.keys()],
       pending: [...this.pending],
-      concurrency: this.concurrency,
+      limits: this.limits,
+      runningByMode: this._runningByMode(),
     };
+  }
+
+  _limitFor(mode) {
+    return Math.max(1, this.limits[mode] ?? 1);
+  }
+
+  _runningByMode() {
+    const counts = {};
+    for (const id of this.active.keys()) {
+      const mode = this.store.get(id)?.mode ?? "fast";
+      counts[mode] = (counts[mode] ?? 0) + 1;
+    }
+    return counts;
   }
 
   _emitJob(jobId) {
@@ -64,11 +86,21 @@ export class JobQueue extends EventEmitter {
     if (job) this.emit("job", job);
   }
 
+  /** 按模式各自的上限调度：某个模式满了不阻塞其他模式（AI 排队时本地任务照跑）。 */
   _pump() {
-    while (this.active.size < this.concurrency && this.pending.length) {
+    const running = this._runningByMode();
+    const skipped = [];
+    while (this.pending.length) {
       const jobId = this.pending.shift();
+      const mode = this.store.get(jobId)?.mode ?? "fast";
+      if ((running[mode] ?? 0) >= this._limitFor(mode)) {
+        skipped.push(jobId);       // 这个模式满了，留在队列里等
+        continue;
+      }
+      running[mode] = (running[mode] ?? 0) + 1;
       this._start(jobId);
     }
+    this.pending = skipped.concat(this.pending);
   }
 
   async _start(jobId) {

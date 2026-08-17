@@ -700,10 +700,10 @@ export default function Home() {
         </section>
       ) : status === "processing" ? (
         <section className="processing-view" aria-live="polite">
-          <div className="processing-orbit"><span>{percent}%</span><i /></div><div className="eyebrow">{mode === "ai" ? "本地初稿 + AI 精校" : "正在本机转换"}</div>
+          <div className="processing-orbit"><span>{percent}%</span><i /></div><div className="eyebrow">{mode === "ai" ? "视觉模型识别中" : "正在本机转换"}</div>
           <h1>{activeFilename}</h1><p>{progressDetail}{progress.total ? ` · ${Math.floor(progress.page)} / ${progress.total} 页` : ""}</p>
           <div className="progress-track"><i style={{ width: `${percent}%` }} /></div>
-          <small>{mode === "ai" ? "页面图像会发送给你在设置中选择的模型；失败页面会保留本地初稿。" : "请保持页面开启，文件不会离开你的设备。"}</small>
+          <small>{mode === "ai" ? "页面图像会发送给你在设置中选择的模型；识别失败的页面回退 PDF 文字层。" : "转换在本机服务里进行，关掉页面也会继续。"}</small>
         </section>
       ) : status === "error" ? (
         <section className="error-card"><span>转换未完成</span><h1>这个 PDF 暂时没能读取</h1><p>{error}</p><div className="error-actions">{error.includes("AI 精校") && <button className="secondary-button" type="button" onClick={openSettings}>打开设置</button>}<button className="primary-button" type="button" onClick={reset}>换一个文件</button></div></section>
@@ -736,7 +736,7 @@ export default function Home() {
               <article key={page.page} className={page.status === "good" ? "good-page" : ""}><span>第 {page.page} 页</span><div><strong>{methodLabel(page)}</strong>{page.reasons.length ? page.reasons.map((reason) => <p key={reason}>{reason}</p>) : <p>程序校验通过</p>}<p>{page.formulaCount ?? 0} 个公式 · {page.optionCount ?? 0} 个选项标签</p></div><small>{page.charCount} 字符</small></article>
             ))}</div>}
             {tab === "compare" && (comparedPages.length ? <div className="compare-list">{comparedPages.map((page) => (
-              <article key={page.page}><header><strong>第 {page.page} 页</strong><span className={`method-badge ${page.method === "ai" ? "accepted" : "fallback"}`}>{page.method === "ai" ? `采用 ${page.model}` : "回退本地初稿"}</span></header><div className="compare-columns"><section><h3>最终 Markdown</h3><pre>{page.markdown}</pre></section><section><h3>Surya 本地初稿</h3><pre>{page.rawMarkdown}</pre></section></div></article>
+              <article key={page.page}><header><strong>第 {page.page} 页</strong><span className={`method-badge ${page.method === "ai" ? "accepted" : "fallback"}`}>{page.method === "ai" ? `采用 ${page.model}` : mode === "ai" ? "AI 未通过 · 回退文字层" : "回退本地初稿"}</span></header><div className="compare-columns"><section><h3>最终 Markdown</h3><pre>{page.markdown}</pre></section><section><h3>{mode === "ai" ? "PDF 文字层（提示/回退）" : "Surya 本地初稿"}</h3><pre>{page.rawMarkdown}</pre></section></div></article>
             ))}</div> : <div className="all-clear"><span>↔</span><h2>这次没有 AI 对照记录</h2><p>使用“重新 AI 精校”后，这里会保留最终结果与本地初稿。</p></div>)}
             {tab === "source" && sourceUrl && <iframe className="pdf-preview" src={sourceUrl} title="原始 PDF 预览" />}
           </div>
@@ -749,7 +749,7 @@ export default function Home() {
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSettings(false); }}>
           <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
             <header><div><span className="eyebrow">MODEL SETTINGS</span><h2 id="settings-title">AI 精校设置</h2></div><button type="button" onClick={() => setShowSettings(false)} aria-label="关闭设置">×</button></header>
-            <div className="settings-warning"><strong>隐私说明</strong><p>AI 精校时，选定页面的 JPEG 图像和本地初稿会发送给你选择的模型服务。API Key 仅保存在本项目的本机 <code>settings.local.json</code>，不会写入 Library 或浏览器页面数据。</p></div>
+            <div className="settings-warning"><strong>隐私说明</strong><p>AI 模式下，页面的 JPEG 图像和 PDF 文字层提示会发送给你选择的模型服务。API Key 仅保存在本项目的本机 <code>settings.local.json</code>，不会写入 Library 或浏览器页面数据。</p></div>
             <div className="settings-provider" role="group" aria-label="模型服务商">
               <button type="button" className={settingsDraft.provider === "gemini" ? "active" : ""} onClick={() => selectProvider("gemini")}>Google Gemini</button>
               <button type="button" className={settingsDraft.provider === "kimi" ? "active" : ""} onClick={() => selectProvider("kimi")}>Kimi</button>

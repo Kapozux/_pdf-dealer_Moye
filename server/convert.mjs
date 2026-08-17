@@ -18,6 +18,11 @@ import { readFile } from "node:fs/promises";
 
 const { document: sharedDoc, Node: DomNode } = parseHTML("<html><body></body></html>");
 
+// 一份文档内同时送多少页给模型。AI 调用是纯网络等待，串行等于把 86 页排成
+// 86 段往返。实测这把 key 12 并发零限流，取 6 留足余量（可用 MOYE_AI_PAGE_CONCURRENCY 调）。
+// 上游 postWithRetries 已对 429/5xx 退避重试，偶发限流不会丢页。
+const AI_PAGE_CONCURRENCY = Number(process.env.MOYE_AI_PAGE_CONCURRENCY) || 6;
+
 const median = (values) => {
   if (!values.length) return 12;
   const sorted = [...values].sort((a, b) => a - b);
@@ -180,6 +185,25 @@ function linesToMarkdown(items) {
   return output.join("\n\n");
 }
 
+
+/**
+ * 并发 map，**保序**。单个失败不影响其他（错误由调用方在 fn 内部处理）。
+ * 对应 Verbatim harness 的 fanout —— 页面级 AI 调用是纯网络等待，
+ * 一页一页串行等于把一份 86 页的文档排成 86 段串行网络往返。
+ */
+async function fanout(items, fn, concurrency) {
+  const results = new Array(items.length);
+  let cursor = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
+    while (cursor < items.length) {
+      const index = cursor++;
+      results[index] = await fn(items[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 async function extractFastPages(pdfDoc, onProgress) {
   const pages = [];
   for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
@@ -318,14 +342,13 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
       images = await renderer.renderPages(pdfPath, targets.map((d) => d.page));
     }
 
-    const output = [];
-    for (let index = 0; index < drafts.length; index += 1) {
-      const draft = drafts[index];
+    let finished = 0;
+    const output = await fanout(drafts, async (draft, index) => {
       if (!targets.includes(draft)) {
-        output.push(draft);
-        continue;
+        finished += 1;
+        onProgress(finished, drafts.length, `第 ${draft.page} 页跳过`);
+        return draft;
       }
-      onProgress(index, drafts.length, `第 ${draft.page} 页：视觉模型精校`);
       try {
         const imageBase64 = images[String(draft.page)];
         if (!imageBase64) throw new Error("页面图像生成失败。");
@@ -337,7 +360,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
         });
         const validation = validateAiPage(draft, refined);
         if (validation.failures.length) {
-          output.push({
+          return {
             ...draft,
             rawMarkdown: draft.markdown,
             aiAttempted: true,
@@ -345,12 +368,12 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
             reasons: [...draft.reasons, `AI 结果未通过程序校验：${validation.failures.join("；")}`],
             model: refined.model,
             provider: refined.provider,
-          });
+          };
         } else {
           const uncertain = refined.uncertain ?? [];
           const reasons = [...uncertain.map((item) => `模型标记不确定：${item}`)];
           if (refined.markdown.includes("[unclear]")) reasons.push("结果中仍有无法辨认的符号");
-          output.push({
+          return {
             page: draft.page,
             markdown: refined.markdown.trim(),
             rawMarkdown: draft.markdown,
@@ -365,10 +388,10 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
             optionCount: validation.finalOptionCount,
             uncertain,
             aiAttempted: true,
-          });
+          };
         }
       } catch (error) {
-        output.push({
+        return {
           ...draft,
           rawMarkdown: draft.markdown,
           aiAttempted: true,
@@ -379,10 +402,12 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
               ? `AI 识别失败，已回退 PDF 文字层：${error?.message ?? "未知错误"}`
               : `AI 识别失败，且此页没有文字层可回退：${error?.message ?? "未知错误"}`,
           ],
-        });
+        };
+      } finally {
+        finished += 1;
+        onProgress(finished, drafts.length, `已完成 ${finished}/${drafts.length} 页`);
       }
-      onProgress(index + 1, drafts.length, `第 ${draft.page} 页精校完成`);
-    }
+    }, AI_PAGE_CONCURRENCY);
     return output;
   }
 

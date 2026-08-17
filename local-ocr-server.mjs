@@ -90,6 +90,8 @@ function normalizeSettings(input, previous = defaultSettings) {
     // 多个 Gemini key（不同 Google 项目 = 各自独立配额）。换行或逗号分隔。
     // 单账号吞吐是硬顶（实测加并发反而更慢），加 key 是唯一能线性扩展的办法。
     geminiKeysExtra: cleanString(input.geminiKeysExtra) || previous.geminiKeysExtra || "",
+    // 这些 key 分属几个**独立 Google 项目**（同项目的 key 共用配额，加了不提速）
+    geminiProjects: Math.max(1, Number(input.geminiProjects) || Number(previous.geminiProjects) || 1),
     geminiModel: cleanString(input.geminiModel) || defaultSettings.geminiModel,
     geminiFallbackModel: cleanString(input.geminiFallbackModel) || defaultSettings.geminiFallbackModel,
     geminiBaseUrl: cleanString(input.geminiBaseUrl) || defaultSettings.geminiBaseUrl,
@@ -173,6 +175,7 @@ function publicSettings(settings) {
     aiScope: settings.aiScope,
     aiConfigured: activeConfigured,
     geminiKeyCount: geminiKeyPool(settings).length,
+    geminiProjects: Math.max(1, Number(settings.geminiProjects) || 1),
   };
 }
 
@@ -297,7 +300,7 @@ async function postWithRetries(url, options, attempts = 3) {
 
 async function callGemini(settings, imageBase64, mimeType, draft, testOnly = false) {
   if (!settings.geminiKey) throw new Error("请先在设置中填写 Gemini API Key。");
-  settings = { ...settings, __key: nextGeminiKey(settings) };   // 轮询多项目 key
+  settings = { ...settings, __key: settings.__key || nextGeminiKey(settings) };  // 指定 key 优先，否则轮询
   const models = [settings.geminiModel, settings.geminiFallbackModel].filter((model, index, values) => model && values.indexOf(model) === index);
   let lastError;
   for (const model of models) {
@@ -400,7 +403,7 @@ async function callConfiguredModel(settings, input, testOnly = false) {
 async function listConfiguredModels(settings) {
   if (settings.provider === "gemini") {
     if (!settings.geminiKey) throw new Error("请先在设置中填写 Gemini API Key。");
-  settings = { ...settings, __key: nextGeminiKey(settings) };   // 轮询多项目 key
+  settings = { ...settings, __key: settings.__key || nextGeminiKey(settings) };  // 指定 key 优先，否则轮询
     const response = await fetchWithTimeout(`${settings.geminiBaseUrl.replace(/\/$/, "")}/models`, {
       headers: { "x-goog-api-key": settings.geminiKey },
     }, 30000);
@@ -468,8 +471,15 @@ async function runSuryaOnPdf(pdfPath) {
 }
 
 const converter = createConverter({
-  // 每把 key 是独立配额，并发上限随 key 数线性放大（单把 key 最优是 6，实测过）
-  aiPageConcurrency: async () => 6 * Math.max(1, geminiKeyPool(await loadSettings()).length),
+  // 并发 = 6 × 独立项目数。注意是**项目**不是 key：Gemini 按项目计配额，
+  // 同一项目下的多把 key 共用同一份额度，加了不会更快——而实测单项目并发
+  // 超过 6 之后吞吐反而下降（0.18 → 0.11 页/s），所以不能按 key 数盲目放大。
+  // geminiProjects 由用户在设置里声明（默认 1），未声明时保持保守的 6。
+  aiPageConcurrency: async () => {
+    const st = await loadSettings();
+    const projects = Math.max(1, Number(st.geminiProjects) || 1);
+    return 6 * Math.min(projects, geminiKeyPool(st).length || 1);
+  },
   runSurya: runSuryaOnPdf,
   refinePage: async (input) => callConfiguredModel(await loadSettings(), input, false),
   loadSettings: async () => publicSettings(await loadSettings()),
@@ -528,6 +538,30 @@ const server = createServer(async (request, response) => {
       const supplied = await readJson(request, 128 * 1024);
       const stored = await loadSettings();
       const settings = normalizeSettings(supplied, stored);
+      // Gemini：逐把测所有 key。只测主 key 的话，后面几把坏了要等真跑批量才发现。
+      if (settings.provider === "gemini") {
+        const pool = geminiKeyPool(settings);
+        const keys = await Promise.all(
+          pool.map(async (key, index) => {
+            try {
+              await callConfiguredModel({ ...settings, __key: key }, {}, true);
+              return { index: index + 1, tail: key.slice(-4), ok: true };
+            } catch (error) {
+              return { index: index + 1, tail: key.slice(-4), ok: false,
+                       reason: String(error?.message ?? error).slice(0, 160) };
+            }
+          })
+        );
+        const bad = keys.filter((k) => !k.ok);
+        sendJson(response, 200, {
+          ok: bad.length === 0,
+          keys,
+          reason: bad.length
+            ? `${keys.length} 把 Key 中 ${bad.length} 把不可用：${bad.map((k) => `#${k.index}(…${k.tail})`).join("、")}`
+            : `${keys.length} 把 Key 全部可用。`,
+        });
+        return;
+      }
       const result = await callConfiguredModel(settings, {}, true);
       sendJson(response, 200, result);
       return;

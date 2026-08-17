@@ -776,10 +776,10 @@ export default function Home() {
                   <div className="keypool-head">
                     <div>
                       <span className="keypool-title">并行密钥</span>
-                      <small>单个 Google 项目的吞吐有硬上限，加并发不会更快。再加一把<b>其他项目</b>的 Key，就多一份配额。</small>
+                      <small>配额<b>按 Google 项目算，不按 Key 算</b>。同一项目下开再多 Key 也共用同一份额度，不会更快；只有<b>不同项目</b>的 Key 才能叠加。</small>
                     </div>
-                    <span className="keypool-badge" title="每把 Key 6 路并发">
-                      <b>{extraKeys.filter((k) => k.trim()).length + 1}</b> 把 · 并发 {(extraKeys.filter((k) => k.trim()).length + 1) * 6}
+                    <span className="keypool-badge" title="并发 = 6 × 独立项目数">
+                      <b>{extraKeys.filter((k) => k.trim()).length + 1}</b> 把 Key · 并发 {6 * Math.max(1, Math.min(settingsDraft.geminiProjects || 1, extraKeys.filter((k) => k.trim()).length + 1))}
                     </span>
                   </div>
                   <ol className="keypool-list">
@@ -802,7 +802,14 @@ export default function Home() {
                       </li>
                     ))}
                   </ol>
-                  <button type="button" className="keypool-add" onClick={addExtraKey}>＋ 添加一把 Key</button>
+                  <div className="keypool-foot">
+                    <button type="button" className="keypool-add" onClick={addExtraKey}>＋ 添加一把 Key</button>
+                    <label className="keypool-projects">
+                      <span>其中来自几个独立项目</span>
+                      <input type="number" min={1} max={20} value={settingsDraft.geminiProjects || 1}
+                        onChange={(event) => setSettingsDraft((v) => ({ ...v, geminiProjects: Math.max(1, Number(event.target.value) || 1) }))} />
+                    </label>
+                  </div>
                 </div>
                 <label htmlFor="gemini-model"><span>主模型</span><ModelPicker id="gemini-model" provider="gemini" value={settingsDraft.geminiModel} extra={remoteModels?.provider === "gemini" ? remoteModels.models : []} onChange={(geminiModel) => setSettingsDraft((value) => ({ ...value, geminiModel }))} /></label>
                 <label><span>失败回退模型</span><input value={settingsDraft.geminiFallbackModel} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiFallbackModel: event.target.value }))} /></label>

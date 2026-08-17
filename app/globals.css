@@ -320,3 +320,6 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
   transition: border-color .15s ease, color .15s ease, background .15s ease;
 }
 .keypool-add:hover { border-color: rgba(38, 92, 62, .5); color: #2f6a49; background: rgba(38, 92, 62, .05); }
+.keypool-foot { display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; }
+.keypool-projects { display:flex; align-items:center; gap:8px; margin-top:11px; font-size:10.5px; color:rgba(71,46,34,.6); }
+.keypool-projects input { width:56px; height:30px; padding:0 8px; border:1px solid var(--line); border-radius:7px; background:#fff; font-size:11.5px; text-align:center; }

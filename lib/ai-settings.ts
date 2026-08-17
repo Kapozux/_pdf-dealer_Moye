@@ -11,6 +11,8 @@ export type AiSettings = {
   geminiKey?: string;
   /** 额外的 Gemini key（不同项目=独立配额），换行/逗号分隔 */
   geminiKeysExtra: string;
+  /** 这些 Key 分属几个独立 Google 项目（同项目共用配额） */
+  geminiProjects: number;
   geminiModel: string;
   geminiFallbackModel: string;
   geminiBaseUrl: string;
@@ -41,6 +43,7 @@ export const defaultAiSettings: AiSettings = {
   geminiKeyMasked: "",
   geminiKey: "",
   geminiKeysExtra: "",
+  geminiProjects: 1,
   geminiModel: "gemini-2.5-flash",
   geminiFallbackModel: "gemini-flash-latest",
   geminiBaseUrl: "https://generativelanguage.googleapis.com/v1beta",

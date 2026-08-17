@@ -2,17 +2,23 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createWriteStream } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { createReadStream, createWriteStream } from "node:fs";
+import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
+import { randomUUID } from "node:crypto";
+
+import { JobStore } from "./server/jobstore.mjs";
+import { JobQueue, EventHub } from "./server/queue.mjs";
+import { createConverter } from "./server/convert.mjs";
+import { createRenderer } from "./server/render.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 const surya = resolve(root, "../.venv-marker/bin/surya_ocr");
 const jobRoot = resolve(root, "tmp/pdfs/moye-web-job-");
 const settingsPath = resolve(root, "settings.local.json");
-const port = 8765;
+const port = Number(process.env.MOYE_PORT) || 8765;
 const maxJsonBytes = 24 * 1024 * 1024;
 
 const defaultSettings = {
@@ -37,8 +43,8 @@ await mkdir(resolve(root, "tmp/pdfs"), { recursive: true });
 
 function cors(response) {
   response.setHeader("Access-Control-Allow-Origin", "http://localhost:3000");
-  response.setHeader("Access-Control-Allow-Headers", "content-type,x-filename");
-  response.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  response.setHeader("Access-Control-Allow-Headers", "content-type,x-filename,x-mode");
+  response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
 }
 
 function sendJson(response, status, payload) {
@@ -411,6 +417,56 @@ async function listConfiguredModels(settings) {
   };
 }
 
+// ===== 服务端编排：存储 + 管线 + 队列 =====
+// Surya 与 AI 调用以依赖注入方式交给管线（同进程直接调用，不再自己请求自己）。
+const jobStore = new JobStore(resolve(root, "data"));
+const events = new EventHub();
+
+async function runSuryaOnPdf(pdfPath) {
+  const work = await mkdtemp(jobRoot);
+  const output = join(work, "surya");
+  try {
+    await runSurya(pdfPath, output);
+    const resultPath = await findResult(output);
+    if (!resultPath) throw new Error("Surya 未生成 results.json。");
+    const raw = JSON.parse(await readFile(resultPath, "utf8"));
+    const pages = Object.values(raw)[0];
+    if (!Array.isArray(pages)) throw new Error("Surya 结果格式异常。");
+    return { pages };
+  } finally {
+    await rm(work, { recursive: true, force: true });
+  }
+}
+
+const converter = createConverter({
+  runSurya: runSuryaOnPdf,
+  refinePage: async (input) => callConfiguredModel(await loadSettings(), input, false),
+  loadSettings: async () => publicSettings(await loadSettings()),
+  renderer: createRenderer({ python: resolve(root, "../.venv-marker/bin/python") }),
+});
+
+const jobQueue = new JobQueue({
+  store: jobStore,
+  // 本机跑 Surya 很吃资源，默认串行；纯文字层模式很轻，用 MOYE_CONCURRENCY 可调。
+  concurrency: Number(process.env.MOYE_CONCURRENCY) || 1,
+  run: async (job, onProgress) => {
+    const pdfPath = jobStore.sourcePath(job.id);
+    const title = job.filename.replace(/\.pdf$/i, "");
+    // 「重跑精校」的任务带着上次的初稿，直接复用，不重跑 Surya
+    let previous = null;
+    try {
+      previous = JSON.parse(await readFile(join(jobStore.dir(job.id), "previous.json"), "utf8"));
+    } catch {
+      previous = null;
+    }
+    return previous
+      ? converter.refineExisting(pdfPath, title, previous, onProgress)
+      : converter.convertPdf(pdfPath, title, job.mode, onProgress);
+  },
+});
+
+jobQueue.on("job", (job) => events.broadcast("job", job));
+
 const server = createServer(async (request, response) => {
   cors(response);
   if (request.method === "OPTIONS") {
@@ -481,14 +537,112 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    // ---- 任务：提交 / 查询 / 取消 / SSE ----
+    if (request.method === "POST" && request.url?.startsWith("/api/jobs")) {
+      // HTTP header 只能带 latin-1，中文文件名必须由前端 encodeURIComponent 后再解回来，
+      // 否则「测试文档.pdf」会变成一堆乱码存进 Library。
+      const rawName = cleanString(request.headers["x-filename"], "document.pdf");
+      let filename = rawName;
+      try {
+        filename = decodeURIComponent(rawName);
+      } catch {
+        filename = rawName;
+      }
+      const mode = cleanString(request.headers["x-mode"], "fast");
+      if (!["fast", "balanced", "math", "ai"].includes(mode)) throw new Error("未知的转换模式。");
+      const id = randomUUID();
+      const job = jobStore.create({ id, filename, fileSize: 0, mode });
+      await pipeline(request, createWriteStream(jobStore.sourcePath(id)));
+      const { size } = await stat(jobStore.sourcePath(id));
+      jobStore.db.prepare("UPDATE jobs SET file_size = ? WHERE id = ?").run(size, id);
+      jobQueue.enqueue(id);
+      sendJson(response, 202, { job: { ...job, file_size: size } });
+      return;
+    }
+
+    if (request.method === "GET" && request.url === "/api/jobs") {
+      sendJson(response, 200, { jobs: jobStore.list({ limit: 200 }), queue: jobQueue.status() });
+      return;
+    }
+
+    if (request.method === "GET" && request.url === "/api/events") {
+      events.attach(request, response);
+      return;
+    }
+
+    const cancelMatch = request.url?.match(/^\/api\/jobs\/([\w-]+)\/cancel$/);
+    if (request.method === "POST" && cancelMatch) {
+      sendJson(response, 200, { cancelled: jobQueue.cancel(cancelMatch[1]) });
+      return;
+    }
+
+    // ---- Library：列表 / 结果 / 原始 PDF / 删除 ----
+    if (request.method === "GET" && request.url === "/api/library") {
+      const jobs = jobStore.list({ limit: 500 }).filter((job) => job.status === "done");
+      sendJson(response, 200, { items: jobs });
+      return;
+    }
+
+    const resultMatch = request.url?.match(/^\/api\/library\/([\w-]+)$/);
+    if (request.method === "GET" && resultMatch) {
+      const job = jobStore.get(resultMatch[1]);
+      if (!job) return sendJson(response, 404, { error: "记录不存在。" });
+      const result = await jobStore.readResult(job.id);
+      if (!result) return sendJson(response, 404, { error: "结果尚未生成。" });
+      sendJson(response, 200, { job, result });
+      return;
+    }
+
+    const pdfMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/pdf$/);
+    if (request.method === "GET" && pdfMatch) {
+      const job = jobStore.get(pdfMatch[1]);
+      if (!job) return sendJson(response, 404, { error: "记录不存在。" });
+      cors(response);
+      response.writeHead(200, {
+        "Content-Type": "application/pdf",
+        "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(job.filename)}`,
+      });
+      createReadStream(jobStore.sourcePath(job.id)).pipe(response);
+      return;
+    }
+
+    const deleteMatch = request.url?.match(/^\/api\/library\/([\w-]+)$/);
+    if (request.method === "DELETE" && deleteMatch) {
+      jobQueue.cancel(deleteMatch[1]);
+      await jobStore.delete(deleteMatch[1]);
+      sendJson(response, 200, { deleted: true });
+      return;
+    }
+
+    // 重跑 AI 精校：复用已存的本地初稿，不重新跑 Surya
+    const refineMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/refine$/);
+    if (request.method === "POST" && refineMatch) {
+      const source = jobStore.get(refineMatch[1]);
+      if (!source) return sendJson(response, 404, { error: "记录不存在。" });
+      const previous = await jobStore.readResult(source.id);
+      if (!previous) return sendJson(response, 404, { error: "没有可复用的初稿。" });
+      const id = randomUUID();
+      jobStore.create({ id, filename: source.filename, fileSize: source.file_size, mode: "ai" });
+      await copyFile(jobStore.sourcePath(source.id), jobStore.sourcePath(id));
+      await writeFile(join(jobStore.dir(id), "previous.json"), JSON.stringify(previous), "utf8");
+      jobQueue.enqueue(id);
+      sendJson(response, 202, { job: jobStore.get(id) });
+      return;
+    }
+
     sendJson(response, 404, { error: "Not found" });
   } catch (error) {
     const message = error instanceof Error ? error.message : "服务处理失败。";
-    const status = /API Key|缺少|有效的 JSON|过大/.test(message) ? 400 : 500;
+    const status = /API Key|缺少|有效的 JSON|过大|未知的转换模式/.test(message) ? 400 : 500;
     sendJson(response, status, { error: message });
   }
 });
 
-server.listen(port, "127.0.0.1", () => {
-  console.log(`Moye OCR and AI service ready at http://127.0.0.1:${port}`);
+server.listen(port, "127.0.0.1", async () => {
+  console.log(`墨页服务已就绪 http://127.0.0.1:${port}`);
+  // 重启恢复：上次没跑完的任务，源文件还在就重新排队（对齐 Verbatim 的做法）
+  const recovered = await jobStore.recover((job) => jobQueue.enqueue(job.id));
+  if (recovered.requeued || recovered.failed) {
+    console.log(`重启恢复：重新排队 ${recovered.requeued} 个，标记失败 ${recovered.failed} 个`);
+  }
 });

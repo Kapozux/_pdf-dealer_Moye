@@ -41,14 +41,23 @@ const defaultSettings = {
 
 await mkdir(resolve(root, "tmp/pdfs"), { recursive: true });
 
-function cors(response) {
-  response.setHeader("Access-Control-Allow-Origin", "http://localhost:3000");
+// 本机来源一律放行：写死 localhost:3000 时，用 127.0.0.1:3000 打开页面会被
+// 浏览器整个拦掉（Library 看起来就是空的），而两个地址都指向同一台机器。
+const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
+
+function cors(response, request) {
+  const origin = request?.headers?.origin;
+  response.setHeader(
+    "Access-Control-Allow-Origin",
+    origin && LOCAL_ORIGIN.test(origin) ? origin : "http://localhost:3000"
+  );
+  response.setHeader("Vary", "Origin");
   response.setHeader("Access-Control-Allow-Headers", "content-type,x-filename,x-mode");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
 }
 
 function sendJson(response, status, payload) {
-  cors(response);
+  // CORS 头已在请求入口按 Origin 设置好，这里不要再覆盖
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(payload));
 }
@@ -468,7 +477,7 @@ const jobQueue = new JobQueue({
 jobQueue.on("job", (job) => events.broadcast("job", job));
 
 const server = createServer(async (request, response) => {
-  cors(response);
+  cors(response, request);
   if (request.method === "OPTIONS") {
     response.writeHead(204);
     response.end();

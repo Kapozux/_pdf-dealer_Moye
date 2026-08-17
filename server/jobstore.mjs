@@ -37,7 +37,11 @@ export class JobStore {
         error        TEXT,
         created_at   TEXT NOT NULL,
         updated_at   TEXT NOT NULL,
-        finished_at  TEXT
+        finished_at  TEXT,
+        page_count   INTEGER NOT NULL DEFAULT 0,
+        review_count INTEGER NOT NULL DEFAULT 0,
+        ai_pages     INTEGER NOT NULL DEFAULT 0,
+        preview      TEXT NOT NULL DEFAULT ''
       );
       CREATE INDEX IF NOT EXISTS idx_jobs_created ON jobs(created_at DESC);
     `);
@@ -112,6 +116,22 @@ export class JobStore {
     if (typeof result?.markdown === "string") {
       await writeFile(join(this.dir(id), "document.md"), result.markdown, "utf8");
     }
+    // 摘要写进库：Library 列表只查 SQLite，不用逐份读 result.json
+    const pages = Array.isArray(result?.pages) ? result.pages : [];
+    const preview = String(result?.markdown ?? "")
+      .replace(/[#*`$|<>\\]/g, "")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 240);
+    this.db
+      .prepare("UPDATE jobs SET page_count = ?, review_count = ?, ai_pages = ?, preview = ? WHERE id = ?")
+      .run(
+        Number(result?.pageCount ?? 0),
+        pages.filter((p) => p?.status === "review").length,
+        pages.filter((p) => p?.method === "ai").length,
+        preview,
+        id
+      );
   }
 
   async readResult(id) {

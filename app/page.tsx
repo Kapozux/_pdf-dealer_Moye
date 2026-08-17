@@ -2,8 +2,11 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import { defaultAiSettings, fetchAiModels, getAiSettings, saveAiSettings, testAiSettings, type AiModelOption, type AiProvider, type AiSettings } from "../lib/ai-settings";
-import { convertPdf, refineExistingPdf, type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
-import { deleteFromLibrary, listLibrary, saveToLibrary, type LibraryRecord } from "../lib/library";
+import { type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
+import {
+  cancelJob, deleteLibraryEntry, fetchLibraryEntry, libraryPdfUrl, listJobs,
+  listLibraryItems, refineLibraryEntry, submitJob, subscribeJobs, type Job,
+} from "../lib/api";
 
 type Status = "idle" | "processing" | "batch" | "complete" | "error";
 type Screen = "converter" | "library";
@@ -11,6 +14,7 @@ type ResultTab = "markdown" | "quality" | "compare" | "source";
 type BatchItemStatus = "queued" | "processing" | "complete" | "error";
 type BatchItem = {
   id: string;
+  jobId?: string;
   file: File;
   status: BatchItemStatus;
   page: number;
@@ -110,6 +114,52 @@ function methodLabel(page: PageResult) {
   return "未识别";
 }
 
+/**
+ * 等一个服务端任务跑完。进度来自 SSE（服务端广播），
+ * 另有低频轮询兜底，避免 SSE 断连时干等。
+ */
+function waitForJob(jobId: string, onProgress: (job: Job) => void): Promise<Job> {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const finish = (job: Job) => {
+      if (settled) return;
+      settled = true;
+      unsubscribe();
+      clearInterval(poll);
+      resolve(job);
+    };
+    const handle = (job: Job) => {
+      if (job.id !== jobId) return;
+      onProgress(job);
+      if (["done", "failed", "cancelled"].includes(job.status)) finish(job);
+    };
+    const unsubscribe = subscribeJobs(handle);
+    const poll = setInterval(() => {
+      void listJobs()
+        .then((jobs) => {
+          const job = jobs.find((item) => item.id === jobId);
+          if (job) handle(job);
+        })
+        .catch(() => undefined);
+    }, 4000);
+    setTimeout(() => {
+      if (!settled) {
+        void listJobs()
+          .then((jobs) => {
+            const job = jobs.find((item) => item.id === jobId);
+            if (!job) {
+              settled = true;
+              unsubscribe();
+              clearInterval(poll);
+              reject(new Error("任务不存在或已被清除。"));
+            }
+          })
+          .catch(() => undefined);
+      }
+    }, 2000);
+  });
+}
+
 export default function Home() {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
@@ -124,7 +174,8 @@ export default function Home() {
   const [tab, setTab] = useState<ResultTab>("markdown");
   const [copied, setCopied] = useState(false);
   const [screen, setScreen] = useState<Screen>("converter");
-  const [library, setLibrary] = useState<LibraryRecord[]>([]);
+  const [library, setLibrary] = useState<Job[]>([]);
+  const [activeJobId, setActiveJobId] = useState<string>("");
   const [libraryLoading, setLibraryLoading] = useState(true);
   const [libraryError, setLibraryError] = useState("");
   const [query, setQuery] = useState("");
@@ -168,7 +219,7 @@ export default function Home() {
   async function refreshLibrary() {
     setLibraryLoading(true);
     try {
-      setLibrary(await listLibrary());
+      setLibrary(await listLibraryItems());
       setLibraryError("");
     } catch (caught) {
       setLibraryError(caught instanceof Error ? caught.message : "资料库读取失败。");
@@ -249,19 +300,21 @@ export default function Home() {
     setProgressDetail("正在读取 PDF 结构…");
     setStatus("processing");
     try {
-      const converted = await convertPdf(selected, selectedMode, (page, total, detail) => {
-        setProgress({ page, total });
-        if (detail) setProgressDetail(detail);
+      // 交给服务端跑：这里只提交 + 等结果，关掉页面任务也会继续
+      const job = await submitJob(selected, selectedMode);
+      const finished = await waitForJob(job.id, (live) => {
+        setProgress({ page: live.page, total: live.total });
+        if (live.detail) setProgressDetail(live.detail);
       });
+      if (finished.status !== "done") {
+        throw new Error(finished.error || "转换未完成。");
+      }
+      const { result: converted } = await fetchLibraryEntry(finished.id);
       setResult(converted);
+      setActiveJobId(finished.id);
       setTab(selectedMode === "ai" ? "compare" : "markdown");
       setStatus("complete");
-      try {
-        await saveToLibrary(selected, converted);
-        await refreshLibrary();
-      } catch (caught) {
-        setLibraryError(caught instanceof Error ? caught.message : "转换完成，但未能存入资料库。");
-      }
+      await refreshLibrary();
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "转换失败，请换一个 PDF 再试。";
       setError(message);
@@ -311,25 +364,35 @@ export default function Home() {
     setBatchItems(queue);
     setBatchRunning(true);
 
-    for (const item of queue) {
-      updateBatchItem(item.id, { status: "processing", detail: "正在读取 PDF 结构…" });
-      try {
-        const converted = await convertPdf(item.file, selectedMode, (page, total, detail) => {
-          updateBatchItem(item.id, { page, total, detail: detail || "正在转换…" });
-        });
-        await saveToLibrary(item.file, converted);
-        updateBatchItem(item.id, {
-          status: "complete",
-          page: converted.pageCount,
-          total: converted.pageCount,
-          detail: `已完成并存入 Library · ${converted.pageCount} 页`,
-          result: converted,
-        });
-      } catch (caught) {
-        const message = caught instanceof Error ? caught.message : "转换失败。";
-        updateBatchItem(item.id, { status: "error", detail: "处理失败，队列将继续", error: message });
-      }
-    }
+    // 整批一次性提交给服务端；排队和并发由服务端统一控制，
+    // 浏览器只负责显示进度（关掉页面这批也会继续跑完）。
+    await Promise.all(
+      queue.map(async (item) => {
+        try {
+          const job = await submitJob(item.file, selectedMode);
+          updateBatchItem(item.id, { jobId: job.id, status: "processing", detail: "已提交，等待服务端处理…" });
+          const finished = await waitForJob(job.id, (live) => {
+            updateBatchItem(item.id, {
+              page: live.page,
+              total: live.total,
+              detail: live.detail || "正在转换…",
+              status: live.status === "queued" ? "queued" : "processing",
+            });
+          });
+          if (finished.status !== "done") throw new Error(finished.error || "转换未完成。");
+          updateBatchItem(item.id, {
+            status: "complete",
+            jobId: finished.id,
+            page: finished.total,
+            total: finished.total,
+            detail: `已完成并存入 Library · ${finished.total} 页`,
+          });
+        } catch (caught) {
+          const message = caught instanceof Error ? caught.message : "转换失败。";
+          updateBatchItem(item.id, { status: "error", detail: "处理失败，其余文件继续", error: message });
+        }
+      })
+    );
 
     setBatchRunning(false);
     await refreshLibrary();
@@ -381,23 +444,28 @@ export default function Home() {
     void refreshLibrary();
   }
 
-  function openRecord(record: LibraryRecord) {
-    if (sourceUrl) URL.revokeObjectURL(sourceUrl);
-    const restoredFile = new File([record.pdf], record.filename, { type: "application/pdf", lastModified: record.lastModified });
-    setFile(restoredFile);
-    setActiveFilename(record.filename);
-    setSourceUrl(URL.createObjectURL(record.pdf));
-    setMode(record.result.mode);
-    setResult(record.result);
-    setTab("markdown");
-    setStatus("complete");
-    setScreen("converter");
+  async function openRecord(record: Job) {
+    try {
+      const { result: stored } = await fetchLibraryEntry(record.id);
+      if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+      setFile(null);
+      setActiveJobId(record.id);
+      setActiveFilename(record.filename);
+      setSourceUrl(libraryPdfUrl(record.id));   // 原始 PDF 由服务端提供
+      setMode(stored.mode);
+      setResult(stored);
+      setTab("markdown");
+      setStatus("complete");
+      setScreen("converter");
+    } catch (caught) {
+      setLibraryError(caught instanceof Error ? caught.message : "无法打开这条记录。");
+    }
   }
 
-  async function removeRecord(record: LibraryRecord) {
+  async function removeRecord(record: Job) {
     if (!window.confirm(`从本机资料库删除“${record.filename}”？此操作无法撤销。`)) return;
     try {
-      await deleteFromLibrary(record.id);
+      await deleteLibraryEntry(record.id);
       setLibrary((items) => items.filter((item) => item.id !== record.id));
       setLibraryError("");
     } catch (caught) {
@@ -413,21 +481,24 @@ export default function Home() {
   }
 
   async function rerunAiRefinement() {
-    if (!file || !result) return;
+    if (!activeJobId || !result) return;
     setMode("ai");
     setStatus("processing");
     setError("");
     setProgress({ page: 0, total: result.pageCount });
     setProgressDetail("正在复用 Library 中的本地初稿…");
     try {
-      const refined = await refineExistingPdf(file, result, (page, total, detail) => {
-        setProgress({ page, total });
-        if (detail) setProgressDetail(detail);
+      const job = await refineLibraryEntry(activeJobId);
+      const finished = await waitForJob(job.id, (live) => {
+        setProgress({ page: live.page, total: live.total });
+        if (live.detail) setProgressDetail(live.detail);
       });
+      if (finished.status !== "done") throw new Error(finished.error || "AI 精校未完成。");
+      const { result: refined } = await fetchLibraryEntry(finished.id);
       setResult(refined);
+      setActiveJobId(finished.id);
       setTab("compare");
       setStatus("complete");
-      await saveToLibrary(file, refined);
       await refreshLibrary();
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "AI 精校失败。";
@@ -459,7 +530,7 @@ export default function Home() {
           </header>
           <div className="library-toolbar">
             <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名…" aria-label="搜索资料库" /></label>
-            <div><strong>{library.length}</strong> 份文件 · <strong>{library.reduce((sum, item) => sum + item.result.pageCount, 0)}</strong> 页</div>
+            <div><strong>{library.length}</strong> 份文件 · <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> 页</div>
           </div>
           {libraryError && <div className="library-notice" role="status">{libraryError}</div>}
           {libraryLoading ? (
@@ -467,17 +538,17 @@ export default function Home() {
           ) : filteredLibrary.length ? (
             <div className="library-grid">
               {filteredLibrary.map((record) => {
-                const needsReview = record.result.pages.filter((page) => page.status === "review").length;
-                const aiPages = record.result.pages.filter((page) => page.method === "ai").length;
-                const preview = record.result.markdown.replace(/[#*`$|<>\\]/g, "").replace(/\s+/g, " ").trim();
+                const needsReview = record.review_count;
+                const aiPages = record.ai_pages;
+                const preview = record.preview;
                 return (
                   <article className="library-card" key={record.id}>
                     <button className="library-open" type="button" onClick={() => openRecord(record)} aria-label={`打开 ${record.filename}`}>
                       <span className="library-file-icon">MD<i>PDF</i></span>
-                      <span className="library-card-body"><span className="library-card-meta">{formatDate(record.updatedAt)}</span><strong>{record.filename}</strong><span className="library-card-preview">{preview || "没有可预览的文字"}</span></span>
+                      <span className="library-card-body"><span className="library-card-meta">{formatDate(new Date(record.updated_at).getTime())}</span><strong>{record.filename}</strong><span className="library-card-preview">{preview || "没有可预览的文字"}</span></span>
                     </button>
                     <div className="library-card-footer">
-                      <span>{record.result.pageCount} 页</span><span>{formatSize(record.fileSize)}</span><span>{aiPages ? `${aiPages} 页 AI 精校` : modeNames[record.result.mode] || "旧版转换"}</span>
+                      <span>{record.page_count} 页</span><span>{formatSize(record.file_size)}</span><span>{aiPages ? `${aiPages} 页 AI 精校` : modeNames[record.mode] || "旧版转换"}</span>
                       <span className={needsReview ? "review-count" : ""}>{needsReview ? `${needsReview} 页待检查` : "检查通过"}</span>
                       <button type="button" onClick={() => void removeRecord(record)} aria-label={`删除 ${record.filename}`}>删除</button>
                     </div>

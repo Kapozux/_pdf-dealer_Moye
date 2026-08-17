@@ -32,7 +32,7 @@ test("ships local extraction, a persistent library, bundled workers, Surya, AI r
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../lib/pdf-to-markdown.ts", import.meta.url), "utf8"),
     readFile(new URL("../lib/ai-settings.ts", import.meta.url), "utf8"),
-    readFile(new URL("../lib/library.ts", import.meta.url), "utf8"),
+    readFile(new URL("../server/convert.mjs", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
     readFile(new URL("../local-ocr-server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../start.command", import.meta.url), "utf8"),
@@ -51,31 +51,24 @@ test("ships local extraction, a persistent library, bundled workers, Surya, AI r
   assert.match(page, /qwen-vl-ocr/);
   assert.match(page, /从服务商同步模型/);
   assert.match(page, /ModelPicker/);
-  assert.match(page, /refineExistingPdf/);
+  assert.match(page, /refineLibraryEntry/);
   assert.match(page, /原始 PDF/);
   assert.match(page, /你的分析资料库/);
-  assert.match(page, /saveToLibrary/);
+  assert.match(page, /submitJob/);
+  assert.match(page, /subscribeJobs/);   // 进度来自服务端 SSE，不是本地 state
   assert.match(page, /async function processFiles/);
   assert.match(page, /status === "batch"/);
   assert.match(page, /下载合并 \.md/);
   assert.match(page, /单个文件失败不会中断后续文件/);
   assert.match(page, /openRecord/);
-  assert.match(library, /indexedDB\.open/);
-  assert.match(library, /pdf: file\.slice/);
-  assert.match(library, /result: ConversionResult/);
-  assert.match(converter, /pdfjs-dist/);
-  assert.match(converter, /GlobalWorkerOptions\.workerSrc = "\/pdf\.worker\.min\.mjs"/);
-  assert.doesNotMatch(converter, /workerSrc\s*=\s*new URL/);
-  assert.match(converter, /\/api\/surya/);
-  assert.match(converter, /\/api\/ai-refine/);
-  assert.match(converter, /validateAiPage/);
-  assert.match(converter, /export async function refineExistingPdf/);
+  // 转换在服务端跑：管线、AI 校验回退、公式保护都应在 server/convert.mjs
+  assert.match(library, /export function createConverter/);
+  assert.match(library, /validateAiPage/);
+  assert.match(library, /公式区块已识别，但转换为 Markdown 时丢失/);
+  // lib/pdf-to-markdown.ts 现在只剩前后端共用的类型，实现已在服务端
+  assert.match(converter, /export type ConversionResult/);
   assert.match(converter, /rawMarkdown/);
-  assert.match(converter, /method: markdown \? "surya"/);
-  assert.match(converter, /node\.nodeType !== Node\.ELEMENT_NODE/);
-  assert.doesNotMatch(converter, /node instanceof HTMLElement/);
-  assert.match(converter, /block\.label === "Equation"/);
-  assert.match(converter, /公式区块已识别，但转换为 Markdown 时丢失/);
+  assert.doesNotMatch(converter, /convertPdf|GlobalWorkerOptions/);
   assert.match(settings, /\/api\/settings\/test/);
   assert.match(settings, /\/api\/models/);
   assert.match(settings, /"kimi"/);

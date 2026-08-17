@@ -190,6 +190,15 @@ export default function Home() {
   const [batchRunning, setBatchRunning] = useState(false);
   // 选好的文件先暂存，等用户按「开始转换」再提交——不再一选中就自动跑
   const [staged, setStaged] = useState<File[]>([]);
+  // 并行密钥：界面上按行编辑，保存时再拼回换行分隔的字符串
+  // 并行密钥列表用独立 state：从字符串来回推导会把空行吃掉
+  //（[""].join("\n") === ""，于是刚加的空行立刻消失，点「添加」像没反应）。
+  // 只在保存时把非空项拼回 geminiKeysExtra。
+  const [extraKeys, setExtraKeys] = useState<string[]>([]);
+  const updateExtraKey = (index: number, next: string) =>
+    setExtraKeys((keys) => keys.map((k, i) => (i === index ? next : k)));
+  const addExtraKey = () => setExtraKeys((keys) => [...keys, ""]);
+  const removeExtraKey = (index: number) => setExtraKeys((keys) => keys.filter((_, i) => i !== index));
   // 服务端正在跑/排队的任务：任务不在浏览器里跑，所以重开页面必须能看到它们
   const [activeJobs, setActiveJobs] = useState<Job[]>([]);
 
@@ -248,6 +257,7 @@ export default function Home() {
 
   function openSettings() {
     setSettingsDraft({ ...settings, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
+    setExtraKeys((settings.geminiKeysExtra || "").split("\n").filter((k) => k.trim()));
     setSettingsStatus("");
     setShowSettings(true);
   }
@@ -262,7 +272,10 @@ export default function Home() {
     setSettingsBusy(true);
     setSettingsStatus("正在保存…");
     try {
-      const saved = await saveAiSettings(settingsDraft);
+      const saved = await saveAiSettings({
+        ...settingsDraft,
+        geminiKeysExtra: extraKeys.map((k) => k.trim()).filter(Boolean).join("\n"),
+      });
       setSettings(saved);
       setSettingsDraft({ ...saved, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
       setSettingsStatus("已保存到本机。密钥不会出现在网页数据或 Library 中。");
@@ -759,7 +772,38 @@ export default function Home() {
             {settingsDraft.provider === "gemini" ? (
               <div className="settings-fields">
                 <label><span>Gemini API Key</span><input type="password" value={settingsDraft.geminiKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiKey: event.target.value }))} placeholder={settingsDraft.geminiKeyMasked || "AIza…"} /><small>{settingsDraft.geminiConfigured ? `已配置 ${settingsDraft.geminiKeyMasked}；留空则保留原值` : "尚未配置"}</small></label>
-                <label><span>额外 Gemini Key（提速）</span><textarea rows={3} value={settingsDraft.geminiKeysExtra || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiKeysExtra: event.target.value }))} placeholder={"每行一个，来自不同的 Google 项目\nAIza…\nAIza…"} /><small>单个项目的吞吐是硬上限（实测再加并发反而更慢）。<b>不同项目的 key 各有独立配额</b>，每加一把并发上限翻一倍。当前可用 {settings.geminiKeyCount ?? 1} 把。</small></label>
+                <div className="keypool">
+                  <div className="keypool-head">
+                    <div>
+                      <span className="keypool-title">并行密钥</span>
+                      <small>单个 Google 项目的吞吐有硬上限，加并发不会更快。再加一把<b>其他项目</b>的 Key，就多一份配额。</small>
+                    </div>
+                    <span className="keypool-badge" title="每把 Key 6 路并发">
+                      <b>{extraKeys.filter((k) => k.trim()).length + 1}</b> 把 · 并发 {(extraKeys.filter((k) => k.trim()).length + 1) * 6}
+                    </span>
+                  </div>
+                  <ol className="keypool-list">
+                    <li className="keypool-row is-primary">
+                      <span className="keypool-index">1</span>
+                      <code>{settingsDraft.geminiKeyMasked || "上方主 Key"}</code>
+                      <span className="keypool-tag">主</span>
+                    </li>
+                    {extraKeys.map((key, i) => (
+                      <li className="keypool-row" key={i}>
+                        <span className="keypool-index">{i + 2}</span>
+                        <input
+                          type="password"
+                          value={key}
+                          spellCheck={false}
+                          placeholder="AIza… （另一个 Google 项目的 Key）"
+                          onChange={(event) => updateExtraKey(i, event.target.value)}
+                        />
+                        <button type="button" className="keypool-remove" aria-label={`移除第 ${i + 2} 把 Key`} onClick={() => removeExtraKey(i)}>✕</button>
+                      </li>
+                    ))}
+                  </ol>
+                  <button type="button" className="keypool-add" onClick={addExtraKey}>＋ 添加一把 Key</button>
+                </div>
                 <label htmlFor="gemini-model"><span>主模型</span><ModelPicker id="gemini-model" provider="gemini" value={settingsDraft.geminiModel} extra={remoteModels?.provider === "gemini" ? remoteModels.models : []} onChange={(geminiModel) => setSettingsDraft((value) => ({ ...value, geminiModel }))} /></label>
                 <label><span>失败回退模型</span><input value={settingsDraft.geminiFallbackModel} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiFallbackModel: event.target.value }))} /></label>
                 <label className="wide"><span>API Base URL</span><input value={settingsDraft.geminiBaseUrl} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiBaseUrl: event.target.value }))} /></label>

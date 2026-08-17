@@ -135,8 +135,28 @@ function geminiKeyPool(settings) {
 }
 
 let geminiKeyCursor = 0;
-function nextGeminiKey(settings) {
+// 认证失败（401/403/"API key not valid"）的 key 拉黑，之后不再轮到它——
+// 否则一把废 key 会按比例吃掉转换请求，表现为「部分页面莫名失败」。
+const geminiDeadKeys = new Set();
+
+function liveGeminiKeys(settings) {
   const pool = geminiKeyPool(settings);
+  const live = pool.filter((k) => !geminiDeadKeys.has(k));
+  return live.length ? live : pool;   // 全挂了就还用原池，让错误如实抛出
+}
+
+function markGeminiKeyDead(key, message) {
+  if (!key) return;
+  if (/API key not valid|API_KEY_INVALID|permission|unauthor/i.test(String(message))) {
+    if (!geminiDeadKeys.has(key)) {
+      geminiDeadKeys.add(key);
+      console.warn(`Gemini key …${key.slice(-4)} 认证失败，已从轮询中移除：${String(message).slice(0, 90)}`);
+    }
+  }
+}
+
+function nextGeminiKey(settings) {
+  const pool = liveGeminiKeys(settings);
   if (!pool.length) return "";
   return pool[geminiKeyCursor++ % pool.length];
 }
@@ -175,6 +195,7 @@ function publicSettings(settings) {
     aiScope: settings.aiScope,
     aiConfigured: activeConfigured,
     geminiKeyCount: geminiKeyPool(settings).length,
+    geminiKeysLive: liveGeminiKeys(settings).length,
     geminiProjects: Math.max(1, Number(settings.geminiProjects) || 1),
   };
 }
@@ -288,6 +309,7 @@ async function postWithRetries(url, options, attempts = 3) {
         try { return JSON.parse(text)?.error?.message || JSON.parse(text)?.error || text; } catch { return text; }
       })();
       const error = new Error(`模型请求失败（${response.status}）：${String(message).slice(0, 500)}`);
+      if (options?.headers?.["x-goog-api-key"]) markGeminiKeyDead(options.headers["x-goog-api-key"], message);
       if (response.status < 500 && response.status !== 429) throw error;
       lastError = error;
     } catch (error) {
@@ -478,7 +500,9 @@ const converter = createConverter({
   aiPageConcurrency: async () => {
     const st = await loadSettings();
     const projects = Math.max(1, Number(st.geminiProjects) || 1);
-    return 6 * Math.min(projects, geminiKeyPool(st).length || 1);
+    // 取「声明的项目数」和「当前还能用的 key 数」的小者：
+    // 有 key 失效时并发要跟着降，否则等于拿更高并发去挤更少的配额。
+    return 6 * Math.max(1, Math.min(projects, liveGeminiKeys(st).length || 1));
   },
   runSurya: runSuryaOnPdf,
   refinePage: async (input) => callConfiguredModel(await loadSettings(), input, false),

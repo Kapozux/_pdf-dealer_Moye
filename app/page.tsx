@@ -190,8 +190,24 @@ export default function Home() {
   const [batchRunning, setBatchRunning] = useState(false);
   // 选好的文件先暂存，等用户按「开始转换」再提交——不再一选中就自动跑
   const [staged, setStaged] = useState<File[]>([]);
+  // 服务端正在跑/排队的任务：任务不在浏览器里跑，所以重开页面必须能看到它们
+  const [activeJobs, setActiveJobs] = useState<Job[]>([]);
 
   useEffect(() => () => { if (sourceUrl) URL.revokeObjectURL(sourceUrl); }, [sourceUrl]);
+  // 开页拉一次 + 订阅 SSE：关掉页面再回来，也能看到还在跑的任务
+  useEffect(() => {
+    const isLive = (j: Job) => j.status === "queued" || j.status === "running";
+    void listJobs().then((jobs) => setActiveJobs(jobs.filter(isLive))).catch(() => undefined);
+    const unsubscribe = subscribeJobs((job) => {
+      setActiveJobs((prev) => {
+        const rest = prev.filter((j) => j.id !== job.id);
+        return isLive(job) ? [...rest, job] : rest;
+      });
+      if (!isLive(job)) void refreshLibrary();
+    });
+    return unsubscribe;
+  }, []);
+
   useEffect(() => {
     void refreshLibrary();
     void getAiSettings().then((loaded) => {
@@ -592,6 +608,25 @@ export default function Home() {
                 {visibleModes.map((item) => <button key={item} type="button" className={mode === item ? "active" : ""} onClick={() => { setMode(item); if (item === "ai" && !settings.aiConfigured) openSettings(); }}>{modeNames[item]}</button>)}
               </div>
             </div>
+            {activeJobs.length > 0 && (
+              <div className="active-panel" aria-label="正在进行的任务">
+                <div className="staged-head">
+                  <strong>服务端进行中 · {activeJobs.length}</strong>
+                  <span className="staged-size">关掉页面也会继续跑</span>
+                </div>
+                <ul className="staged-list">
+                  {activeJobs.map((j) => (
+                    <li key={j.id}>
+                      <span>{j.filename}</span>
+                      <span className="staged-size">
+                        {j.status === "queued" ? "排队中" : j.total ? `${j.page}/${j.total} 页` : "处理中"}
+                      </span>
+                      <button type="button" onClick={() => void cancelJob(j.id)}>取消</button>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )}
             {staged.length > 0 && (
               <div className="staged-panel" aria-label="待转换文件">
                 <div className="staged-head">

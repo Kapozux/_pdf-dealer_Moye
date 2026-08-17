@@ -248,3 +248,9 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 }
 .staged-list li button:hover { opacity: 1; text-decoration: underline; }
 .staged-start { width: 100%; }
+
+/* 服务端进行中的任务：任务不在浏览器里跑，重开页面也要看得见 */
+.active-panel {
+  margin-top: 18px; border: 1px solid rgba(0, 0, 0, 0.12); border-radius: 14px;
+  padding: 14px 16px; background: rgba(255, 236, 200, 0.35);
+}

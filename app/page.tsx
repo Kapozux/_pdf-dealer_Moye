@@ -776,7 +776,7 @@ export default function Home() {
                   <div className="keypool-head">
                     <div>
                       <span className="keypool-title">并行密钥</span>
-                      <small>配额<b>按 Google 项目算，不按 Key 算</b>。同一项目下开再多 Key 也共用同一份额度，不会更快；只有<b>不同项目</b>的 Key 才能叠加。</small>
+                      <small>实测：同一 Google <b>账号</b>下的 Key（哪怕分属不同项目）共用同一份吞吐，加了不会更快；<b>换一个 Google 账号</b>的 Key 才是独立配额——实测两个账号并行提速 <b>3.3 倍</b>。</small>
                     </div>
                     <span className="keypool-badge" title="并发 = 6 × 独立项目数">
                       <b>{extraKeys.filter((k) => k.trim()).length + 1}</b> 把 Key · 并发 {6 * Math.max(1, Math.min(settingsDraft.geminiProjects || 1, extraKeys.filter((k) => k.trim()).length + 1))}
@@ -805,7 +805,7 @@ export default function Home() {
                   <div className="keypool-foot">
                     <button type="button" className="keypool-add" onClick={addExtraKey}>＋ 添加一把 Key</button>
                     <label className="keypool-projects">
-                      <span>其中来自几个独立项目</span>
+                      <span>其中来自几个独立账号</span>
                       <input type="number" min={1} max={20} value={settingsDraft.geminiProjects || 1}
                         onChange={(event) => setSettingsDraft((v) => ({ ...v, geminiProjects: Math.max(1, Number(event.target.value) || 1) }))} />
                     </label>

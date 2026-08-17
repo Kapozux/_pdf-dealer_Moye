@@ -303,7 +303,13 @@ function assembleResult(title, mode, pageCount, pages, startedMs) {
  * @param {() => Promise<object>} deps.loadSettings
  * @param {{renderPages: Function}} deps.renderer
  */
-export function createConverter({ runSurya, refinePage, loadSettings, renderer }) {
+export function createConverter({ runSurya, refinePage, loadSettings, renderer, aiPageConcurrency }) {
+  // 并发上限：可传函数（按 key 数动态算），否则用默认值
+  async function pageConcurrency() {
+    if (typeof aiPageConcurrency === "function") return Math.max(1, await aiPageConcurrency());
+    return Math.max(1, aiPageConcurrency || AI_PAGE_CONCURRENCY);
+  }
+
   async function openPdf(pdfPath) {
     const data = new Uint8Array(await readFile(pdfPath));
     return getDocument({ data, useSystemFonts: true, isEvalSupported: false }).promise;
@@ -407,7 +413,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer }
         finished += 1;
         onProgress(finished, drafts.length, `已完成 ${finished}/${drafts.length} 页`);
       }
-    }, AI_PAGE_CONCURRENCY);
+    }, await pageConcurrency());
     return output;
   }
 

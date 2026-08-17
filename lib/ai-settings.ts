@@ -9,6 +9,8 @@ export type AiSettings = {
   geminiConfigured: boolean;
   geminiKeyMasked: string;
   geminiKey?: string;
+  /** 额外的 Gemini key（不同项目=独立配额），换行/逗号分隔 */
+  geminiKeysExtra: string;
   geminiModel: string;
   geminiFallbackModel: string;
   geminiBaseUrl: string;
@@ -29,6 +31,8 @@ export type AiSettings = {
   openrouterBaseUrl: string;
   aiScope: AiScope;
   aiConfigured: boolean;
+  /** 可用的 Gemini key 数量（每把=独立配额，并发按此放大） */
+  geminiKeyCount?: number;
 };
 
 export const defaultAiSettings: AiSettings = {
@@ -36,6 +40,7 @@ export const defaultAiSettings: AiSettings = {
   geminiConfigured: false,
   geminiKeyMasked: "",
   geminiKey: "",
+  geminiKeysExtra: "",
   geminiModel: "gemini-2.5-flash",
   geminiFallbackModel: "gemini-flash-latest",
   geminiBaseUrl: "https://generativelanguage.googleapis.com/v1beta",

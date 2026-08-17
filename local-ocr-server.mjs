@@ -87,6 +87,9 @@ function normalizeSettings(input, previous = defaultSettings) {
   return {
     provider,
     geminiKey: cleanString(input.geminiKey) || previous.geminiKey || "",
+    // 多个 Gemini key（不同 Google 项目 = 各自独立配额）。换行或逗号分隔。
+    // 单账号吞吐是硬顶（实测加并发反而更慢），加 key 是唯一能线性扩展的办法。
+    geminiKeysExtra: cleanString(input.geminiKeysExtra) || previous.geminiKeysExtra || "",
     geminiModel: cleanString(input.geminiModel) || defaultSettings.geminiModel,
     geminiFallbackModel: cleanString(input.geminiFallbackModel) || defaultSettings.geminiFallbackModel,
     geminiBaseUrl: cleanString(input.geminiBaseUrl) || defaultSettings.geminiBaseUrl,
@@ -122,6 +125,20 @@ async function saveSettings(input) {
   return settings;
 }
 
+/** 所有可用的 Gemini key：主 key + 额外 key（各自是独立项目、独立配额）。 */
+function geminiKeyPool(settings) {
+  return [settings.geminiKey, ...String(settings.geminiKeysExtra || "").split(/[\n,]+/)]
+    .map((k) => (k || "").trim())
+    .filter(Boolean);
+}
+
+let geminiKeyCursor = 0;
+function nextGeminiKey(settings) {
+  const pool = geminiKeyPool(settings);
+  if (!pool.length) return "";
+  return pool[geminiKeyCursor++ % pool.length];
+}
+
 function maskedKey(value) {
   if (!value) return "";
   return `••••••••${value.slice(-4)}`;
@@ -155,6 +172,7 @@ function publicSettings(settings) {
     openrouterBaseUrl: settings.openrouterBaseUrl,
     aiScope: settings.aiScope,
     aiConfigured: activeConfigured,
+    geminiKeyCount: geminiKeyPool(settings).length,
   };
 }
 
@@ -279,6 +297,7 @@ async function postWithRetries(url, options, attempts = 3) {
 
 async function callGemini(settings, imageBase64, mimeType, draft, testOnly = false) {
   if (!settings.geminiKey) throw new Error("请先在设置中填写 Gemini API Key。");
+  settings = { ...settings, __key: nextGeminiKey(settings) };   // 轮询多项目 key
   const models = [settings.geminiModel, settings.geminiFallbackModel].filter((model, index, values) => model && values.indexOf(model) === index);
   let lastError;
   for (const model of models) {
@@ -292,7 +311,7 @@ async function callGemini(settings, imageBase64, mimeType, draft, testOnly = fal
           ];
       const payload = await postWithRetries(url, {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": settings.geminiKey },
+        headers: { "Content-Type": "application/json", "x-goog-api-key": settings.__key || settings.geminiKey },
         body: JSON.stringify({
           contents: [{ role: "user", parts }],
           generationConfig: {
@@ -381,6 +400,7 @@ async function callConfiguredModel(settings, input, testOnly = false) {
 async function listConfiguredModels(settings) {
   if (settings.provider === "gemini") {
     if (!settings.geminiKey) throw new Error("请先在设置中填写 Gemini API Key。");
+  settings = { ...settings, __key: nextGeminiKey(settings) };   // 轮询多项目 key
     const response = await fetchWithTimeout(`${settings.geminiBaseUrl.replace(/\/$/, "")}/models`, {
       headers: { "x-goog-api-key": settings.geminiKey },
     }, 30000);
@@ -448,6 +468,8 @@ async function runSuryaOnPdf(pdfPath) {
 }
 
 const converter = createConverter({
+  // 每把 key 是独立配额，并发上限随 key 数线性放大（单把 key 最优是 6，实测过）
+  aiPageConcurrency: async () => 6 * Math.max(1, geminiKeyPool(await loadSettings()).length),
   runSurya: runSuryaOnPdf,
   refinePage: async (input) => callConfiguredModel(await loadSettings(), input, false),
   loadSettings: async () => publicSettings(await loadSettings()),

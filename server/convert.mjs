@@ -187,6 +187,67 @@ function linesToMarkdown(items) {
 
 
 /**
+ * 全局 AI 调用闸（可调容量）。
+ *
+ * fanout 的并发是**每份文档**的，而队列同时会跑好几个 AI 任务：
+ * 4 个任务 × 每个 64 路 = 256 路同时在飞，实测那个量级 60% 的请求会吃 429。
+ * 真正该限制的是「此刻打向模型的请求总数」，所以闸放在模块级，所有任务共用一份，
+ * 跟 queue.mjs 里 job 级并发用全局信号量是同一个道理。
+ */
+const aiGate = {
+  limit: 6,
+  inFlight: 0,
+  waiters: [],
+  setLimit(next) {
+    this.limit = Math.max(1, next);
+    this._drain();
+  },
+  _drain() {
+    while (this.inFlight < this.limit && this.waiters.length) {
+      this.inFlight += 1;
+      this.waiters.shift()();
+    }
+  },
+  async run(fn) {
+    if (this.inFlight >= this.limit) await new Promise((r) => this.waiters.push(r));
+    else this.inFlight += 1;
+    try {
+      return await fn();
+    } finally {
+      this.inFlight -= 1;
+      this._drain();
+    }
+  },
+};
+
+/**
+ * 渲染闸。每份文档渲染页面都要 spawn 一个 Python 进程（pypdfium2）。
+ *
+ * 这里的数字曾经设成 4，结果它自己成了瓶颈：38 份文档同时跑时有 22 份卡在
+ * 「正在生成图像」，AI 那边反而闲着。实测证明这个担心是多余的——单次渲染
+ * 72–79ms，8 路并发**总共** 94ms（几乎完全并行，spawn 开销可以忽略）。
+ * 所以闸的作用只剩下防止极端情况下几百个 Python 进程同时存在，放宽到 16。
+ */
+const renderGate = {
+  limit: Math.max(1, Number(process.env.MOYE_RENDER_CONCURRENCY) || 16),
+  inFlight: 0,
+  waiters: [],
+  async run(fn) {
+    if (this.inFlight >= this.limit) await new Promise((r) => this.waiters.push(r));
+    else this.inFlight += 1;
+    try {
+      return await fn();
+    } finally {
+      this.inFlight -= 1;
+      if (this.waiters.length && this.inFlight < this.limit) {
+        this.inFlight += 1;
+        this.waiters.shift()();
+      }
+    }
+  },
+};
+
+/**
  * 并发 map，**保序**。单个失败不影响其他（错误由调用方在 fn 内部处理）。
  * 对应 Verbatim harness 的 fanout —— 页面级 AI 调用是纯网络等待，
  * 一页一页串行等于把一份 86 页的文档排成 86 段串行网络往返。
@@ -304,10 +365,14 @@ function assembleResult(title, mode, pageCount, pages, startedMs) {
  * @param {{renderPages: Function}} deps.renderer
  */
 export function createConverter({ runSurya, refinePage, loadSettings, renderer, aiPageConcurrency }) {
-  // 并发上限：可传函数（按 key 数动态算），否则用默认值
+  // 并发上限：可传函数（按供应商 / key 数动态算），否则用默认值。
+  // 每次解析完都同步给全局闸——用户在设置里换了供应商，下一份文档就按新上限跑。
   async function pageConcurrency() {
-    if (typeof aiPageConcurrency === "function") return Math.max(1, await aiPageConcurrency());
-    return Math.max(1, aiPageConcurrency || AI_PAGE_CONCURRENCY);
+    const limit = typeof aiPageConcurrency === "function"
+      ? Math.max(1, await aiPageConcurrency())
+      : Math.max(1, aiPageConcurrency || AI_PAGE_CONCURRENCY);
+    aiGate.setLimit(limit);
+    return limit;
   }
 
   async function openPdf(pdfPath) {
@@ -327,98 +392,155 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
     return pages.map((page, index) => renderSuryaPage(page, index + 1));
   }
 
-  async function refineWithAi(pdfPath, drafts, onProgress) {
-    const settings = await loadSettings();
-    if (!settings.aiConfigured) {
-      throw new Error("AI 精校尚未配置。请点击右上角“设置”，填写当前服务的 API Key。");
-    }
-    // 注意：初稿现在来自文字层，大多数页会是 "good"。若仍按 review 过滤，
-    // 选了 AI 却几乎没有页面被精校，所以 aiScope=all 时一律精校。
-    const targets = drafts.filter(
-      (draft) =>
-        settings.aiScope === "all" ||
-        draft.status === "review" ||
-        (draft.formulaCount ?? 0) > 0 ||
-        (draft.optionCount ?? 0) > 0
-    );
-    // 需要的页一次性渲染，省掉逐页起 Python 进程
-    let images = {};
-    if (targets.length) {
-      onProgress(0, drafts.length, `正在为 ${targets.length} 页生成图像`);
-      images = await renderer.renderPages(pdfPath, targets.map((d) => d.page));
-    }
-
-    let finished = 0;
-    const output = await fanout(drafts, async (draft, index) => {
-      if (!targets.includes(draft)) {
-        finished += 1;
-        onProgress(finished, drafts.length, `第 ${draft.page} 页跳过`);
-        return draft;
-      }
-      try {
-        const imageBase64 = images[String(draft.page)];
-        if (!imageBase64) throw new Error("页面图像生成失败。");
-        const refined = await refinePage({
-          page: draft.page,
-          draft: draft.markdown,
-          imageBase64,
-          mimeType: "image/jpeg",
-        });
-        const validation = validateAiPage(draft, refined);
-        if (validation.failures.length) {
-          return {
-            ...draft,
-            rawMarkdown: draft.markdown,
-            aiAttempted: true,
-            status: "review",
-            reasons: [...draft.reasons, `AI 结果未通过程序校验：${validation.failures.join("；")}`],
-            model: refined.model,
-            provider: refined.provider,
-          };
-        } else {
-          const uncertain = refined.uncertain ?? [];
-          const reasons = [...uncertain.map((item) => `模型标记不确定：${item}`)];
-          if (refined.markdown.includes("[unclear]")) reasons.push("结果中仍有无法辨认的符号");
-          return {
-            page: draft.page,
-            markdown: refined.markdown.trim(),
-            rawMarkdown: draft.markdown,
-            charCount: visibleLength(refined.markdown),
-            lineCount: refined.markdown.trim().split(/\n+/).length,
-            method: "ai",
-            status: reasons.length ? "review" : "good",
-            reasons,
-            model: refined.model,
-            provider: refined.provider,
-            formulaCount: validation.finalFormulaCount,
-            optionCount: validation.finalOptionCount,
-            uncertain,
-            aiAttempted: true,
-          };
-        }
-      } catch (error) {
+  /** 单页精校。AI 调用失败时返回带 aiFailed 标记的回退结果，供补救轮识别。 */
+  async function refineOne(draft, images, rescue = false) {
+    try {
+      const imageBase64 = images[String(draft.page)];
+      if (!imageBase64) throw new Error("页面图像生成失败。");
+      // 过全局闸：并发上限约束的是「所有任务合计在飞的请求数」，不是单份文档的
+      const refined = await aiGate.run(() => refinePage({
+        page: draft.page,
+        draft: draft.markdown,
+        imageBase64,
+        mimeType: "image/jpeg",
+        rescue,   // 补救轮：只试一次、超时更短，失败就痛快回退
+      }));
+      const validation = validateAiPage(draft, refined);
+      if (validation.failures.length) {
         return {
           ...draft,
           rawMarkdown: draft.markdown,
           aiAttempted: true,
           status: "review",
-          reasons: [
-            ...draft.reasons,
-            draft.markdown
-              ? `AI 识别失败，已回退 PDF 文字层：${error?.message ?? "未知错误"}`
-              : `AI 识别失败，且此页没有文字层可回退：${error?.message ?? "未知错误"}`,
-          ],
+          reasons: [...draft.reasons, `AI 结果未通过程序校验：${validation.failures.join("；")}`],
+          model: refined.model,
+          provider: refined.provider,
         };
-      } finally {
-        finished += 1;
-        onProgress(finished, drafts.length, `已完成 ${finished}/${drafts.length} 页`);
       }
-    }, await pageConcurrency());
+      const uncertain = refined.uncertain ?? [];
+      const reasons = [...uncertain.map((item) => `模型标记不确定：${item}`)];
+      if (refined.markdown.includes("[unclear]")) reasons.push("结果中仍有无法辨认的符号");
+      return {
+        page: draft.page,
+        markdown: refined.markdown.trim(),
+        rawMarkdown: draft.markdown,
+        charCount: visibleLength(refined.markdown),
+        lineCount: refined.markdown.trim().split(/\n+/).length,
+        method: "ai",
+        status: reasons.length ? "review" : "good",
+        reasons,
+        model: refined.model,
+        provider: refined.provider,
+        formulaCount: validation.finalFormulaCount,
+        optionCount: validation.finalOptionCount,
+        uncertain,
+        aiAttempted: true,
+      };
+    } catch (error) {
+      // 以前这里静默吞掉：AI 失败只体现为「某页回退了文字层」，日志里一个字都没有，
+      // 排查时只能靠猜。失败原因是唯一能区分「超时 / 限流 / 认证 / 格式」的线索。
+      console.warn(`[AI失败] 第 ${draft.page} 页：${String(error?.message ?? error).slice(0, 160)}`);
+      return {
+        ...draft,
+        rawMarkdown: draft.markdown,
+        aiAttempted: true,
+        aiFailed: true, // 补救轮的筛选标记，成功产出前必须清掉
+        status: "review",
+        reasons: [
+          ...draft.reasons,
+          draft.markdown
+            ? `AI 识别失败，已回退 PDF 文字层：${error?.message ?? "未知错误"}`
+            : `AI 识别失败，且此页没有文字层可回退：${error?.message ?? "未知错误"}`,
+        ],
+      };
+    }
+  }
+
+  async function refineWithAi(pdfPath, drafts, onProgress, checkpoint = null) {
+    const settings = await loadSettings();
+    if (!settings.aiConfigured) {
+      throw new Error("AI 精校尚未配置。请点击右上角“设置”，填写当前服务的 API Key。");
+    }
+    // 重启续跑：已经存档的页直接拿来用，不重新调模型也不重新渲染
+    const finishedPages = checkpoint ? await checkpoint.load() : new Map();
+    if (finishedPages.size) {
+      onProgress(finishedPages.size, drafts.length, `续跑：已有 ${finishedPages.size} 页存档，跳过`);
+    }
+    // 注意：初稿现在来自文字层，大多数页会是 "good"。若仍按 review 过滤，
+    // 选了 AI 却几乎没有页面被精校，所以 aiScope=all 时一律精校。
+    const targets = drafts.filter(
+      (draft) =>
+        !finishedPages.has(draft.page) &&
+        (settings.aiScope === "all" ||
+          draft.status === "review" ||
+          (draft.formulaCount ?? 0) > 0 ||
+          (draft.optionCount ?? 0) > 0)
+    );
+    // 需要的页一次性渲染，省掉逐页起 Python 进程
+    let images = {};
+    if (targets.length) {
+      onProgress(0, drafts.length, `正在为 ${targets.length} 页生成图像`);
+      images = await renderGate.run(() => renderer.renderPages(pdfPath, targets.map((d) => d.page)));
+    }
+
+    let finished = 0;
+    const concurrency = await pageConcurrency();
+    const output = await fanout(drafts, async (draft) => {
+      // 存档命中：这一页上次已经跑完了，直接用，省掉一次模型调用
+      const archived = finishedPages.get(draft.page);
+      if (archived) {
+        finished += 1;
+        onProgress(finished, drafts.length, `第 ${draft.page} 页（存档）`);
+        return archived;
+      }
+      if (!targets.includes(draft)) {
+        finished += 1;
+        onProgress(finished, drafts.length, `第 ${draft.page} 页跳过`);
+        return draft;
+      }
+      const result = await refineOne(draft, images);
+      // 每页一落盘：下次重启从这里续，而不是整份重来
+      if (checkpoint) await checkpoint.save(draft.page, result).catch(() => undefined);
+      finished += 1;
+      onProgress(finished, drafts.length, `已完成 ${finished}/${drafts.length} 页`);
+      return result;
+    }, concurrency);
+
+    // 补救轮：把「AI 调用本身失败」的页低压力重跑一遍。
+    //
+    // 高并发下失败几乎都是长尾超时，而超时后的重试是在**同一批请求还压着上游**时
+    // 发出的，等于撞进同一个堵住的队列，三次机会经常一起废掉。实测 92 页 / 64 并发
+    // 那轮就是这样：最后 9 页全部 90s 超时，直接降级成纯文字层（占 11%）。
+    // 等主轮跑完、压力归零之后再用低并发补几页，几乎不影响总时长，却能把这批救回来。
+    const casualtyIndexes = output.map((page, index) => (page.aiFailed ? index : -1)).filter((i) => i >= 0);
+    if (casualtyIndexes.length) {
+      console.warn(`[补救] ${casualtyIndexes.length}/${drafts.length} 页主轮失败，开始重试`);
+      // 补救轮并发。这里曾经写死上限 4，理由是「等压力归零再低并发补几页」——
+      // 那是按「同时只有一份文档在补救」设想的。实测 15 份大文档并行时有 7 份同时
+      // 进入补救，每份只跑 4 路，在途请求塌到 8 条，而全局 aiGate 有 84 的余量在闲着。
+      // 总量本来就由 aiGate 兜底，这里再压一层只会饿死自己。
+      const rescueConcurrency = Math.max(4, Math.floor(concurrency / 4));
+      onProgress(finished, drafts.length, `补救 ${casualtyIndexes.length} 页失败的识别`);
+      const rescued = await fanout(
+        casualtyIndexes,
+        (index) => refineOne(drafts[index], images, true),
+        rescueConcurrency
+      );
+      // JSONL 是追加写，同一页后写的那行会在 load() 时覆盖先写的——
+      // 所以补救成功的结果必须再存一次，否则续跑会读回主轮那个失败版本。
+      for (const [i, index] of casualtyIndexes.entries()) {
+        if (rescued[i] && !rescued[i].aiFailed) {
+          output[index] = rescued[i];
+          if (checkpoint) await checkpoint.save(drafts[index].page, rescued[i]).catch(() => undefined);
+        }
+      }
+    }
+    for (const page of output) delete page.aiFailed;
     return output;
   }
 
   /** 一份 PDF → ConversionResult。onProgress(page, total, detail) */
-  async function convertPdf(pdfPath, title, mode, onProgress = () => {}) {
+  async function convertPdf(pdfPath, title, mode, onProgress = () => {}, checkpoint = null) {
     const started = performance.now();
     const pdfDoc = await openPdf(pdfPath);
     const total = pdfDoc.numPages;
@@ -432,7 +554,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
       // 扫描件没有文字层时提示为空，就是纯视觉识别（本来也该如此）。
       onProgress(0, total, "读取文字层作为提示，随后交给视觉模型");
       const hints = await extractFastPages(pdfDoc, () => {});
-      pages = await refineWithAi(pdfPath, hints, onProgress);
+      pages = await refineWithAi(pdfPath, hints, onProgress, checkpoint);
     } else {
       pages = await convertWithSurya(pdfPath, total, onProgress);
     }
@@ -440,7 +562,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
   }
 
   /** 复用 Library 里已有的本地初稿，只重跑 AI 精校。 */
-  async function refineExisting(pdfPath, title, previous, onProgress = () => {}) {
+  async function refineExisting(pdfPath, title, previous, onProgress = () => {}, checkpoint = null) {
     const started = performance.now();
     const pdfDoc = await openPdf(pdfPath);
     if (pdfDoc.numPages !== previous.pageCount) {
@@ -462,7 +584,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
         lineCount: markdown ? markdown.split(/\n+/).length : 0,
       };
     });
-    const pages = await refineWithAi(pdfPath, drafts, onProgress);
+    const pages = await refineWithAi(pdfPath, drafts, onProgress, checkpoint);
     return assembleResult(title, "ai", pdfDoc.numPages, pages, started);
   }
 
@@ -470,3 +592,17 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
 }
 
 export const __test__ = { suryaHtmlToMarkdown, linesToMarkdown, validateAiPage, countFormulas, countOptions };
+
+/**
+ * 两个闸的实时状态，给 /api/debug 用。
+ *
+ * 加这个是因为排查时只能从进程外数 TCP 连接来猜「到底有多少请求在飞」，
+ * 而那个数字既不准（连接复用、keep-alive 残留）又看不出请求卡在哪一层，
+ * 结果反复得出错误结论。闸内部的 inFlight/waiters 才是真相。
+ */
+export function gateStats() {
+  return {
+    ai: { limit: aiGate.limit, inFlight: aiGate.inFlight, waiting: aiGate.waiters.length },
+    render: { limit: renderGate.limit, inFlight: renderGate.inFlight, waiting: renderGate.waiters.length },
+  };
+}

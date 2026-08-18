@@ -15,20 +15,34 @@ export class JobQueue extends EventEmitter {
    * @param {object} opts
    * @param {import('./jobstore.mjs').JobStore} opts.store
    * @param {(job: object, onProgress: Function, signal: {cancelled: boolean}) => Promise<object>} opts.run
-   * @param {Record<string, number>} opts.concurrency 每种模式各自的并发上限
+   * @param {Record<string, number>|number} opts.concurrency 每种模式各自的上限；
+   *        传数字只覆盖本机模式（balanced/math），AI 不跟着变——见下面 ai 的说明。
    */
   constructor({ store, run, concurrency = {} }) {
     super();
     this.store = store;
     this.run = run;
+    // 传数字时只当作「本机识别的并发」：以前这里直接 ...concurrency 展开，
+    // 而展开一个数字得到的是 {}（`{...1}` === `{}`），所以 MOYE_CONCURRENCY
+    // 一直被静默忽略，改它毫无效果。
+    const overrides =
+      typeof concurrency === "number" ? { balanced: concurrency, math: concurrency } : concurrency;
     // 按模式分别限流：三种模式的瓶颈完全不同，用一个数字管所有模式，
     // 要么把本机 CPU 打爆（Surya 开多路），要么让纯网络任务白白排队（AI）。
     this.limits = {
       fast: 4,       // 只读文字层，几乎不耗资源
       balanced: 1,   // 本机 Surya，吃满 CPU/GPU
       math: 1,
-      ai: 4,         // 主要在等远端模型；内层还有 Surya 闸兜底（见 convert 的 suryaGate）
-      ...concurrency,
+      // AI 模式真正的闸是 convert.mjs 里的全局 aiGate，它限的是「此刻打向模型的
+      // 请求总数」；这里限的只是「同时有几份文档在跑」。要的效果是**页级填满**：
+      // 文档只是页的来源，aiGate 没满就该继续拉更多文档的页进来。
+      // 所以这个数字必须远大于「够用」——它不是并发上限，只是喂料口的宽度。
+      // 实测 65 份平均 1.8 页的试卷：ai=4 时在途请求只有 ~7 条，喂不满 aiGate。
+      // 按压测后的权重，aiGate 上限是 84（gemini 12 + qwen 8 + openrouter 64），
+      // 84 ÷ 1.8 ≈ 47 份才能填满，取 48 留余量。
+      // 天花板始终由 aiGate 兜着，这里放大只是把料喂到闸口，不会多打请求出去。
+      ai: Number(process.env.MOYE_AI_JOB_CONCURRENCY) || 48,
+      ...overrides,
     };
     this.pending = [];        // 等待中的 job id
     this.active = new Map();  // job id → { cancelled }
@@ -131,6 +145,9 @@ export class JobQueue extends EventEmitter {
         this.store.update(jobId, { status: "cancelled", detail: "已取消" });
       } else {
         await this.store.saveResult(jobId, result);
+        // 结果已完整落盘，逐页存档没用了——留着会占磁盘，
+        // 而且这份任务若被「重新精校」复用，旧页会盖掉新结果。
+        await this.store.checkpoint?.(jobId).clear().catch(() => undefined);
         this.store.update(jobId, {
           status: "done",
           detail: "完成",

@@ -5,7 +5,8 @@ import { defaultAiSettings, fetchAiModels, getAiSettings, saveAiSettings, testAi
 import { type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
 import {
   cancelJob, deleteLibraryEntry, fetchLibraryEntry, libraryPdfUrl, listJobs,
-  listLibraryItems, refineLibraryEntry, submitJob, subscribeJobs, type Job,
+  exportZipUrl, listBatches, listLibraryItems, refineLibraryEntry, submitJob, subscribeJobs,
+  type Batch, type Job,
 } from "../lib/api";
 
 type Status = "idle" | "processing" | "batch" | "complete" | "error";
@@ -22,6 +23,9 @@ type BatchItem = {
   detail: string;
   result?: ConversionResult;
   error?: string;
+  /** 提交时刻 / 结束时刻，用来算实时耗时 */
+  startedAt?: number;
+  finishedAt?: number;
 };
 
 const modeNames: Record<ConversionMode, string> = {
@@ -36,6 +40,13 @@ const modeDescriptions: Record<ConversionMode, string> = {
   balanced: "本机 Surya 逐页识别版面、表格与公式，速度较慢。",
   math: "本机 Surya 逐页识别版面、表格与公式。",
   ai: "直接把页面图像交给视觉模型识别（不跑本地 Surya），文字层作提示与回退。",
+};
+
+const providerNames: Record<AiProvider, string> = {
+  gemini: "Gemini",
+  kimi: "Kimi",
+  qwen: "Qwen",
+  openrouter: "OpenRouter",
 };
 
 const modelPresets: Record<AiProvider, { value: string; label: string }[]> = {
@@ -59,8 +70,17 @@ const modelPresets: Record<AiProvider, { value: string; label: string }[]> = {
     { value: "qwen-vl-ocr", label: "Qwen VL OCR · 文档/表格/试卷/手写" },
     { value: "qwen-vl-ocr-latest", label: "Qwen VL OCR Latest" },
   ],
+  // 实测排序（同一份数学 PDF、64 路并发、关闭推理）：
+  //   kimi-k2.6      1.9 页/s  $0.0028/页  LaTeX 71 ← 公式最全，理科文档首选
+  //   qwen3.7-flash  4.2 页/s  $0.00013/页 LaTeX 36 ← 快一倍、便宜 20 倍，公式会掉
+  //   glm-5v-turbo   1.8 页/s  $0.0055/页  LaTeX 64 ← 与 kimi 同速但贵一倍
+  // gemini-2.5-flash 留着但不推荐：它和直连 Gemini 抢同一个 Google 配额池，
+  // 绕道 OpenRouter 不会更快，只会多付一层加价。
   openrouter: [
-    { value: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash" },
+    { value: "moonshotai/kimi-k2.6", label: "Kimi K2.6 · 数学/理科推荐 · 公式最全" },
+    { value: "qwen/qwen3.7-flash", label: "Qwen3.7 Flash · 纯文字推荐 · 最快最便宜" },
+    { value: "z-ai/glm-5v-turbo", label: "GLM-5V Turbo · 备选" },
+    { value: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash · 与直连同配额，不建议" },
     { value: "qwen/qwen2.5-vl-72b-instruct", label: "Qwen 2.5 VL 72B" },
   ],
 };
@@ -94,6 +114,15 @@ function download(content: string, filename: string, type: string) {
 function formatSize(bytes: number) {
   if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** 把毫秒变成「1 分 04 秒」这种好读的形式。 */
+function formatElapsed(ms: number) {
+  const total = Math.max(0, Math.round(ms / 1000));
+  if (total < 60) return `${total} 秒`;
+  const minutes = Math.floor(total / 60);
+  if (minutes < 60) return `${minutes} 分 ${String(total % 60).padStart(2, "0")} 秒`;
+  return `${Math.floor(minutes / 60)} 时 ${String(minutes % 60).padStart(2, "0")} 分`;
 }
 
 function formatDate(timestamp: number) {
@@ -175,6 +204,7 @@ export default function Home() {
   const [copied, setCopied] = useState(false);
   const [screen, setScreen] = useState<Screen>("converter");
   const [library, setLibrary] = useState<Job[]>([]);
+  const [batches, setBatches] = useState<Batch[]>([]);
   const [activeJobId, setActiveJobId] = useState<string>("");
   const [libraryLoading, setLibraryLoading] = useState(true);
   const [libraryError, setLibraryError] = useState("");
@@ -190,31 +220,75 @@ export default function Home() {
   const [batchRunning, setBatchRunning] = useState(false);
   // 选好的文件先暂存，等用户按「开始转换」再提交——不再一选中就自动跑
   const [staged, setStaged] = useState<File[]>([]);
-  // 并行密钥：界面上按行编辑，保存时再拼回换行分隔的字符串
-  // 并行密钥列表用独立 state：从字符串来回推导会把空行吃掉
-  //（[""].join("\n") === ""，于是刚加的空行立刻消失，点「添加」像没反应）。
-  // 只在保存时把非空项拼回 geminiKeysExtra。
-  const [extraKeys, setExtraKeys] = useState<string[]>([]);
+  /**
+   * 并行密钥列表。每项要么是「已存在的」（只有打码文本，明文在服务端），
+   * 要么是「新填的」（有明文）。以前这里只存明文字符串，而服务端从不回传
+   * 明文，所以列表永远是空的——用户以为没存上，重新添加就把旧的覆盖了。
+   */
+  type KeyRow = { masked: string | null; value: string };
+  const [extraKeys, setExtraKeys] = useState<KeyRow[]>([]);
   const updateExtraKey = (index: number, next: string) =>
-    setExtraKeys((keys) => keys.map((k, i) => (i === index ? next : k)));
-  const addExtraKey = () => setExtraKeys((keys) => [...keys, ""]);
+    setExtraKeys((keys) => keys.map((k, i) => (i === index ? { ...k, value: next } : k)));
+  const addExtraKey = () => setExtraKeys((keys) => [...keys, { masked: null, value: "" }]);
   const removeExtraKey = (index: number) => setExtraKeys((keys) => keys.filter((_, i) => i !== index));
   // 服务端正在跑/排队的任务：任务不在浏览器里跑，所以重开页面必须能看到它们
   const [activeJobs, setActiveJobs] = useState<Job[]>([]);
+  // 每秒走一次的时钟，只在有任务在跑时开着——耗时要实时跳，但空闲时不该白转
+  const [now, setNow] = useState(() => Date.now());
+  // 从哪个界面点进结果页的，决定「返回」回到哪
+  const [cameFrom, setCameFrom] = useState<Screen | "batch" | null>(null);
+  // 本次转换的开始时刻，用来显示总计时（单份和批量共用）
+  const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [runEndedAt, setRunEndedAt] = useState<number | null>(null);
 
   useEffect(() => () => { if (sourceUrl) URL.revokeObjectURL(sourceUrl); }, [sourceUrl]);
+  // 计时器只在真的有东西在跑时才转；跑完（runEndedAt 有值）立刻停，避免空转重渲染
+  useEffect(() => {
+    const live = activeJobs.length > 0 || batchRunning || status === "processing"
+      || (runStartedAt !== null && runEndedAt === null && status === "batch");
+    if (!live) return;
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [activeJobs.length, batchRunning, status, runStartedAt, runEndedAt]);
   // 开页拉一次 + 订阅 SSE：关掉页面再回来，也能看到还在跑的任务
+  /**
+   * 订阅服务端任务进度。
+   *
+   * SSE 每条进度都直接 setState 会把页面卡死：服务端对每个任务节流到 300ms，
+   * 但十几个任务同时跑就是每秒几十次全页重渲染。这里先攒进 ref，每 500ms
+   * 统一刷一次界面——进度条本来也不需要比这更快。
+   * 同理，任务完成时不立刻拉整个 Library，攒到同一次刷新里做。
+   */
   useEffect(() => {
     const isLive = (j: Job) => j.status === "queued" || j.status === "running";
     void listJobs().then((jobs) => setActiveJobs(jobs.filter(isLive))).catch(() => undefined);
+
+    const pending = new Map<string, Job>();
+    let libraryDirty = false;
     const unsubscribe = subscribeJobs((job) => {
-      setActiveJobs((prev) => {
-        const rest = prev.filter((j) => j.id !== job.id);
-        return isLive(job) ? [...rest, job] : rest;
-      });
-      if (!isLive(job)) void refreshLibrary();
+      pending.set(job.id, job);
+      if (!isLive(job)) libraryDirty = true;
     });
-    return unsubscribe;
+    const flush = setInterval(() => {
+      if (pending.size) {
+        const batch = [...pending.values()];
+        pending.clear();
+        setActiveJobs((prev) => {
+          const byId = new Map(prev.map((j) => [j.id, j]));
+          for (const job of batch) {
+            if (isLive(job)) byId.set(job.id, job);
+            else byId.delete(job.id);
+          }
+          return [...byId.values()];
+        });
+      }
+      if (libraryDirty) {
+        libraryDirty = false;
+        void refreshLibrary();
+      }
+    }, 500);
+
+    return () => { unsubscribe(); clearInterval(flush); };
   }, []);
 
   useEffect(() => {
@@ -228,13 +302,46 @@ export default function Home() {
   const reviewPages = useMemo(() => result?.pages.filter((page) => page.status === "review") ?? [], [result]);
   const comparedPages = useMemo(() => result?.pages.filter((page) => page.rawMarkdown !== undefined) ?? [], [result]);
   const aiWasUsed = mode === "ai" || result?.pages.some((page) => page.method === "ai" || page.aiAttempted);
+  // 哪些渠道已经有 Key（多渠道分流时实际参与的就是这几家）。
+  // 用已保存的 settings 而不是 draft：draft 里的 Key 输入框是空的（留空=保留原值）。
+  const configuredProviders = useMemo(
+    () => (["gemini", "kimi", "qwen", "openrouter"] as AiProvider[]).filter(
+      (p) => settings[`${p}Configured` as const]
+    ),
+    [settings]
+  );
   const percent = progress.total ? Math.round((progress.page / progress.total) * 100) : 0;
   const filteredLibrary = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
     return normalized ? library.filter((item) => item.filename.toLocaleLowerCase().includes(normalized)) : library;
   }, [library, query]);
+  /**
+   * 按合集分组显示：一次批量转换是一组（可整包下 zip），单独转的归到「单独转换」。
+   * 分组基于筛选后的结果，搜索时合集里只留匹配的那几份，空组不显示。
+   */
+  const librarySections = useMemo(() => {
+    const byBatch = new Map<string, Job[]>();
+    const loose: Job[] = [];
+    for (const item of filteredLibrary) {
+      if (!item.batch_id) loose.push(item);
+      else byBatch.set(item.batch_id, [...(byBatch.get(item.batch_id) ?? []), item]);
+    }
+    const sections = batches
+      .filter((batch) => byBatch.has(batch.id))
+      .map((batch) => ({ batch, items: byBatch.get(batch.id)! }));
+    return { sections, loose };
+  }, [filteredLibrary, batches]);
   const batchCompleted = batchItems.filter((item) => item.status === "complete").length;
   const batchFailed = batchItems.filter((item) => item.status === "error").length;
+  // 页数统计：总页数要等各份读出 total 才有，未知的按 0 算（显示成 "?" 更诚实）
+  const batchTotalPages = batchItems.reduce((sum, item) => sum + (item.total || 0), 0);
+  const batchDonePages = batchItems.reduce((sum, item) => sum + (item.page || 0), 0);
+  const batchPagesUnknown = batchItems.some((item) => !item.total && item.status !== "error");
+  // 计时：跑完后定格在结束时刻，不再继续走
+  const runElapsed = runStartedAt ? (runEndedAt ?? now) - runStartedAt : 0;
+  const pagesPerMin = runElapsed > 3000 && batchDonePages
+    ? (batchDonePages / (runElapsed / 60000))
+    : 0;
   const batchFinished = batchCompleted + batchFailed;
   const batchPercent = batchItems.length
     ? Math.round(batchItems.reduce((sum, item) => {
@@ -246,7 +353,9 @@ export default function Home() {
   async function refreshLibrary() {
     setLibraryLoading(true);
     try {
-      setLibrary(await listLibraryItems());
+      const [items, groups] = await Promise.all([listLibraryItems(), listBatches()]);
+      setLibrary(items);
+      setBatches(groups);
       setLibraryError("");
     } catch (caught) {
       setLibraryError(caught instanceof Error ? caught.message : "资料库读取失败。");
@@ -257,7 +366,8 @@ export default function Home() {
 
   function openSettings() {
     setSettingsDraft({ ...settings, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
-    setExtraKeys((settings.geminiKeysExtra || "").split("\n").filter((k) => k.trim()));
+    // 已存的 key 以打码行呈现，明文留在服务端；保存时用 __KEEP__ 占位
+    setExtraKeys((settings.geminiKeysExtraMasked ?? []).map((masked) => ({ masked, value: "" })));
     setSettingsStatus("");
     setShowSettings(true);
   }
@@ -274,7 +384,10 @@ export default function Home() {
     try {
       const saved = await saveAiSettings({
         ...settingsDraft,
-        geminiKeysExtra: extraKeys.map((k) => k.trim()).filter(Boolean).join("\n"),
+        // 已存在且未改动的传占位符（服务端沿用原值），新填的传明文，空行丢弃
+        geminiKeysExtra: extraKeys
+          .map((k) => (k.value.trim() ? k.value.trim() : k.masked ? "__KEEP__" : ""))
+          .filter(Boolean),
       });
       setSettings(saved);
       setSettingsDraft({ ...saved, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
@@ -330,6 +443,8 @@ export default function Home() {
     setProgress({ page: 0, total: 0 });
     setProgressDetail("正在读取 PDF 结构…");
     setStatus("processing");
+    setRunStartedAt(Date.now());
+    setRunEndedAt(null);
     try {
       // 交给服务端跑：这里只提交 + 等结果，关掉页面任务也会继续
       const job = await submitJob(selected, selectedMode);
@@ -394,15 +509,35 @@ export default function Home() {
     setStatus("batch");
     setBatchItems(queue);
     setBatchRunning(true);
+    setRunStartedAt(Date.now());
+    setRunEndedAt(null);
+
+    // 多份一起转 = 一个合集：同一个 batch id，Library 里能整包下 zip。
+    // 只有一份就不建合集，免得 Library 里全是「1 份文件」的空壳分组。
+    const batch =
+      queue.length > 1
+        ? {
+            id: crypto.randomUUID(),
+            label: `${queue.length} 份 · ${new Date().toLocaleString("zh-CN", {
+              month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+            })}`,
+          }
+        : undefined;
 
     // 整批一次性提交给服务端；排队和并发由服务端统一控制，
     // 浏览器只负责显示进度（关掉页面这批也会继续跑完）。
     await Promise.all(
       queue.map(async (item) => {
         try {
-          const job = await submitJob(item.file, selectedMode);
-          updateBatchItem(item.id, { jobId: job.id, status: "processing", detail: "已提交，等待服务端处理…" });
+          const job = await submitJob(item.file, selectedMode, batch);
+          updateBatchItem(item.id, { jobId: job.id, status: "processing", detail: "已提交，等待服务端处理…", startedAt: Date.now() });
+          // 进度回调节流：批量转换时十几份同时推进度，每条都 setState 会卡死界面
+          let lastPaint = 0;
           const finished = await waitForJob(job.id, (live) => {
+            const now = Date.now();
+            const isEdge = live.status !== "running" || live.page >= live.total;
+            if (!isEdge && now - lastPaint < 500) return;
+            lastPaint = now;
             updateBatchItem(item.id, {
               page: live.page,
               total: live.total,
@@ -417,15 +552,17 @@ export default function Home() {
             page: finished.total,
             total: finished.total,
             detail: `已完成并存入 Library · ${finished.total} 页`,
+            finishedAt: Date.now(),
           });
         } catch (caught) {
           const message = caught instanceof Error ? caught.message : "转换失败。";
-          updateBatchItem(item.id, { status: "error", detail: "处理失败，其余文件继续", error: message });
+          updateBatchItem(item.id, { status: "error", detail: "处理失败，其余文件继续", error: message, finishedAt: Date.now() });
         }
       })
     );
 
     setBatchRunning(false);
+    setRunEndedAt(Date.now());   // 计时定格，不再跳
     await refreshLibrary();
   }
 
@@ -462,28 +599,78 @@ export default function Home() {
     if (inputRef.current) inputRef.current.value = "";
   }
 
-  function openBatchResult(item: BatchItem) {
-    if (!item.result) return;
-    if (sourceUrl) URL.revokeObjectURL(sourceUrl);
-    setFile(item.file);
-    setActiveFilename(item.file.name);
-    setSourceUrl(URL.createObjectURL(item.file));
-    setResult(item.result);
-    setMode(item.result.mode);
-    setTab(item.result.mode === "ai" ? "compare" : "markdown");
-    setStatus("complete");
+  /**
+   * 打开批次里某一份的结果。
+   * 结果存在服务端，这里按 jobId 现取——以前指望 item.result，但那个字段
+   * 从来没被赋过值，所以「查看/下载」按钮永远不显示，等于跑完就打不开。
+   */
+  async function openBatchResult(item: BatchItem) {
+    if (!item.jobId) return;
+    try {
+      const { result: stored } = await fetchLibraryEntry(item.jobId);
+      if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+      setFile(null);
+      setActiveJobId(item.jobId);
+      setActiveFilename(item.file.name);
+      setSourceUrl(libraryPdfUrl(item.jobId));
+      setResult(stored);
+      setMode(stored.mode);
+      setTab(stored.mode === "ai" ? "compare" : "markdown");
+      setCameFrom("batch");
+      setStatus("complete");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "无法打开这份结果。");
+      setStatus("error");
+    }
   }
 
-  function downloadBatchMarkdown() {
-    const completed = batchItems.filter((item): item is BatchItem & { result: ConversionResult } => Boolean(item.result));
+  /** 下载批次里某一份的 Markdown（同样从服务端取）。 */
+  async function downloadBatchItem(item: BatchItem) {
+    if (!item.jobId) return;
+    const { result: stored } = await fetchLibraryEntry(item.jobId);
+    download(stored.markdown, `${stored.title}.md`, "text/markdown;charset=utf-8");
+  }
+
+  async function downloadBatchMarkdown() {
+    const completed = batchItems.filter((item) => item.status === "complete" && item.jobId);
     if (!completed.length) return;
-    const combined = completed.map((item) => `<!-- 来源文件：${item.file.name} -->\n\n${item.result.markdown}`).join("\n\n---\n\n");
-    download(combined, `墨页批量转换-${new Date().toISOString().slice(0, 10)}.md`, "text/markdown;charset=utf-8");
+    const parts = await Promise.all(
+      completed.map(async (item) => {
+        const { result: stored } = await fetchLibraryEntry(item.jobId!);
+        return `<!-- 来源文件：${item.file.name} -->\n\n${stored.markdown}`;
+      })
+    );
+    download(parts.join("\n\n---\n\n"), `墨页批量转换-${new Date().toISOString().slice(0, 10)}.md`, "text/markdown;charset=utf-8");
   }
 
   function showLibrary() {
     setScreen("library");
     void refreshLibrary();
+  }
+
+  function renderLibraryCard(record: Job) {
+    return (
+      <article className="library-card" key={record.id}>
+        <button className="library-open" type="button" onClick={() => openRecord(record)} aria-label={`打开 ${record.filename}`}>
+          <span className="library-file-icon">MD<i>PDF</i></span>
+          <span className="library-card-body">
+            <span className="library-card-meta">{formatDate(new Date(record.updated_at).getTime())}</span>
+            <strong>{record.filename}</strong>
+            <span className="library-card-preview">{record.preview || "没有可预览的文字"}</span>
+          </span>
+        </button>
+        <div className="library-card-footer">
+          <span>{record.page_count} 页</span>
+          <span>{formatSize(record.file_size)}</span>
+          <span>{record.ai_pages ? `${record.ai_pages} 页 AI 精校` : modeNames[record.mode] || "旧版转换"}</span>
+          <span className={record.review_count ? "review-count" : ""}>
+            {record.review_count ? `${record.review_count} 页待检查` : "检查通过"}
+          </span>
+          <a href={exportZipUrl({ ids: [record.id] })} download aria-label={`下载 ${record.filename}`}>下载</a>
+          <button type="button" onClick={() => void removeRecord(record)} aria-label={`删除 ${record.filename}`}>删除</button>
+        </div>
+      </article>
+    );
   }
 
   async function openRecord(record: Job) {
@@ -497,6 +684,7 @@ export default function Home() {
       setMode(stored.mode);
       setResult(stored);
       setTab("markdown");
+      setCameFrom("library");
       setStatus("complete");
       setScreen("converter");
     } catch (caught) {
@@ -573,31 +761,43 @@ export default function Home() {
           <div className="library-toolbar">
             <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名…" aria-label="搜索资料库" /></label>
             <div><strong>{library.length}</strong> 份文件 · <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> 页</div>
+            {library.length > 0 && (
+              // 直接用 <a download>：整包由服务端生成并流式下载，不经过 JS 内存
+              <a className="secondary-button" href={exportZipUrl()} download>⭳ 全部打包下载</a>
+            )}
           </div>
           {libraryError && <div className="library-notice" role="status">{libraryError}</div>}
           {libraryLoading ? (
             <div className="library-empty"><span className="library-empty-mark">墨</span><h2>正在读取资料库…</h2></div>
           ) : filteredLibrary.length ? (
-            <div className="library-grid">
-              {filteredLibrary.map((record) => {
-                const needsReview = record.review_count;
-                const aiPages = record.ai_pages;
-                const preview = record.preview;
-                return (
-                  <article className="library-card" key={record.id}>
-                    <button className="library-open" type="button" onClick={() => openRecord(record)} aria-label={`打开 ${record.filename}`}>
-                      <span className="library-file-icon">MD<i>PDF</i></span>
-                      <span className="library-card-body"><span className="library-card-meta">{formatDate(new Date(record.updated_at).getTime())}</span><strong>{record.filename}</strong><span className="library-card-preview">{preview || "没有可预览的文字"}</span></span>
-                    </button>
-                    <div className="library-card-footer">
-                      <span>{record.page_count} 页</span><span>{formatSize(record.file_size)}</span><span>{aiPages ? `${aiPages} 页 AI 精校` : modeNames[record.mode] || "旧版转换"}</span>
-                      <span className={needsReview ? "review-count" : ""}>{needsReview ? `${needsReview} 页待检查` : "检查通过"}</span>
-                      <button type="button" onClick={() => void removeRecord(record)} aria-label={`删除 ${record.filename}`}>删除</button>
+            <>
+              {librarySections.sections.map(({ batch, items }) => (
+                <section className="library-batch" key={batch.id}>
+                  <div className="library-batch-head">
+                    <div>
+                      <strong>{batch.label || "批量转换"}</strong>
+                      <span>{batch.total} 份 · {batch.pages} 页{batch.failed ? ` · ${batch.failed} 份失败` : ""}{batch.active ? ` · ${batch.active} 份进行中` : ""}</span>
                     </div>
-                  </article>
-                );
-              })}
-            </div>
+                    <a className="secondary-button" href={exportZipUrl({ batchId: batch.id })} download>⭳ 下载这个合集</a>
+                  </div>
+                  <div className="library-grid">
+                    {items.map((record) => renderLibraryCard(record))}
+                  </div>
+                </section>
+              ))}
+              {librarySections.loose.length > 0 && (
+                <section className="library-batch">
+                  {librarySections.sections.length > 0 && (
+                    <div className="library-batch-head">
+                      <div><strong>单独转换</strong><span>{librarySections.loose.length} 份</span></div>
+                    </div>
+                  )}
+                  <div className="library-grid">
+                    {librarySections.loose.map((record) => renderLibraryCard(record))}
+                  </div>
+                </section>
+              )}
+            </>
           ) : (
             <div className="library-empty"><span className="library-empty-mark">墨</span><h2>{query ? "没有匹配的文件" : "资料库还是空的"}</h2><p>{query ? "换个关键词试试。" : "完成第一次转换后，文件会自动出现在这里。"}</p>{!query && <button className="primary-button" type="button" onClick={reset}>开始第一次转换</button>}</div>
           )}
@@ -633,6 +833,7 @@ export default function Home() {
                       <span>{j.filename}</span>
                       <span className="staged-size">
                         {j.status === "queued" ? "排队中" : j.total ? `${j.page}/${j.total} 页` : "处理中"}
+                        {" · ⏱ "}{formatElapsed(now - new Date(j.created_at).getTime())}
                       </span>
                       <button type="button" onClick={() => void cancelJob(j.id)}>取消</button>
                     </li>
@@ -684,6 +885,26 @@ export default function Home() {
               {!batchRunning && <button className="primary-button" type="button" onClick={reset}>＋ 新批次</button>}
             </div>
           </header>
+          <div className="run-timer" aria-live="off">
+            <div className="run-timer-clock">
+              <span className="run-timer-label">{batchRunning ? "已用时" : "总用时"}</span>
+              <strong>{formatElapsed(runElapsed)}</strong>
+            </div>
+            <div className="run-timer-pages">
+              <div>
+                <strong>{batchDonePages}<em> / {batchPagesUnknown && !batchTotalPages ? "?" : batchTotalPages}</em></strong>
+                <span>页{batchPagesUnknown && batchTotalPages ? "（部分未读出）" : ""}</span>
+              </div>
+              <div>
+                <strong>{pagesPerMin ? pagesPerMin.toFixed(0) : "—"}</strong>
+                <span>页/分钟</span>
+              </div>
+              <div>
+                <strong>{batchItems.length}</strong>
+                <span>份文件</span>
+              </div>
+            </div>
+          </div>
           <div className="batch-summary">
             <div><strong>{batchPercent}%</strong><span>总体进度</span></div>
             <div><strong>{batchCompleted}</strong><span>转换成功</span></div>
@@ -697,13 +918,26 @@ export default function Home() {
                 <article className={`batch-item ${item.status}`} key={item.id}>
                   <span className="batch-index">{String(index + 1).padStart(2, "0")}</span>
                   <div className="batch-item-main">
-                    <div className="batch-item-title"><strong>{item.file.name}</strong><span>{formatSize(item.file.size)}</span></div>
+                    <div className="batch-item-title">
+                      <strong>{item.file.name}</strong>
+                      <span>{formatSize(item.file.size)}</span>
+                      {item.startedAt && (
+                        <span className="batch-elapsed">
+                          ⏱ {formatElapsed((item.finishedAt ?? now) - item.startedAt)}
+                        </span>
+                      )}
+                    </div>
                     <p>{item.error || item.detail}{item.status === "processing" && item.total ? ` · ${Math.floor(item.page)} / ${item.total} 页` : ""}</p>
                     <div className="batch-item-track"><i style={{ width: `${itemPercent}%` }} /></div>
                   </div>
                   <div className="batch-item-status">
                     <span>{item.status === "queued" ? "等待中" : item.status === "processing" ? `${itemPercent}%` : item.status === "complete" ? "已完成" : "失败"}</span>
-                    {item.result && <div><button type="button" onClick={() => openBatchResult(item)}>查看</button><button type="button" onClick={() => download(item.result!.markdown, `${item.result!.title}.md`, "text/markdown;charset=utf-8")}>下载</button></div>}
+                    {item.status === "complete" && item.jobId && (
+                      <div>
+                        <button type="button" onClick={() => void openBatchResult(item)}>查看</button>
+                        <button type="button" onClick={() => void downloadBatchItem(item)}>下载</button>
+                      </div>
+                    )}
                   </div>
                 </article>
               );
@@ -714,7 +948,20 @@ export default function Home() {
       ) : status === "processing" ? (
         <section className="processing-view" aria-live="polite">
           <div className="processing-orbit"><span>{percent}%</span><i /></div><div className="eyebrow">{mode === "ai" ? "视觉模型识别中" : "正在本机转换"}</div>
-          <h1>{activeFilename}</h1><p>{progressDetail}{progress.total ? ` · ${Math.floor(progress.page)} / ${progress.total} 页` : ""}</p>
+          <h1>{activeFilename}</h1><p>{progressDetail}</p>
+          <div className="run-timer solo">
+            <div className="run-timer-clock">
+              <span className="run-timer-label">已用时</span>
+              <strong>{formatElapsed(runElapsed)}</strong>
+            </div>
+            <div className="run-timer-pages">
+              <div><strong>{Math.floor(progress.page)}<em> / {progress.total || "?"}</em></strong><span>页</span></div>
+              <div>
+                <strong>{runElapsed > 3000 && progress.page ? (progress.page / (runElapsed / 60000)).toFixed(0) : "—"}</strong>
+                <span>页/分钟</span>
+              </div>
+            </div>
+          </div>
           <div className="progress-track"><i style={{ width: `${percent}%` }} /></div>
           <small>{mode === "ai" ? "页面图像会发送给你在设置中选择的模型；识别失败的页面回退 PDF 文字层。" : "转换在本机服务里进行，关掉页面也会继续。"}</small>
         </section>
@@ -725,7 +972,13 @@ export default function Home() {
           <header className="result-header">
             <div><span className="success-kicker"><i />转换完成 · 已存入 Library</span><h1>{activeFilename}</h1><p>{result.pageCount} 页 · {modeNames[result.mode] || "旧版转换"} · {(result.durationMs / 1000).toFixed(1)} 秒</p></div>
             <div className="result-actions">
-              {batchItems.length > 1 && <button type="button" className="secondary-button" onClick={() => setStatus("batch")}>← 返回批次</button>}
+              {cameFrom === "library" ? (
+                <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); showLibrary(); }}>← 返回 Library</button>
+              ) : cameFrom === "batch" || batchItems.length > 1 ? (
+                <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); setStatus("batch"); }}>← 返回批次</button>
+              ) : (
+                <button type="button" className="secondary-button" onClick={reset}>← 返回首页</button>
+              )}
               {!batchRunning && <button type="button" className="secondary-button" onClick={() => void rerunAiRefinement()}>复用初稿重新 AI 精校</button>}
               <button type="button" className="secondary-button" onClick={copyMarkdown}>{copied ? "已复制" : "复制 Markdown"}</button>
               <button type="button" className="primary-button" onClick={() => download(result.markdown, `${result.title}.md`, "text/markdown;charset=utf-8")}>下载 .md</button>
@@ -769,6 +1022,58 @@ export default function Home() {
               <button type="button" className={settingsDraft.provider === "qwen" ? "active" : ""} onClick={() => selectProvider("qwen")}>Qwen 百炼</button>
               <button type="button" className={settingsDraft.provider === "openrouter" ? "active" : ""} onClick={() => selectProvider("openrouter")}>OpenRouter</button>
             </div>
+            <div className="multichannel">
+              <label className="multichannel-main">
+                <input
+                  type="checkbox"
+                  checked={Boolean(settingsDraft.multiChannel)}
+                  onChange={(event) => setSettingsDraft((value) => ({ ...value, multiChannel: event.target.checked }))}
+                />
+                <span>
+                  <strong>多渠道并行</strong>
+                  <small>
+                    {settingsDraft.multiChannel
+                      ? "页面按并发能力分给下面勾选的渠道。上面选的服务商只决定「测试连接」测哪一家。"
+                      : `关闭时只用上面选中的 ${providerNames[settingsDraft.provider]} 一家。不同渠道打的是不同上游，配额互不占用。`}
+                  </small>
+                </span>
+              </label>
+              {settingsDraft.multiChannel && (
+                <>
+                  <div className="channel-picks">
+                    {configuredProviders.length === 0 && <span className="channel-empty">还没有配置任何 API Key</span>}
+                    {configuredProviders.map((p) => {
+                      const picked = !settingsDraft.channels?.length || settingsDraft.channels.includes(p);
+                      return (
+                        <label key={p} className={`channel-chip ${picked ? "on" : ""}`}>
+                          <input
+                            type="checkbox"
+                            checked={picked}
+                            onChange={() => setSettingsDraft((value) => {
+                              // 空数组代表「全选」，第一次取消要先展开成完整列表再减
+                              const current = value.channels?.length ? value.channels : configuredProviders;
+                              const next = current.includes(p) ? current.filter((x) => x !== p) : [...current, p];
+                              return { ...value, channels: next.length ? next : configuredProviders };
+                            })}
+                          />
+                          <b>{providerNames[p]}</b>
+                          <i>{settings.channelWeights?.[p] ?? "?"} 路</i>
+                        </label>
+                      );
+                    })}
+                  </div>
+                  <div className="channel-total">
+                    合计并发{" "}
+                    <b>
+                      {configuredProviders
+                        .filter((p) => !settingsDraft.channels?.length || settingsDraft.channels.includes(p))
+                        .reduce((sum, p) => sum + (settings.channelWeights?.[p] ?? 0), 0)}
+                    </b>{" "}
+                    路 · 实测 84 路可靠，再往上会有请求挂死
+                  </div>
+                </>
+              )}
+            </div>
             {settingsDraft.provider === "gemini" ? (
               <div className="settings-fields">
                 <label><span>Gemini API Key</span><input type="password" value={settingsDraft.geminiKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiKey: event.target.value }))} placeholder={settingsDraft.geminiKeyMasked || "AIza…"} /><small>{settingsDraft.geminiConfigured ? `已配置 ${settingsDraft.geminiKeyMasked}；留空则保留原值` : "尚未配置"}</small></label>
@@ -779,7 +1084,7 @@ export default function Home() {
                       <small>实测：同一 Google <b>账号</b>下的 Key（哪怕分属不同项目）共用同一份吞吐，加了不会更快；<b>换一个 Google 账号</b>的 Key 才是独立配额——实测两个账号并行提速 <b>3.3 倍</b>。</small>
                     </div>
                     <span className="keypool-badge" title="并发 = 6 × 独立项目数">
-                      <b>{extraKeys.filter((k) => k.trim()).length + 1}</b> 把 Key · 并发 {6 * Math.max(1, Math.min(settingsDraft.geminiProjects || 1, extraKeys.filter((k) => k.trim()).length + 1))}
+                      <b>{extraKeys.filter((k) => k.masked || k.value.trim()).length + 1}</b> 把 Key · 并发 {6 * Math.max(1, Math.min(settingsDraft.geminiProjects || 1, extraKeys.filter((k) => k.masked || k.value.trim()).length + 1))}
                     </span>
                   </div>
                   <ol className="keypool-list">
@@ -791,13 +1096,20 @@ export default function Home() {
                     {extraKeys.map((key, i) => (
                       <li className="keypool-row" key={i}>
                         <span className="keypool-index">{i + 2}</span>
-                        <input
-                          type="password"
-                          value={key}
-                          spellCheck={false}
-                          placeholder="AIza… （另一个 Google 项目的 Key）"
-                          onChange={(event) => updateExtraKey(i, event.target.value)}
-                        />
+                        {key.masked && !key.value ? (
+                          <>
+                            <code>{key.masked}</code>
+                            <span className="keypool-tag">已保存</span>
+                          </>
+                        ) : (
+                          <input
+                            type="password"
+                            value={key.value}
+                            spellCheck={false}
+                            placeholder={key.masked ? "留空则保留原值" : "AIza… （另一个 Google 账号的 Key）"}
+                            onChange={(event) => updateExtraKey(i, event.target.value)}
+                          />
+                        )}
                         <button type="button" className="keypool-remove" aria-label={`移除第 ${i + 2} 把 Key`} onClick={() => removeExtraKey(i)}>✕</button>
                       </li>
                     ))}

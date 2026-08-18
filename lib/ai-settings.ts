@@ -6,11 +6,28 @@ export type AiModelOption = { id: string; label: string };
 
 export type AiSettings = {
   provider: AiProvider;
+  /**
+   * 关：一份文档只走 provider 选的那一家。
+   * 开：所有配了 Key 的渠道同时用，按各自并发权重加权轮询分配页面。
+   * 不同渠道打的是不同上游主机，互不占用配额，所以同时开是纯加法。
+   */
+  multiChannel: boolean;
+  /** 参与分流的渠道白名单。空 = 所有配了 Key 的都用。 */
+  channels: AiProvider[];
+  /** 服务端回传：当前实际参与分流的渠道（multiChannel 关时就是 provider 一家）。 */
+  activeChannels?: AiProvider[];
+  /** 服务端回传：各渠道的并发权重，用来显示合计并发。 */
+  channelWeights?: Partial<Record<AiProvider, number>>;
   geminiConfigured: boolean;
   geminiKeyMasked: string;
   geminiKey?: string;
-  /** 额外的 Gemini key（不同项目=独立配额），换行/逗号分隔 */
-  geminiKeysExtra: string;
+  /**
+   * 额外的 Gemini key。保存时传数组：`"__KEEP__"` 表示这一把保持原样
+   * （页面拿不到明文），其余为新填入的明文。空数组 = 清空全部。
+   */
+  geminiKeysExtra: string | string[];
+  /** 服务端回传的打码列表，让页面能显示「已存了哪几把」 */
+  geminiKeysExtraMasked?: string[];
   /** 这些 Key 分属几个独立 Google 项目（同项目共用配额） */
   geminiProjects: number;
   geminiModel: string;
@@ -39,6 +56,9 @@ export type AiSettings = {
 
 export const defaultAiSettings: AiSettings = {
   provider: "gemini",
+  multiChannel: false,
+  channels: [],
+  activeChannels: [],
   geminiConfigured: false,
   geminiKeyMasked: "",
   geminiKey: "",

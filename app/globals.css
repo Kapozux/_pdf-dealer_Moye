@@ -161,6 +161,18 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 .library-card-footer .review-count { color:#9b5938; }
 .library-card-footer button { margin-left:auto; padding:6px 8px; border:0; border-radius:6px; color:rgba(23,35,29,.42); background:transparent; font-size:9px; cursor:pointer; }
 .library-card-footer button:hover { color:#963e31; background:#f0ded8; }
+/* 合集：一次批量转换归成一组，组头可整包下载 */
+.library-batch { margin-top:26px; }
+.library-batch-head { display:flex; align-items:center; justify-content:space-between; gap:16px; padding:12px 10px 12px 16px; border:1px solid var(--line); border-radius:11px; background:rgba(255,255,255,.24); }
+.library-batch-head>div { min-width:0; display:flex; flex-direction:column; gap:3px; }
+.library-batch-head strong { font-family:Georgia,"Noto Serif TC",serif; font-size:15px; font-weight:500; }
+.library-batch-head span { color:rgba(23,35,29,.5); font-size:10px; }
+.library-batch .library-grid { margin-top:14px; }
+/* 下载是 <a download>（整包由服务端生成），要和相邻的删除按钮长得一样 */
+.library-toolbar a.secondary-button,.library-batch-head a.secondary-button { text-decoration:none; white-space:nowrap; }
+.library-card-footer a { margin-left:auto; padding:6px 8px; border-radius:6px; color:rgba(23,35,29,.42); background:transparent; font-size:9px; text-decoration:none; }
+.library-card-footer a:hover { color:var(--green); background:var(--green-soft); }
+.library-card-footer a+button { margin-left:0; }
 .library-empty { min-height:350px; display:flex; flex-direction:column; align-items:center; justify-content:center; margin-top:20px; border:1px dashed rgba(31,91,65,.24); border-radius:16px; text-align:center; }
 .library-empty-mark { width:54px; height:54px; display:grid; place-items:center; border-radius:50%; color:var(--paper); background:var(--green); font-family:Georgia,"Noto Serif TC",serif; font-size:20px; }
 .library-empty h2 { margin:18px 0 6px; font-family:Georgia,"Noto Serif TC",serif; font-size:24px; font-weight:500; }
@@ -205,6 +217,40 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 .model-sync-row .secondary-button { padding-block:8px; white-space:nowrap; }
 .model-sync-row span { color:rgba(23,35,29,.46); font-size:9px; line-height:1.45; }
 .settings-fields small { color:rgba(23,35,29,.42); font-size:9px; }
+.multichannel { margin:12px 28px 0; padding:12px 14px; border:1px solid var(--line); border-radius:10px; }
+.multichannel-main { display:flex; align-items:flex-start; gap:10px; cursor:pointer; }
+.multichannel-main input { margin-top:2px; accent-color:var(--green); }
+.multichannel strong { display:block; font-size:11px; }
+.multichannel small { display:block; margin-top:3px; color:rgba(23,35,29,.62); font-size:10px; line-height:1.5; }
+.channel-picks { display:flex; flex-wrap:wrap; gap:7px; margin-top:11px; }
+.channel-chip { display:inline-flex; align-items:center; gap:6px; padding:6px 10px; border:1px solid var(--line); border-radius:999px; font-size:10px; cursor:pointer; opacity:.45; }
+.channel-chip.on { border-color:var(--green); background:rgba(47,111,74,.08); opacity:1; }
+.channel-chip input { accent-color:var(--green); }
+.channel-chip i { color:rgba(23,35,29,.55); font-style:normal; }
+.channel-empty { color:rgba(23,35,29,.5); font-size:10px; }
+.channel-total { margin-top:9px; color:rgba(23,35,29,.62); font-size:10px; }
+.channel-total b { color:var(--green); font-size:12px; }
+.batch-elapsed { color:rgba(23,35,29,.55); font-size:10px; font-variant-numeric:tabular-nums; }
+
+/* 大计时器：转换时最该一眼看到的两件事——用了多久、跑了多少页 */
+.run-timer { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:20px;
+  margin:22px 0 0; padding:20px 26px; border:1px solid var(--line); border-radius:14px;
+  background:linear-gradient(180deg, rgba(47,111,74,.05), rgba(47,111,74,.01)); }
+.run-timer.solo { margin-inline:auto; max-width:520px; }
+.run-timer-clock { display:flex; flex-direction:column; gap:2px; }
+.run-timer-label { color:rgba(23,35,29,.55); font-size:10px; font-weight:700; letter-spacing:.09em; text-transform:uppercase; }
+.run-timer-clock strong { color:var(--green); font-size:44px; font-variant-numeric:tabular-nums; font-weight:600; line-height:1.05; letter-spacing:-.02em; }
+.run-timer-pages { display:flex; gap:30px; }
+.run-timer-pages div { display:flex; flex-direction:column; gap:2px; text-align:right; }
+.run-timer-pages strong { font-size:24px; font-variant-numeric:tabular-nums; font-weight:600; line-height:1.1; }
+.run-timer-pages em { color:rgba(23,35,29,.42); font-size:15px; font-style:normal; }
+.run-timer-pages span { color:rgba(23,35,29,.55); font-size:10px; letter-spacing:.03em; }
+@media (max-width:560px) {
+  .run-timer { flex-direction:column; align-items:flex-start; padding:16px 18px; }
+  .run-timer-clock strong { font-size:36px; }
+  .run-timer-pages { gap:22px; }
+  .run-timer-pages div { text-align:left; }
+}
 .scope-field { display:flex; gap:20px; margin:20px 28px 0; padding:14px 16px; border:1px solid var(--line); border-radius:10px; }
 .scope-field legend { padding:0 6px; }
 .scope-field label { display:flex; align-items:center; gap:7px; font-size:10px; }
@@ -216,7 +262,7 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 @media (max-width:700px) { .app-shell{padding:0 16px}.topbar{height:68px}.brand-subtitle{display:none}.privacy-pill{font-size:10px;padding:8px 10px}.hero{margin-top:54px}.hero h1{font-size:45px}.converter-card{padding:8px}.dropzone{min-height:235px}.profile-row{align-items:stretch;flex-direction:column;padding:16px 8px 4px}.profile-options{display:grid;grid-template-columns:repeat(3,1fr)}.profile-options button{padding-inline:6px}.feature-grid{grid-template-columns:1fr;gap:28px;margin-top:48px}footer{gap:20px} }
 @media (max-width:700px) { .top-actions .quiet-button{display:none}.result-workspace{padding-top:30px}.result-header{align-items:stretch;flex-direction:column}.result-actions{display:grid;grid-template-columns:1fr 1fr}.score-strip{grid-template-columns:repeat(3,1fr)}.score-strip>div{padding:15px 10px;text-align:center}.score-strip>button{grid-column:1/-1;justify-self:stretch;margin:0;padding:12px;border-top:1px solid var(--line)}.result-panel{height:540px}.markdown-preview{padding:24px 20px}.quality-list article{grid-template-columns:70px 1fr}.quality-list article small{display:none} }
 @media (max-width:700px) { .privacy-pill{display:none}.library-nav{padding-inline:8px}.library-view{padding-top:35px}.library-header{align-items:stretch;flex-direction:column}.library-header .primary-button{align-self:flex-start}.library-toolbar{align-items:stretch;flex-direction:column}.library-toolbar>div{border-top:1px solid var(--line);border-left:0;padding-left:0}.library-grid{grid-template-columns:1fr}.library-open{padding:20px}.library-card-footer{padding-left:20px;gap:7px}.library-card-footer span:nth-of-type(2){display:none} }
-@media (max-width:700px) { .settings-button{font-size:10px;padding-inline:7px}.compare-columns{grid-template-columns:1fr}.compare-columns section+section{border-left:0;border-top:1px solid var(--line)}.compare-columns pre{height:280px}.settings-modal{max-height:calc(100vh - 24px)}.settings-provider{grid-template-columns:1fr 1fr}.settings-fields{grid-template-columns:1fr;padding-inline:18px}.settings-fields label{grid-column:1/-1}.model-picker{grid-template-columns:1fr}.model-sync-row{align-items:flex-start;flex-direction:column;margin-inline:18px}.settings-modal>header{padding-inline:20px}.settings-warning,.settings-provider,.scope-field,.settings-status{margin-left:18px;margin-right:18px}.scope-field{align-items:flex-start;flex-direction:column}.settings-modal>footer{padding-inline:18px}.result-tabs{gap:12px;overflow:auto}.result-tabs button{white-space:nowrap} }
+@media (max-width:700px) { .settings-button{font-size:10px;padding-inline:7px}.compare-columns{grid-template-columns:1fr}.compare-columns section+section{border-left:0;border-top:1px solid var(--line)}.compare-columns pre{height:280px}.settings-modal{max-height:calc(100vh - 24px)}.settings-provider{grid-template-columns:1fr 1fr}.settings-fields{grid-template-columns:1fr;padding-inline:18px}.settings-fields label{grid-column:1/-1}.model-picker{grid-template-columns:1fr}.model-sync-row{align-items:flex-start;flex-direction:column;margin-inline:18px}.settings-modal>header{padding-inline:20px}.settings-warning,.settings-provider,.scope-field,.settings-status,.multichannel{margin-left:18px;margin-right:18px}.scope-field{align-items:flex-start;flex-direction:column}.settings-modal>footer{padding-inline:18px}.result-tabs{gap:12px;overflow:auto}.result-tabs button{white-space:nowrap} }
 @media (max-width:700px) { .batch-view{padding-top:34px}.batch-header{align-items:stretch;flex-direction:column}.batch-actions{display:grid;grid-template-columns:1fr 1fr}.batch-summary{grid-template-columns:repeat(3,1fr);padding-top:14px}.batch-summary>div:not(.batch-overall-track){padding:8px 10px;text-align:center}.batch-overall-track{grid-column:1/-1;width:auto;margin:12px 18px 18px}.batch-item{grid-template-columns:35px minmax(0,1fr);gap:10px;padding:16px 14px}.batch-item-status{grid-column:2;align-items:flex-start;flex-direction:row;justify-content:space-between}.batch-item-title{align-items:flex-start;flex-direction:column;gap:4px}.batch-item-title strong{max-width:100%} }
 
 /* 待转换清单：选好文件后先确认，避免一选中就自动开始 */

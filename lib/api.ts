@@ -29,6 +29,22 @@ export type Job = {
   review_count: number;
   ai_pages: number;
   preview: string;
+  /** 同一次批量提交共享一个 batch_id；单份转换为 null */
+  batch_id: string | null;
+  batch_label: string | null;
+};
+
+/** 一次批量提交的汇总（服务端 SQL 聚合，不用逐份读任务）。 */
+export type Batch = {
+  id: string;
+  label: string | null;
+  total: number;
+  done: number;
+  active: number;
+  failed: number;
+  pages: number;
+  created_at: string;
+  updated_at: string;
 };
 
 async function asJson<T>(response: Response): Promise<T> {
@@ -39,20 +55,45 @@ async function asJson<T>(response: Response): Promise<T> {
   return payload as T;
 }
 
-/** 提交一份 PDF；立刻返回任务，转换在服务端进行。 */
-export async function submitJob(file: File, mode: ConversionMode): Promise<Job> {
+/**
+ * 提交一份 PDF；立刻返回任务，转换在服务端进行。
+ * 传 batch 时，这份会归到同一个合集里（Library 可整包下载）。
+ */
+export async function submitJob(
+  file: File,
+  mode: ConversionMode,
+  batch?: { id: string; label: string }
+): Promise<Job> {
   const response = await fetch(`${SERVICE_BASE}/api/jobs`, {
     method: "POST",
     headers: {
       "Content-Type": "application/pdf",
-      // HTTP header 只能带 latin-1，中文文件名必须编码后再传
+      // HTTP header 只能带 latin-1，中文文件名/批次名必须编码后再传
       "x-filename": encodeURIComponent(file.name),
       "x-mode": mode,
+      ...(batch ? { "x-batch-id": batch.id, "x-batch-label": encodeURIComponent(batch.label) } : {}),
     },
     body: file,
   });
   const { job } = await asJson<{ job: Job }>(response);
   return job;
+}
+
+export async function listBatches(): Promise<Batch[]> {
+  const { batches } = await asJson<{ batches: Batch[] }>(await fetch(`${SERVICE_BASE}/api/batches`));
+  return batches;
+}
+
+/**
+ * 整包下载地址。传 batchId 下一个合集，传 ids 下指定几份，都不传就是全部。
+ * 直接给 <a href> 用——让浏览器自己下载，不用先把整个 zip 读进内存。
+ */
+export function exportZipUrl(options: { batchId?: string; ids?: string[] } = {}): string {
+  const query = new URLSearchParams();
+  if (options.batchId) query.set("batch", options.batchId);
+  if (options.ids?.length) query.set("ids", options.ids.join(","));
+  const suffix = query.toString();
+  return `${SERVICE_BASE}/api/export/zip${suffix ? `?${suffix}` : ""}`;
 }
 
 export async function listJobs(): Promise<Job[]> {

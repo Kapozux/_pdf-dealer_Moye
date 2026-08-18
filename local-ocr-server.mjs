@@ -400,6 +400,25 @@ const RESCUE_TIMEOUT_MS = Number(process.env.MOYE_RESCUE_TIMEOUT_MS) || 25000;
 const RESCUE_ATTEMPTS = 1;
 
 /**
+ * 按渠道的单次调用超时。
+ *
+ * 一个全局超时对三家是错的——它们的正常速度差 8 倍（同一页真实试卷图，孤立测量）：
+ *   openrouter/CoreWeave  3s      ← 最快
+ *   qwen3.7-plus          13s
+ *   gemini-2.5-flash      25s     ← 离 30s 只差 5s
+ * 全局 30s 的后果：Gemini 稍有负载就超时 → 重试 3 次 → 再换回退模型 →
+ * 一页烧掉 150s 预算，满配 12 路却只跑出 7 页；qwen 也被判成「慢」降到 3 路。
+ * 现在各给约 3 倍 p50 的余量，快的照样快速失败，慢的不再被误杀。
+ */
+const PROVIDER_TIMEOUT_MS = {
+  openrouter: Number(process.env.MOYE_TIMEOUT_OPENROUTER) || 30000,
+  qwen: Number(process.env.MOYE_TIMEOUT_QWEN) || 45000,
+  kimi: Number(process.env.MOYE_TIMEOUT_KIMI) || 45000,
+  gemini: Number(process.env.MOYE_TIMEOUT_GEMINI) || 75000,
+};
+const providerTimeout = (provider) => PROVIDER_TIMEOUT_MS[provider] ?? PAGE_CALL_TIMEOUT_MS;
+
+/**
  * 单页**总时间预算**（含所有重试、所有回退模型）。
  *
  * 逐层限时挡不住相乘：3 次重试 × 90s = 270s，Gemini 还要在主模型和回退模型上
@@ -526,12 +545,6 @@ const OPENROUTER_PROVIDERS = (process.env.MOYE_OPENROUTER_PROVIDERS || "CoreWeav
   .split(",").map((p) => p.trim()).filter(Boolean);
 
 /**
- * 轮转起点。每个请求从不同的供应商开始试，而不是所有人都先撞 CoreWeave——
- * 否则持续高并发时，第一家被打满，后面每个请求都要先白等一次超时才换家。
- */
-let openrouterCursor = 0;
-
-/**
  * 模型级兜底链。换供应商解决的是「这家机房挂了」，但如果是模型本身出问题
  * （下架、全网限流、持续 5xx），换多少家供应商都没用，得换模型。
  *
@@ -599,11 +612,21 @@ async function callOpenRouterFailover(settings, input, opts = {}) {
 
   for (const model of models) {
     if (Date.now() >= overallDeadline) break;
-    const start = openrouterCursor++;   // 每个模型独立轮转起点，避免都压第一家
 
-    for (let i = 0; i < pool.length; i += 1) {
+    // 按 OPENROUTER_PROVIDERS 的顺序试，**不做轮转**。
+    // 曾经这里用 openrouterCursor++ 轮转起点，想着「分散负载」，实测是灾难：
+    // 五家速度差 4 倍（CoreWeave p50 12s、Baidu 41s、Cloudflare 51s），轮转把
+    // 80% 的请求发给了慢的四家，而后两家的 p50 本身就超过 30s 超时线——必然
+    // 超时、换家、再等，平均每页 236 秒，吞吐 14 页/分钟。
+    // 而按顺序优先最快的一家：32 路里 31 个落在 CoreWeave，p50 3.3s、2.17 页/秒。
+    // 分散负载该由 OpenRouter 在它那侧做，客户端硬分只会把活推给慢的。
+    // 第 0 次尝试不钉死任何一家：把整个白名单交给 OpenRouter，让它自己在
+    // 健康的几家之间做负载均衡（实测 32 路里 31 个落到最快的 CoreWeave，
+    // p50 3.3s、2.17 页/秒——比客户端自己分片快 15 倍）。
+    // 只有它挑的那家失败了，才逐家钉死重试。
+    const attempts = [null, ...pool];
+    for (const pinned of attempts) {
       if (Date.now() >= overallDeadline) break;
-      const pinned = pool[(start + i) % pool.length];
       try {
         const result = await callOpenAiCompatible(
           { ...base, model, pinProvider: pinned },
@@ -776,9 +799,11 @@ function directProviderConfig(provider, settings) {
 
 async function callProvider(provider, settings, input, testOnly) {
   // 补救轮只给一次机会、超时更短——那些页刚刚才卡死过，重复三轮只是重复绝望
+  const perTry = providerTimeout(provider);
   const opts = input.rescue
     ? { attempts: RESCUE_ATTEMPTS, timeoutMs: RESCUE_TIMEOUT_MS, budgetMs: RESCUE_TIMEOUT_MS + 2000 }
-    : {};
+    // 按渠道给超时；总预算给足两轮，够它在同一家重试或换一家，但不至于无限拖
+    : { timeoutMs: perTry, budgetMs: Math.max(PAGE_TIME_BUDGET_MS, perTry * 2) };
   if (provider === "gemini") {
     return callGemini(settings, input.imageBase64 || "", input.mimeType || "image/jpeg", input.draft || "", testOnly, opts);
   }
@@ -796,9 +821,12 @@ async function callConfiguredModel(settings, input, testOnly = false) {
   // 真正精校页面：交给自适应节流器。它按渠道各开一条车道，
   // 成功就慢慢提速、超时就砍半，并总是把活派给空位最多的那条——
   // 于是某个平台崩了，流量会自动流向其他平台，不需要人工切换。
-  const channels = settings.multiChannel
+  const channels = (settings.multiChannel
     ? configuredChannels(settings)
-    : [{ provider: settings.provider, weight: channelWeight(settings.provider, settings) }];
+    : [{ provider: settings.provider, weight: channelWeight(settings.provider, settings) }])
+    // slowMs = 该渠道一次尝试的超时。超过它才回来，说明底下必然重试或换过家，
+    // 那就是拥塞信号；用统一阈值会把慢渠道的正常响应误杀。
+    .map((c) => ({ ...c, slowMs: Math.round(providerTimeout(c.provider) * 1.5) }));
   pacer.configure(channels);
   return pacer.run((provider) => callProvider(provider, settings, input, false));
 }

@@ -47,3 +47,6 @@ settings.local.json
 /tmp/
 # 服务端数据（转换任务与产物）
 /data/
+
+# TypeScript 增量构建缓存（每次构建都变，无需版本控制）
+*.tsbuildinfo

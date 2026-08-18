@@ -1,7 +1,7 @@
 #!/bin/zsh
 set -e
 
-project_dir="/Users/kapozux/Documents/Playground/pdf2md-web"
+project_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 current_uid="$(id -u)"
 service_domain="gui/${current_uid}"
 services=(com.kapozux.moye-ocr com.kapozux.moye-web)

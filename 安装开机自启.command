@@ -1,8 +1,10 @@
 #!/bin/zsh
 set -e
 
-project_dir="/Users/kapozux/Documents/Playground/pdf2md-web"
-agent_dir="/Users/kapozux/Library/LaunchAgents"
+# 路径由脚本自身位置推导，不写死——否则换台机器、换个目录就跑不起来，
+# 而且绝对路径里带着用户名，不适合放进公开仓库。
+project_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+agent_dir="$HOME/Library/LaunchAgents"
 current_uid="$(id -u)"
 service_domain="gui/${current_uid}"
 services=(com.kapozux.moye-ocr com.kapozux.moye-web)
@@ -14,10 +16,15 @@ echo "正在构建墨页网页…"
 /opt/homebrew/bin/npm run build
 
 for service_name in "${services[@]}"; do
-  source_plist="$project_dir/launchd/${service_name}.plist"
+  # 仓库里存的是模板（不含绝对路径），安装时把真实路径填进去——
+  # launchd 不接受相对路径，也不展开 $HOME，必须在这一步写死。
+  template="$project_dir/launchd/${service_name}.plist.template"
+  rendered="$(mktemp -t "${service_name}")"
+  sed -e "s#__PROJECT_DIR__#${project_dir}#g" -e "s#__HOME__#${HOME}#g" "$template" > "$rendered"
   target_plist="$agent_dir/${service_name}.plist"
-  plutil -lint "$source_plist"
-  /usr/bin/install -m 644 "$source_plist" "$target_plist"
+  plutil -lint "$rendered"
+  /usr/bin/install -m 644 "$rendered" "$target_plist"
+  rm -f "$rendered"
   launchctl bootout "$service_domain/$service_name" 2>/dev/null || true
 done
 

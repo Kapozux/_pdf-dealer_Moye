@@ -14,6 +14,7 @@ import { JobStore } from "./server/jobstore.mjs";
 import { JobQueue, EventHub } from "./server/queue.mjs";
 import { createConverter, gateStats } from "./server/convert.mjs";
 import { createRenderer } from "./server/render.mjs";
+import { createOfficeConverter, isOfficeFile } from "./server/office2pdf.mjs";
 import { AdaptivePacer } from "./server/pacer.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -1010,6 +1011,14 @@ const converter = createConverter({
   renderer: createRenderer({ python: resolve(root, "../.venv-marker/bin/python") }),
 });
 
+// PPT/PPTX 提交时先经 LibreOffice 转成 PDF，转完直接顶替 source.pdf 走上面这套
+// 转换管线，不单独写一份 PPT 处理逻辑。soffice 路径可用 MOYE_SOFFICE 覆盖，
+// 默认吃 PATH（brew 装的话会链到 /opt/homebrew/bin/soffice）。
+const officeConverter = createOfficeConverter({
+  soffice: process.env.MOYE_SOFFICE || "soffice",
+  timeoutMs: Number(process.env.MOYE_OFFICE_TIMEOUT_MS) || 120000,
+});
+
 const jobQueue = new JobQueue({
   store: jobStore,
   // 本机跑 Surya 很吃资源，默认串行（MOYE_CONCURRENCY 只调本机识别）。
@@ -1230,7 +1239,22 @@ const server = createServer(async (request, response) => {
       const batchLabel = batchId ? decodeHeader(request.headers["x-batch-label"]) : null;
       const id = randomUUID();
       const job = jobStore.create({ id, filename, fileSize: 0, mode, batchId, batchLabel });
-      await pipeline(request, createWriteStream(jobStore.sourcePath(id)));
+      if (isOfficeFile(filename)) {
+        // PPT/PPTX：先整份收进内存转给 soffice，转出来的 PDF 才落盘成 source.pdf。
+        // 不能像 PDF 那样边收边写——soffice 要一个完整文件才能转换。
+        try {
+          const chunks = [];
+          for await (const chunk of request) chunks.push(chunk);
+          const pdfBuffer = await officeConverter.convertToPdf(Buffer.concat(chunks), filename);
+          await writeFile(jobStore.sourcePath(id), pdfBuffer);
+        } catch (error) {
+          const message = error instanceof Error ? error.message : "PPT 转 PDF 失败。";
+          jobStore.update(id, { status: "failed", error: `PPT 转 PDF 失败：${message}` });
+          throw new Error(`PPT 转 PDF 失败：${message}`);
+        }
+      } else {
+        await pipeline(request, createWriteStream(jobStore.sourcePath(id)));
+      }
       const { size } = await stat(jobStore.sourcePath(id));
       jobStore.db.prepare("UPDATE jobs SET file_size = ? WHERE id = ?").run(size, id);
       jobQueue.enqueue(id);

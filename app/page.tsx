@@ -9,6 +9,18 @@ import {
   type Batch, type Job, type Stats, type TagBackfillState,
 } from "../lib/api";
 
+// PPT/PPTX 先在服务端转成 PDF 再走原来那套管线（见 server/office2pdf.mjs），
+// 前端这边只需要放宽"只认 PDF"的校验，不用关心转换细节。
+const ACCEPTED_EXTENSIONS = [".pdf", ".ppt", ".pptx"];
+function isAcceptedFile(f: File) {
+  return f.type === "application/pdf" || ACCEPTED_EXTENSIONS.some((ext) => f.name.toLowerCase().endsWith(ext));
+}
+// 只有真正的 PDF 才能直接拿浏览器本地的 blob URL 预览；PPT 要等服务端转完
+// 才有 PDF 可看，本地文件本身塞进 <iframe> 是空白的。
+function isPdfFile(f: File) {
+  return f.type === "application/pdf" || f.name.toLowerCase().endsWith(".pdf");
+}
+
 type Status = "idle" | "processing" | "batch" | "complete" | "error";
 type Screen = "converter" | "library";
 type ResultTab = "markdown" | "quality" | "compare" | "source";
@@ -523,13 +535,14 @@ export default function Home() {
   }
 
   async function processFile(selected: File, selectedMode: ConversionMode = mode) {
-    if (!selected.name.toLowerCase().endsWith(".pdf") && selected.type !== "application/pdf") {
-      setError("请选择 PDF 文件。");
+    if (!isAcceptedFile(selected)) {
+      setError("请选择 PDF 或 PPT 文件。");
       setStatus("error");
       return;
     }
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
-    setSourceUrl(URL.createObjectURL(selected));
+    // PPT 还没转换完，没有 PDF 可预览；等下面转换完了再指到服务端转出的那份。
+    setSourceUrl(isPdfFile(selected) ? URL.createObjectURL(selected) : "");
     setFile(selected);
     setActiveFilename(selected.name);
     setMode(selectedMode);
@@ -554,6 +567,12 @@ export default function Home() {
       const { result: converted } = await fetchLibraryEntry(finished.id);
       setResult(converted);
       setActiveJobId(finished.id);
+      if (!isPdfFile(selected)) {
+        // 上面校验通过时不是 PDF 就是 PPT——服务端此刻已经把它转成 PDF 了，
+        // 换成服务端那份，「源文件」标签页才有东西可看。
+        if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+        setSourceUrl(libraryPdfUrl(finished.id));
+      }
       setTab(selectedMode === "ai" ? "compare" : "markdown");
       setStatus("complete");
       await refreshLibrary();
@@ -570,9 +589,9 @@ export default function Home() {
   }
 
   async function processFiles(selectedFiles: File[], selectedMode: ConversionMode = mode) {
-    const pdfFiles = selectedFiles.filter((selected) => selected.name.toLowerCase().endsWith(".pdf") || selected.type === "application/pdf");
+    const pdfFiles = selectedFiles.filter(isAcceptedFile);
     if (!pdfFiles.length) {
-      setError("请选择 PDF 文件。");
+      setError("请选择 PDF 或 PPT 文件。");
       setStatus("error");
       return;
     }
@@ -670,8 +689,8 @@ export default function Home() {
   }
 
   function addStaged(incoming: File[]) {
-    const pdfs = incoming.filter((f) => f.name.toLowerCase().endsWith(".pdf") || f.type === "application/pdf");
-    if (!pdfs.length) { setError("请选择 PDF 文件。"); setStatus("error"); return; }
+    const pdfs = incoming.filter(isAcceptedFile);
+    if (!pdfs.length) { setError("请选择 PDF 或 PPT 文件。"); setStatus("error"); return; }
     setError("");
     setStatus("idle");
     setStaged((prev) => {
@@ -846,7 +865,7 @@ export default function Home() {
     <main className={`app-shell ${status !== "idle" || screen === "library" ? "workspace-open" : ""}`}>
       <nav className="topbar" aria-label="主导航">
         <button className="brand brand-button" type="button" onClick={reset} aria-label="回到首页" disabled={batchRunning}>
-          <span className="brand-mark">墨</span><span>墨页</span><span className="brand-subtitle">PDF 转 Markdown</span>
+          <span className="brand-mark">墨</span><span>墨页</span><span className="brand-subtitle">PDF/PPT 转 Markdown</span>
         </button>
         <div className="top-actions">
           <button className={`library-nav ${screen === "library" ? "active" : ""}`} type="button" onClick={showLibrary} disabled={batchRunning}>Library <b>{library.length}</b></button>
@@ -899,16 +918,16 @@ export default function Home() {
       ) : status === "idle" ? (
         <>
           <section className="hero">
-            <div className="eyebrow">VERIFIABLE PDF CONVERTER</div>
-            <h1>让 PDF 变成<br /><em>可靠的 Markdown</em></h1>
+            <div className="eyebrow">VERIFIABLE PDF/PPT CONVERTER</div>
+            <h1>让 PDF/PPT 变成<br /><em>可靠的 Markdown</em></h1>
             <p>选好文件再确认开始。转换在本机服务里排队执行，关掉页面也会继续。</p>
           </section>
-          <section className="converter-card" aria-label="PDF 转换器">
+          <section className="converter-card" aria-label="PDF/PPT 转换器">
             <button className={`dropzone ${dragging ? "is-dragging" : ""}`} type="button" onClick={() => inputRef.current?.click()} onDragEnter={() => setDragging(true)} onDragLeave={() => setDragging(false)} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
-              <span className="paper-icon"><b>PDF</b><i /></span><strong>拖放一个或多个 PDF</strong><span>或点击批量选择文件</span>
+              <span className="paper-icon"><b>PDF</b><i /></span><strong>拖放一个或多个 PDF / PPT</strong><span>或点击批量选择文件</span>
               <small>{mode === "ai" ? "AI 模式会把页面图像发送给你配置的模型" : "当前模式全程在本机处理"}</small>
             </button>
-            <input ref={inputRef} type="file" accept="application/pdf,.pdf" multiple hidden onChange={(event) => { const selected = Array.from(event.target.files || []); if (selected.length) addStaged(selected); event.target.value = ""; }} />
+            <input ref={inputRef} type="file" accept="application/pdf,.pdf,.ppt,.pptx" multiple hidden onChange={(event) => { const selected = Array.from(event.target.files || []); if (selected.length) addStaged(selected); event.target.value = ""; }} />
             <div className="profile-row" aria-label="转换模式">
               <div><span className="field-label">转换模式</span><strong>{modeNames[mode]}</strong><small>{modeDescriptions[mode]}</small></div>
               <div className="profile-options">
@@ -963,7 +982,7 @@ export default function Home() {
           <section className="feature-grid" aria-label="产品特点">
             <article><span>01</span><h2>按需选路</h2><p>本地高精度走 Surya；选 AI 则直接交给视觉模型，不再空跑一遍本地识别。</p></article>
             <article><span>02</span><h2>结果可验证</h2><p>程序检查公式与选项是否丢失，失败时自动回退。</p></article>
-            <article><span>03</span><h2>批量并发</h2><p>一次加入多份 PDF：AI 任务并发跑，本地识别按机器能力限流。</p></article>
+            <article><span>03</span><h2>批量并发</h2><p>一次加入多份 PDF/PPT：AI 任务并发跑，本地识别按机器能力限流。</p></article>
           </section>
         </>
       ) : status === "batch" ? (

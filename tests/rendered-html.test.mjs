@@ -19,10 +19,10 @@ test("server-renders the finished PDF converter", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
-  assert.match(html, /<title>墨页 · PDF 转 Markdown<\/title>/);
+  assert.match(html, /<title>墨页 · PDF\/PPT 转 Markdown<\/title>/);
   assert.match(html, /拖放一个或多个 PDF/);
   assert.match(html, /本地处理 · 文件不上传/);
-  assert.match(html, /accept="application\/pdf,.pdf"/);
+  assert.match(html, /accept="application\/pdf,.pdf,.ppt,.pptx"/);
   assert.match(html, /multiple=""/);
   assert.doesNotMatch(html, /codex-preview|SkeletonPreview|Your site is taking shape/);
 });

@@ -115,6 +115,43 @@ grep '\[AI失败\]\|\[换供应商\]\|\[换模型\]\|\[模型熔断\]\|\[补救\
 逐页可以并行，打包只能串行生成。渲染开销可忽略（4 页 137ms）。
 **结论：不要改成直传 PDF。** 另外逐页才能做逐页校验和回退。
 
+### 代码地图（谁管什么，改之前先找对文件）
+
+```
+local-ocr-server.mjs   8765 服务入口：HTTP 路由、四家供应商调用、settings.local.json 读写
+server/queue.mjs       按模式（fast/balanced/math/ai）分车道限流 + 协作式取消 + SSE 广播
+server/convert.mjs     转换管线本体：文字层排版还原、Surya HTML→MD、AI 校验/回退、aiGate/renderGate 两个闸
+server/pacer.mjs       AI 模式的自适应节流器（AIMD，按渠道独立车道），local-ocr-server 用它派活
+server/jobstore.mjs    SQLite 任务表 + 磁盘布局 + 重启恢复 + 逐页 checkpoint（pages.jsonl）
+server/render.mjs      spawn Python(pypdfium2) 把 PDF 页转 JPEG，供 AI 模式用
+server/zip.mjs         手写最小 ZIP 打包器，只为 Library 整包下载存在
+lib/ai-settings.ts     AI 设置的类型 + 浏览器→8765 的设置类 API 客户端
+lib/api.ts             浏览器→8765 的任务类 API 客户端（提交/查询/SSE 订阅/Library/导出）
+lib/pdf-to-markdown.ts 只剩前后端共用的类型定义；真正实现已搬到 server/convert.mjs
+app/page.tsx           前端几乎全部逻辑（1100+ 行单文件）：拖拽/批量、进度订阅、Library、结果四个 tab、设置弹窗
+worker/index.ts        3000 服务的 vinext/Cloudflare 适配层，顺带处理 HTML 不缓存（否则旧 JS chunk 会残留，见上面第二条规则）
+```
+
+改动前先按这张表定位文件，不要凭猜测改错地方——比如"AI 结果为什么没校验公式"要看 `convert.mjs` 的 `validateAiPage`，不是 `local-ocr-server.mjs`。
+
+### 启动脚本的关系
+
+`启动全部服务.command`（=`start.command` 转发）→ 没装过 launchd 服务就转去跑 `安装开机自启.command`（build + 注册两个 launchd agent），装过了就 `launchctl kickstart` 两个服务再等 `/health` 就绪。真实路径在安装时才写进 `~/Library/LaunchAgents/*.plist`（`launchd/*.plist.template` 里的 `__PROJECT_DIR__`/`__HOME__` 占位符），仓库里存的模板不含绝对路径。
+
+用户另有一个独立项目 `~/Documents/CODEelse/getAudio`，启动方式（`launchctl` 常驻 + 自己的 `启动服务.command`）是同一套约定的来源（本文件顶部"参考 GetAudio"说的就是这个），但两者服务完全独立，互不依赖、互不共享端口。`logs/` 目录里的 `getaudio.err.log`/`getaudio.out.log` 是历史遗留的普通文件（不是软链接，2026-08-17 的，比本项目自己的 launchd 服务还早一天），跟当前两个服务无关，可以忽略。
+
+### 测试是字符串断言网，不是行为测试
+
+`tests/rendered-html.test.mjs` 主要靠 `assert.match` 抓文件里的关键字符串（函数名、UI 文案、依赖名）存在与否，用来防止"某个功能被顺手删掉"。改 UI 文案、重命名导出函数、换掉某个 provider 的固定字符串，都可能让它不相关地挂掉——挂了先看是真的少了功能，还是只是字符串对不上了。
+
+### 几处脚手架遗留（vinext/OpenAI sites 模板带出来的，非本项目功能）
+
+- `app/chatgpt-auth.ts` —— ChatGPT 登录集成，全项目没有任何地方 import 它。
+- `app/_sites-preview/` —— 空目录。
+- `vite.config.ts` 里的 D1/R2 绑定（`site-creator-d1`/`site-creator-r2`）—— 用的是占位 database id，本文件也写着"墨页本身跑在本机，不使用 D1/R2"。
+
+没在功能上生效，暂时留着没有坏处；确认要清理时先 grep 一遍确认没有隐藏引用。
+
 ---
 
 ## 四、密钥与隐私

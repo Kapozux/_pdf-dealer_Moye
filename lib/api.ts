@@ -32,7 +32,21 @@ export type Job = {
   /** 同一次批量提交共享一个 batch_id；单份转换为 null */
   batch_id: string | null;
   batch_label: string | null;
+  /** 统计面板用：全文字数（求和自每页 charCount） */
+  char_count: number;
+  /** AI 打的主题标签，JSON 数组字符串；没打过是 null */
+  tags: string | null;
 };
+
+/** 个人数据统计面板：/api/stats 的返回结构。 */
+export type Stats = {
+  totals: { transcripts: number; pages: number; chars: number };
+  /** 按天聚合的页数，前端据此画累计折线图 */
+  timeline: { day: string; pages: number; count: number }[];
+  topTags: { tag: string; count: number }[];
+};
+
+export type TagBackfillState = { running: boolean; done: number; total: number; failed: number };
 
 /** 一次批量提交的汇总（服务端 SQL 聚合，不用逐份读任务）。 */
 export type Batch = {
@@ -128,6 +142,20 @@ export async function refineLibraryEntry(id: string): Promise<Job> {
 
 export function libraryPdfUrl(id: string): string {
   return `${SERVICE_BASE}/api/library/${id}/pdf`;
+}
+
+/** 个人数据统计面板的聚合数据。 */
+export async function fetchStats(): Promise<Stats> {
+  return asJson(await fetch(`${SERVICE_BASE}/api/stats`));
+}
+
+/** 给还没打标签的旧记录批量生成标签（新完成的任务已经自动打过了，这个只补历史）。 */
+export async function startTagBackfill(): Promise<TagBackfillState> {
+  return asJson(await fetch(`${SERVICE_BASE}/api/tags/backfill`, { method: "POST" }));
+}
+
+export async function fetchTagBackfillStatus(): Promise<TagBackfillState> {
+  return asJson(await fetch(`${SERVICE_BASE}/api/tags/backfill/status`));
 }
 
 /**

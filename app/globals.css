@@ -91,6 +91,7 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 .processing-orbit span { font-family:Georgia,serif; color:var(--green); font-size:20px; }
 .processing-orbit i { position:absolute; inset:-1px; border-radius:50%; border:2px solid transparent; border-top-color:var(--green); animation:spin 1.2s linear infinite; }
 @keyframes spin { to { transform:rotate(360deg); } }
+@keyframes fadeIn { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
 .progress-track { height:4px; width:min(430px,90%); margin:28px auto 0; background:rgba(31,91,65,.1); border-radius:999px; overflow:hidden; }
 .progress-track i { display:block; height:100%; background:var(--green); transition:width .25s ease; }
 .error-card { width:min(560px,100%); margin:auto; padding:80px 50px; text-align:center; border:1px solid var(--line); border-radius:18px; background:rgba(255,255,255,.35); }
@@ -146,6 +147,8 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 .library-toolbar>div { padding:8px 13px; border-left:1px solid var(--line); color:rgba(23,35,29,.5); font-size:11px; white-space:nowrap; }
 .library-toolbar>div strong { color:var(--ink); font-family:Georgia,serif; font-size:15px; font-weight:500; }
 .library-notice { margin-top:14px; padding:11px 14px; border:1px solid rgba(166,99,63,.28); border-radius:9px; color:#874b31; background:#f3e7dc; font-size:11px; }
+/* 重新精校失败时的提示：服务端会保留旧结果（不是报错屏），这条是唯一告诉用户"其实没变"的地方 */
+.result-notice { margin-bottom:14px; padding:11px 16px; border:1px solid rgba(166,99,63,.28); border-radius:10px; color:#874b31; background:#f3e7dc; font-size:12px; }
 .library-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-top:20px; }
 .library-card { min-width:0; border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.34); overflow:hidden; transition:.2s ease; }
 .library-card:hover { border-color:rgba(31,91,65,.35); transform:translateY(-2px); box-shadow:0 16px 36px rgba(35,50,41,.07); }
@@ -368,4 +371,43 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 .keypool-add:hover { border-color: rgba(38, 92, 62, .5); color: #2f6a49; background: rgba(38, 92, 62, .05); }
 .keypool-foot { display:flex; align-items:center; justify-content:space-between; gap:14px; flex-wrap:wrap; }
 .keypool-projects { display:flex; align-items:center; gap:8px; margin-top:11px; font-size:10.5px; color:rgba(71,46,34,.6); }
+
+/* ===== 左下角「你的墨页数据」统计面板（照 getAudio 的个人数据展板改的，换了配色） ===== */
+.stats-fab { position:fixed; left:20px; bottom:20px; z-index:900; }
+.stats-toggle {
+  display:inline-flex; align-items:center; gap:8px; padding:9px 15px;
+  border:1px solid var(--line); border-radius:999px; background:rgba(255,255,255,.55);
+  font-size:12px; color:var(--ink); cursor:pointer; box-shadow:0 8px 24px rgba(23,35,29,.1);
+  transition:background .15s ease, box-shadow .15s ease;
+}
+.stats-toggle:hover { background:rgba(255,255,255,.78); box-shadow:0 10px 28px rgba(23,35,29,.14); }
+.stats-dot { width:7px; height:7px; border-radius:50%; background:var(--green); flex:none; }
+.stats-panel {
+  position:absolute; left:0; bottom:46px; width:296px; padding:20px 22px;
+  border:1px solid var(--line); border-radius:16px; background:#fbfaf6;
+  box-shadow:0 20px 50px rgba(23,35,29,.16); animation:fadeIn .16s ease;
+}
+.stats-head { font-size:11px; letter-spacing:.1em; text-transform:uppercase; color:rgba(23,35,29,.48); font-weight:600; margin-bottom:14px; }
+.stats-nums { display:flex; gap:16px; margin-bottom:18px; }
+.stat-num { display:flex; flex-direction:column; gap:2px; }
+.stat-num b { font-family:Georgia,serif; font-size:23px; font-weight:600; letter-spacing:-.01em; color:var(--ink); }
+.stat-num span { font-size:10.5px; color:rgba(23,35,29,.5); }
+.stats-block { margin-top:14px; }
+.stats-label { font-size:11px; color:rgba(23,35,29,.5); font-weight:500; margin-bottom:8px; }
+.stats-label-row { display:flex; align-items:center; justify-content:space-between; }
+.stats-lang {
+  font-family:inherit; font-size:10px; font-weight:600; letter-spacing:.02em;
+  color:rgba(23,35,29,.55); background:transparent; cursor:pointer;
+  border:1px solid var(--line); border-radius:999px; padding:3px 9px;
+  transition:border-color .15s ease, color .15s ease;
+}
+.stats-lang:hover:not(:disabled) { border-color:var(--green); color:var(--green); }
+.stats-lang:disabled { opacity:.55; cursor:default; }
+.spark { width:100%; height:78px; display:block; }
+.spark-empty { font-size:11.5px; color:rgba(23,35,29,.4); padding:10px 0; }
+.stat-tag { display:flex; align-items:center; gap:8px; margin:6px 0; }
+.stat-tag-name { font-size:12px; color:var(--ink); width:68px; flex:none; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.stat-tag-bar { flex:1; height:6px; background:var(--green-soft); border-radius:999px; overflow:hidden; }
+.stat-tag-bar i { display:block; height:100%; background:var(--green); border-radius:999px; }
+.stat-tag-num { font-size:11px; color:rgba(23,35,29,.5); width:22px; text-align:right; flex:none; }
 .keypool-projects input { width:56px; height:30px; padding:0 8px; border:1px solid var(--line); border-radius:7px; background:#fff; font-size:11.5px; text-align:center; }

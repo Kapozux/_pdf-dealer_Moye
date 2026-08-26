@@ -4,9 +4,9 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { defaultAiSettings, fetchAiModels, getAiSettings, saveAiSettings, testAiSettings, type AiModelOption, type AiProvider, type AiSettings } from "../lib/ai-settings";
 import { type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
 import {
-  cancelJob, deleteLibraryEntry, fetchLibraryEntry, libraryPdfUrl, listJobs,
-  exportZipUrl, listBatches, listLibraryItems, refineLibraryEntry, submitJob, subscribeJobs,
-  type Batch, type Job,
+  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchStats, fetchTagBackfillStatus, libraryPdfUrl, listJobs,
+  exportZipUrl, listBatches, listLibraryItems, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
+  type Batch, type Job, type Stats, type TagBackfillState,
 } from "../lib/api";
 
 type Status = "idle" | "processing" | "batch" | "complete" | "error";
@@ -131,6 +131,41 @@ function formatDate(timestamp: number) {
   }).format(timestamp);
 }
 
+/** 大数字缩写成「12.3K」这种形式，给统计面板的字数用。 */
+function fmtBig(n: number) {
+  if (n >= 1e6) return `${(n / 1e6).toFixed(1)}M`;
+  if (n >= 1e3) return `${(n / 1e3).toFixed(1)}K`;
+  return String(n);
+}
+
+/**
+ * 自绘 SVG 折线（面积填充 + 端点强调），不依赖外部图表库——
+ * 照抄 getAudio 统计面板的手法，这里只是换了配色跟着墨页自己的 --green。
+ */
+function sparkline(values: number[], w = 272, h = 78) {
+  if (values.length < 2) return <div className="spark-empty">数据还不够画图</div>;
+  const pad = 6;
+  const maxY = Math.max(...values, 1);
+  const x = (i: number) => pad + (i / (values.length - 1)) * (w - 2 * pad);
+  const y = (v: number) => h - pad - (v / maxY) * (h - 2 * pad);
+  const pts = values.map((v, i) => `${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(" ");
+  const area = `${x(0)},${h - pad} ${pts} ${x(values.length - 1)},${h - pad}`;
+  const last = values.length - 1;
+  return (
+    <svg viewBox={`0 0 ${w} ${h}`} className="spark" preserveAspectRatio="none">
+      <defs>
+        <linearGradient id="sparkfill" x1="0" y1="0" x2="0" y2="1">
+          <stop offset="0" stopColor="var(--green)" stopOpacity="0.18" />
+          <stop offset="1" stopColor="var(--green)" stopOpacity="0" />
+        </linearGradient>
+      </defs>
+      <polygon points={area} fill="url(#sparkfill)" />
+      <polyline points={pts} fill="none" stroke="var(--green)" strokeWidth={2} strokeLinejoin="round" strokeLinecap="round" />
+      <circle cx={x(last)} cy={y(values[last])} r={3} fill="var(--green)" />
+    </svg>
+  );
+}
+
 function methodLabel(page: PageResult) {
   if (page.method === "ai") {
     const providerName = { gemini: "Gemini", kimi: "Kimi", qwen: "Qwen", openrouter: "OpenRouter" }[page.provider || "gemini"];
@@ -200,6 +235,8 @@ export default function Home() {
   const [progressDetail, setProgressDetail] = useState("正在读取 PDF 结构…");
   const [result, setResult] = useState<ConversionResult | null>(null);
   const [error, setError] = useState("");
+  // 重新精校失败时服务端会保留旧结果（不是空白报错屏），但要让用户知道这次其实没有真的变化
+  const [refineWarning, setRefineWarning] = useState("");
   const [tab, setTab] = useState<ResultTab>("markdown");
   const [copied, setCopied] = useState(false);
   const [screen, setScreen] = useState<Screen>("converter");
@@ -240,6 +277,11 @@ export default function Home() {
   // 本次转换的开始时刻，用来显示总计时（单份和批量共用）
   const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
   const [runEndedAt, setRunEndedAt] = useState<number | null>(null);
+  // 左下角「你的墨页数据」统计面板：开的时候才拉一次，不常驻轮询
+  const [statsOpen, setStatsOpen] = useState(false);
+  const [stats, setStats] = useState<Stats | null>(null);
+  const [statsLoaded, setStatsLoaded] = useState(false);
+  const [backfillState, setBackfillState] = useState<TagBackfillState | null>(null);
 
   useEffect(() => () => { if (sourceUrl) URL.revokeObjectURL(sourceUrl); }, [sourceUrl]);
   // 计时器只在真的有东西在跑时才转；跑完（runEndedAt 有值）立刻停，避免空转重渲染
@@ -301,6 +343,11 @@ export default function Home() {
 
   const reviewPages = useMemo(() => result?.pages.filter((page) => page.status === "review") ?? [], [result]);
   const comparedPages = useMemo(() => result?.pages.filter((page) => page.rawMarkdown !== undefined) ?? [], [result]);
+  // 统计面板的累计页数走势：时间线是按天的增量，前端自己滚成累计和
+  const cumPages = useMemo(() => {
+    let sum = 0;
+    return (stats?.timeline ?? []).map((point) => (sum += point.pages));
+  }, [stats]);
   const aiWasUsed = mode === "ai" || result?.pages.some((page) => page.method === "ai" || page.aiAttempted);
   // 哪些渠道已经有 Key（多渠道分流时实际参与的就是这几家）。
   // 用已保存的 settings 而不是 draft：draft 里的 Key 输入框是空的（留空=保留原值）。
@@ -316,20 +363,36 @@ export default function Home() {
     return normalized ? library.filter((item) => item.filename.toLocaleLowerCase().includes(normalized)) : library;
   }, [library, query]);
   /**
-   * 按合集分组显示：一次批量转换是一组（可整包下 zip），单独转的归到「单独转换」。
+   * 按合集分组显示：一次批量转换是一组（可整包下 zip），单独转的不分组。
    * 分组基于筛选后的结果，搜索时合集里只留匹配的那几份，空组不显示。
+   *
+   * 排列按「这组东西最后动过的时间」统一穿插排序，不是先摆完所有合集再摆单独转换——
+   * 以前是那样堆的，后果是随便一条新的单独转换（比如刚原地重新精校完的）都会被排到
+   * 全部合集下面，哪怕是几秒钟前才更新的，看起来就像"不见了"。
+   * 相邻的单独转换合并进同一个网格（减少视觉碎片），合集各自成块、带自己的表头。
    */
-  const librarySections = useMemo(() => {
+  const libraryTimeline = useMemo(() => {
     const byBatch = new Map<string, Job[]>();
-    const loose: Job[] = [];
+    const entries: { key: string; sortKey: number; batch?: Batch; item?: Job }[] = [];
     for (const item of filteredLibrary) {
-      if (!item.batch_id) loose.push(item);
+      if (!item.batch_id) entries.push({ key: item.id, sortKey: new Date(item.updated_at).getTime(), item });
       else byBatch.set(item.batch_id, [...(byBatch.get(item.batch_id) ?? []), item]);
     }
-    const sections = batches
-      .filter((batch) => byBatch.has(batch.id))
-      .map((batch) => ({ batch, items: byBatch.get(batch.id)! }));
-    return { sections, loose };
+    for (const batch of batches) {
+      if (byBatch.has(batch.id)) entries.push({ key: batch.id, sortKey: new Date(batch.updated_at).getTime(), batch });
+    }
+    entries.sort((a, b) => b.sortKey - a.sortKey);
+    const rows: { key: string; batch?: Batch; items: Job[] }[] = [];
+    for (const entry of entries) {
+      if (entry.batch) {
+        rows.push({ key: entry.key, batch: entry.batch, items: byBatch.get(entry.batch.id)! });
+        continue;
+      }
+      const prevRow = rows.at(-1);
+      if (prevRow && !prevRow.batch) prevRow.items.push(entry.item!);
+      else rows.push({ key: entry.key, items: [entry.item!] });
+    }
+    return rows;
   }, [filteredLibrary, batches]);
   const batchCompleted = batchItems.filter((item) => item.status === "complete").length;
   const batchFailed = batchItems.filter((item) => item.status === "error").length;
@@ -363,6 +426,39 @@ export default function Home() {
       setLibraryLoading(false);
     }
   }
+
+  /** 点开统计面板；只在第一次展开时拉数据，避免每次点开都请求一遍。 */
+  function toggleStats() {
+    setStatsOpen((wasOpen) => {
+      const next = !wasOpen;
+      if (next && !statsLoaded) {
+        void fetchStats()
+          .then((loaded) => { setStats(loaded); setStatsLoaded(true); })
+          .catch(() => undefined);
+      }
+      return next;
+    });
+  }
+
+  /** 给还没打过标签的旧记录批量补标签（新完成的任务已经会自动打标签）。 */
+  async function runBackfill() {
+    try {
+      setBackfillState(await startTagBackfill());
+    } catch {
+      /* 打标签失败不影响主流程，面板上没反应就是没反应 */
+    }
+  }
+  // 补标签跑起来之后轮询进度；跑完再刷一次统计，把新标签体现出来
+  useEffect(() => {
+    if (!backfillState?.running) return;
+    const timer = setInterval(() => {
+      void fetchTagBackfillStatus().then((next) => {
+        setBackfillState(next);
+        if (!next.running) void fetchStats().then(setStats).catch(() => undefined);
+      });
+    }, 1500);
+    return () => clearInterval(timer);
+  }, [backfillState?.running]);
 
   function openSettings() {
     setSettingsDraft({ ...settings, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
@@ -591,6 +687,7 @@ export default function Home() {
     setResult(null);
     setProgress({ page: 0, total: 0 });
     setError("");
+    setRefineWarning("");
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
     setSourceUrl("");
     setActiveFilename("");
@@ -617,6 +714,7 @@ export default function Home() {
       setMode(stored.mode);
       setTab(stored.mode === "ai" ? "compare" : "markdown");
       setCameFrom("batch");
+      setRefineWarning("");
       setStatus("complete");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "无法打开这份结果。");
@@ -685,6 +783,7 @@ export default function Home() {
       setResult(stored);
       setTab("markdown");
       setCameFrom("library");
+      setRefineWarning("");
       setStatus("complete");
       setScreen("converter");
     } catch (caught) {
@@ -715,9 +814,11 @@ export default function Home() {
     setMode("ai");
     setStatus("processing");
     setError("");
+    setRefineWarning("");
     setProgress({ page: 0, total: result.pageCount });
     setProgressDetail("正在复用 Library 中的本地初稿…");
     try {
+      // 现在是原地重跑同一条记录：job.id 就是 activeJobId 本身，不再是新 id
       const job = await refineLibraryEntry(activeJobId);
       const finished = await waitForJob(job.id, (live) => {
         setProgress({ page: live.page, total: live.total });
@@ -729,6 +830,9 @@ export default function Home() {
       setActiveJobId(finished.id);
       setTab("compare");
       setStatus("complete");
+      // 精校失败时服务端会原样保留旧结果（status 仍是 done），但把原因记在 error 字段——
+      // 不能因为"文档还在、没报错屏"就当作真的成功了，得让用户知道这次其实没变化
+      setRefineWarning(finished.error || "");
       await refreshLibrary();
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : "AI 精校失败。";
@@ -771,32 +875,22 @@ export default function Home() {
             <div className="library-empty"><span className="library-empty-mark">墨</span><h2>正在读取资料库…</h2></div>
           ) : filteredLibrary.length ? (
             <>
-              {librarySections.sections.map(({ batch, items }) => (
-                <section className="library-batch" key={batch.id}>
-                  <div className="library-batch-head">
-                    <div>
-                      <strong>{batch.label || "批量转换"}</strong>
-                      <span>{batch.total} 份 · {batch.pages} 页{batch.failed ? ` · ${batch.failed} 份失败` : ""}{batch.active ? ` · ${batch.active} 份进行中` : ""}</span>
-                    </div>
-                    <a className="secondary-button" href={exportZipUrl({ batchId: batch.id })} download>⭳ 下载这个合集</a>
-                  </div>
-                  <div className="library-grid">
-                    {items.map((record) => renderLibraryCard(record))}
-                  </div>
-                </section>
-              ))}
-              {librarySections.loose.length > 0 && (
-                <section className="library-batch">
-                  {librarySections.sections.length > 0 && (
+              {libraryTimeline.map((row) => (
+                <section className="library-batch" key={row.key}>
+                  {row.batch && (
                     <div className="library-batch-head">
-                      <div><strong>单独转换</strong><span>{librarySections.loose.length} 份</span></div>
+                      <div>
+                        <strong>{row.batch.label || "批量转换"}</strong>
+                        <span>{row.batch.total} 份 · {row.batch.pages} 页{row.batch.failed ? ` · ${row.batch.failed} 份失败` : ""}{row.batch.active ? ` · ${row.batch.active} 份进行中` : ""}</span>
+                      </div>
+                      <a className="secondary-button" href={exportZipUrl({ batchId: row.batch.id })} download>⭳ 下载这个合集</a>
                     </div>
                   )}
                   <div className="library-grid">
-                    {librarySections.loose.map((record) => renderLibraryCard(record))}
+                    {row.items.map((record) => renderLibraryCard(record))}
                   </div>
                 </section>
-              )}
+              ))}
             </>
           ) : (
             <div className="library-empty"><span className="library-empty-mark">墨</span><h2>{query ? "没有匹配的文件" : "资料库还是空的"}</h2><p>{query ? "换个关键词试试。" : "完成第一次转换后，文件会自动出现在这里。"}</p>{!query && <button className="primary-button" type="button" onClick={reset}>开始第一次转换</button>}</div>
@@ -984,6 +1078,11 @@ export default function Home() {
               <button type="button" className="primary-button" onClick={() => download(result.markdown, `${result.title}.md`, "text/markdown;charset=utf-8")}>下载 .md</button>
             </div>
           </header>
+          {refineWarning && (
+            <div className="result-notice" role="status">
+              ⚠ 重新精校失败，已保留原结果：{refineWarning}
+            </div>
+          )}
           <div className="score-strip">
             <div><strong>{result.pageCount - reviewPages.length}</strong><span>通过校验</span></div>
             <div className={reviewPages.length ? "needs-review" : ""}><strong>{reviewPages.length}</strong><span>建议检查</span></div>
@@ -1010,6 +1109,47 @@ export default function Home() {
       ) : null}
 
       <footer><span>墨页 · Verifiable document tools</span><span>{aiWasUsed ? "本地初稿 · 可选云端精校 · 逐页留痕" : "当前处理仅在你的设备完成"}</span></footer>
+
+      <div className="stats-fab">
+        {statsOpen && (
+          <div className="stats-panel" role="dialog" aria-label="你的墨页数据">
+            <div className="stats-head">你的墨页数据</div>
+            <div className="stats-nums">
+              <div className="stat-num"><b>{stats ? stats.totals.pages : "—"}</b><span>页已转换</span></div>
+              <div className="stat-num"><b>{stats ? fmtBig(stats.totals.chars) : "—"}</b><span>字</span></div>
+              <div className="stat-num"><b>{stats ? stats.totals.transcripts : "—"}</b><span>份文档</span></div>
+            </div>
+            <div className="stats-block">
+              <div className="stats-label">累计页数</div>
+              {stats ? sparkline(cumPages) : <div className="spark-empty">正在读取…</div>}
+            </div>
+            <div className="stats-block">
+              <div className="stats-label-row">
+                <span className="stats-label">关注领域</span>
+                <button type="button" className="stats-lang" disabled={backfillState?.running} onClick={() => void runBackfill()}>
+                  {backfillState?.running ? `补标签中 ${backfillState.done}/${backfillState.total}` : "补标签"}
+                </button>
+              </div>
+              {stats?.topTags.length ? (
+                <div>
+                  {stats.topTags.map((t) => (
+                    <div className="stat-tag" key={t.tag}>
+                      <span className="stat-tag-name" title={t.tag}>{t.tag}</span>
+                      <span className="stat-tag-bar"><i style={{ width: `${Math.max(6, (t.count / stats.topTags[0].count) * 100)}%` }} /></span>
+                      <span className="stat-tag-num">{t.count}</span>
+                    </div>
+                  ))}
+                </div>
+              ) : (
+                <div className="spark-empty">还没有标签 —— 点右上角&ldquo;补标签&rdquo;生成</div>
+              )}
+            </div>
+          </div>
+        )}
+        <button type="button" className="stats-toggle" onClick={toggleStats} aria-expanded={statsOpen}>
+          <span className="stats-dot" />你的数据
+        </button>
+      </div>
 
       {showSettings && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSettings(false); }}>

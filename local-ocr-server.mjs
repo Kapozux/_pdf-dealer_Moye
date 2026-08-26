@@ -3,7 +3,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createReadStream, createWriteStream } from "node:fs";
-import { copyFile, mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -148,18 +148,22 @@ function normalizeSettings(input, previous = defaultSettings) {
     geminiKeysExtra: mergeExtraKeys(input.geminiKeysExtra, previous.geminiKeysExtra),
     // 这些 key 分属几个**独立 Google 项目**（同项目的 key 共用配额，加了不提速）
     geminiProjects: Math.max(1, Number(input.geminiProjects) || Number(previous.geminiProjects) || 1),
-    geminiModel: cleanString(input.geminiModel) || defaultSettings.geminiModel,
-    geminiFallbackModel: cleanString(input.geminiFallbackModel) || defaultSettings.geminiFallbackModel,
-    geminiBaseUrl: cleanString(input.geminiBaseUrl) || defaultSettings.geminiBaseUrl,
+    // 模型/BaseURL 曾经跟 Key 不一样：传不全就退回硬编码默认值，而不是「上次保存的值」。
+    // 实测踩过一次——一个只带 {provider} 的请求（比如"测试连接"传了不完整的草稿）
+    // 会把用户已经存好的自定义 Base URL（比如 Kimi 的 .cn 地域）悄悄换回默认的 .ai，
+    // 认证接着莫名其妙失败。跟上面 Key 字段一样退回 previous，才不会被partial 请求冲掉。
+    geminiModel: cleanString(input.geminiModel) || previous.geminiModel || defaultSettings.geminiModel,
+    geminiFallbackModel: cleanString(input.geminiFallbackModel) || previous.geminiFallbackModel || defaultSettings.geminiFallbackModel,
+    geminiBaseUrl: cleanString(input.geminiBaseUrl) || previous.geminiBaseUrl || defaultSettings.geminiBaseUrl,
     kimiKey: cleanString(input.kimiKey) || previous.kimiKey || "",
-    kimiModel: cleanString(input.kimiModel) || defaultSettings.kimiModel,
-    kimiBaseUrl: cleanString(input.kimiBaseUrl) || defaultSettings.kimiBaseUrl,
+    kimiModel: cleanString(input.kimiModel) || previous.kimiModel || defaultSettings.kimiModel,
+    kimiBaseUrl: cleanString(input.kimiBaseUrl) || previous.kimiBaseUrl || defaultSettings.kimiBaseUrl,
     qwenKey: cleanString(input.qwenKey) || previous.qwenKey || "",
-    qwenModel: cleanString(input.qwenModel) || defaultSettings.qwenModel,
-    qwenBaseUrl: cleanString(input.qwenBaseUrl) || defaultSettings.qwenBaseUrl,
+    qwenModel: cleanString(input.qwenModel) || previous.qwenModel || defaultSettings.qwenModel,
+    qwenBaseUrl: cleanString(input.qwenBaseUrl) || previous.qwenBaseUrl || defaultSettings.qwenBaseUrl,
     openrouterKey: cleanString(input.openrouterKey) || previous.openrouterKey || "",
-    openrouterModel: cleanString(input.openrouterModel) || defaultSettings.openrouterModel,
-    openrouterBaseUrl: cleanString(input.openrouterBaseUrl) || defaultSettings.openrouterBaseUrl,
+    openrouterModel: cleanString(input.openrouterModel) || previous.openrouterModel || defaultSettings.openrouterModel,
+    openrouterBaseUrl: cleanString(input.openrouterBaseUrl) || previous.openrouterBaseUrl || defaultSettings.openrouterBaseUrl,
     aiScope,
     multiChannel: Boolean(input.multiChannel ?? previous.multiChannel ?? defaultSettings.multiChannel),
     channels: (Array.isArray(input.channels) ? input.channels : previous.channels ?? [])
@@ -551,11 +555,18 @@ const OPENROUTER_PROVIDERS = (process.env.MOYE_OPENROUTER_PROVIDERS || "CoreWeav
  * 顺序按实测（同一份数学 PDF、关推理）：
  *   moonshotai/kimi-k2.6  1.9 页/s  $0.0028/页  LaTeX 71  ← 公式最全，首选
  *   z-ai/glm-5v-turbo     1.8 页/s  $0.0055/页  LaTeX 64  ← 同速、贵一倍，但公式接近
- *   qwen/qwen3.7-flash    4.2 页/s  $0.00013/页 LaTeX 36  ← 最快最便宜，但公式会掉
  * 所以兜底顺序不是按速度排的，是按「公式保真度」排的——理科文档丢公式等于白转。
+ *
+ * 2026-08-25：qwen/qwen3.7-flash 曾经也挂在这条链上（4.2 页/s、$0.00013/页，
+ * 最快最便宜），但线上实测 OpenRouter 白名单五家现在对它全部返回
+ * 404「No endpoints found for qwen/qwen3.7-flash」——这个模型在 OpenRouter
+ * 上已经没有供应商在提供了。留着它只会让每次真正落到兜底链尾部时，
+ * callOpenRouterFailover 白白把五家逐个试一遍再失败，纯粹浪费时间预算，
+ * 于是摘掉。如果之后 OpenRouter 恢复了这个模型的供应商，可以加回来
+ * （直连 Qwen 走的是另一条代码路径，不受这里影响，qwen3.7-flash 本身没坏）。
  */
 const OPENROUTER_FALLBACK_MODELS = (process.env.MOYE_OPENROUTER_FALLBACK_MODELS
-  || "z-ai/glm-5v-turbo,qwen/qwen3.7-flash").split(",").map((m) => m.trim()).filter(Boolean);
+  || "z-ai/glm-5v-turbo").split(",").map((m) => m.trim()).filter(Boolean);
 
 /**
  * 模型熔断器。
@@ -675,7 +686,12 @@ async function callOpenAiCompatible(config, imageBase64, mimeType, draft, testOn
     },
     body: JSON.stringify({
       model: config.model,
-      temperature: 0,
+      // Moonshot 直连 API 对 kimi-k2.6 这类模型锁死了采样参数：温度传 0 会被
+      // 拒绝——"invalid temperature: only 0.6 is allowed for this model"，
+      // 实测直连测试时 400 就是这个。只在直连 Kimi 时用 0.6，其余渠道
+      // （包括 OpenRouter 上转售的同名模型，走的是第三方主机，不受此限制）
+      // 仍用 0——微调过、别顺手改回统一值。
+      temperature: config.provider === "kimi" ? 0.6 : 0,
       // 钉住底层供应商。见 OPENROUTER_PROVIDERS 的实测说明——不指定的话
       // OpenRouter 会把请求几乎全灌给一家（实测是 StreamLake），那家的并发上限
       // 就成了整个渠道的天花板，超出的请求直接挂死不返回。
@@ -880,6 +896,84 @@ async function listConfiguredModels(settings) {
   };
 }
 
+/**
+ * 文档主题标签：转换完成后（不分模式）用当前配置的模型给文档打 2-4 个简短
+ * 主题/类型标签，供 Library 统计面板的「关注领域」用。参考 getAudio 的
+ * enrich.py：只读一小段内容、模型选便宜的就行，不走 aiGate/pacer 那整套节流
+ * （量小——一份文档一次，没必要）。
+ *
+ * 这是用户自己决定要的行为：本地模式（fast/balanced）的文档本来"零上传"，
+ * 打标签会为了这一小段摘要发一次内容出去，跟"本地模式不上传"不是同一件事——
+ * 这是明确的取舍，不是应该"修复"掉的疏漏。没配置任何 AI Key 时这个功能
+ * 本来就调不动，直接跳过（返回 null），不算失败。
+ */
+const TAG_PROMPT = (title, content) => `根据这份 PDF 转换出的文档内容，给它打 2-4 个简短的主题/类型标签（如：教材、试卷、论文、合同、小说、财报、计算机科学、数学、历史）。
+
+标题：${title}
+内容开头：
+${content}
+
+严格输出 JSON，不要输出其他任何内容：
+{"tags": ["标签1","标签2"]}`;
+
+/** 纯文本模型调用（打标签用），不带图像，走当前设置里选定的那一家 provider。 */
+async function callTextModel(settings, prompt) {
+  const deadline = Date.now() + 30000;
+  if (settings.provider === "gemini") {
+    if (!settings.geminiKey) throw new Error("Gemini 未配置 Key。");
+    const key = nextGeminiKey(settings) || settings.geminiKey;
+    const url = `${settings.geminiBaseUrl.replace(/\/$/, "")}/models/${encodeURIComponent(settings.geminiModel)}:generateContent`;
+    const payload = await postWithRetries(url, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+      body: JSON.stringify({
+        contents: [{ role: "user", parts: [{ text: prompt }] }],
+        generationConfig: { temperature: 0.3, responseMimeType: "application/json" },
+      }),
+    }, 2, 20000, deadline);
+    return payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
+  }
+  const config = directProviderConfig(settings.provider, settings);
+  if (!config?.key) throw new Error(`${config?.label ?? settings.provider} 未配置 Key。`);
+  const payload = await postWithRetries(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.key}` },
+    body: JSON.stringify({
+      model: config.model,
+      // kimi-k2.6 直连锁死温度：关推理时必须是 0.6，不关推理必须是 1（实测两条路各自
+      // 唯一允许值不同）。这里漏加过 thinking 字段，导致温度传 0.6 却没关推理，
+      // 135 份补标签全部 400——修的时候两个字段必须配对着改，见 callOpenAiCompatible。
+      temperature: settings.provider === "kimi" ? 0.6 : 0.3,
+      messages: [{ role: "user", content: prompt }],
+      ...(settings.provider !== "qwen" ? { response_format: { type: "json_object" } } : {}),
+      ...(settings.provider === "kimi" ? { max_completion_tokens: 200 } : { max_tokens: 200 }),
+      ...(settings.provider === "kimi" && config.model.startsWith("kimi-k2.6") ? { thinking: { type: "disabled" } } : {}),
+    }),
+  }, 2, 20000, deadline);
+  const content = payload?.choices?.[0]?.message?.content || "";
+  return Array.isArray(content) ? content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("") : content;
+}
+
+/** 给一份已完成的任务生成标签；没配 Key、内容太短、模型失败都返回 null（调用方决定要不要重试）。 */
+async function generateTags(job) {
+  const settings = await loadSettings();
+  const keys = { gemini: settings.geminiKey, kimi: settings.kimiKey, qwen: settings.qwenKey, openrouter: settings.openrouterKey };
+  if (!keys[settings.provider]) return null;
+  const result = await jobStore.readResult(job.id);
+  const content = String(result?.markdown ?? "")
+    .replace(/[#*`$|<>\\]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 3000);
+  if (content.length < 20) return null;
+  const raw = await callTextModel(settings, TAG_PROMPT(job.filename.replace(/\.pdf$/i, ""), content));
+  const parsed = extractJson(raw);
+  const tags = Array.isArray(parsed?.tags)
+    ? parsed.tags.map((t) => String(t).trim().slice(0, 10)).filter(Boolean).slice(0, 4)
+    : [];
+  return tags.length ? tags : null;
+}
+
 // ===== 服务端编排：存储 + 管线 + 队列 =====
 // Surya 与 AI 调用以依赖注入方式交给管线（同进程直接调用，不再自己请求自己）。
 const jobStore = new JobStore(resolve(root, "data"));
@@ -933,13 +1027,69 @@ const jobQueue = new JobQueue({
     }
     // 逐页存档：服务重启后从上次的页续跑，而不是整份重来
     const checkpoint = jobStore.checkpoint(job.id);
-    return previous
-      ? converter.refineExisting(pdfPath, title, previous, onProgress, checkpoint)
-      : converter.convertPdf(pdfPath, title, job.mode, onProgress, checkpoint);
+    if (previous) {
+      // 重新精校现在是原地覆盖同一条记录（见 /refine 路由的说明）：失败绝不能让
+      // 这份已经成功过的文档从 Library 消失。这里兜底——精校失败就把旧结果原样
+      // 交回去（等同"这次没有变化"），但把真实原因记进 error 字段，不是静默吞掉，
+      // 前端会在结果页显示"重新精校失败，已保留原结果"。
+      try {
+        return await converter.refineExisting(pdfPath, title, previous, onProgress, checkpoint);
+      } catch (error) {
+        console.warn(`[重新精校失败] ${job.filename}：${String(error?.message ?? error).slice(0, 200)}，已回退保留原结果`);
+        jobStore.update(job.id, { error: `重新精校失败，已保留原结果：${String(error?.message ?? error).slice(0, 200)}` });
+        return previous;
+      }
+    }
+    return converter.convertPdf(pdfPath, title, job.mode, onProgress, checkpoint);
   },
 });
 
 jobQueue.on("job", (job) => events.broadcast("job", job));
+
+// 转换完成后顺手打标签：不阻塞任务本身完成（fire-and-forget），失败按规则记日志，不静默吞掉。
+// "job" 事件里 done 只在 queue.mjs 的 finally 里广播一次，不会为同一份文档重复触发；
+// 但"重新精校"现在是原地重跑同一个 id，同一份文档会再走一次 done——已经打过
+// 标签的不用重打，省一次没必要的调用（内容大概率还是那些主题）。
+jobQueue.on("job", (job) => {
+  if (job.status !== "done" || job.tags) return;
+  void generateTags(job)
+    .then((tags) => {
+      if (!tags) return;
+      jobStore.setTags(job.id, tags);
+      events.broadcast("job", jobStore.get(job.id));
+    })
+    .catch((error) => {
+      console.warn(`[标签生成失败] ${job.filename}：${String(error?.message ?? error).slice(0, 160)}`);
+    });
+});
+
+// 补标签进度：给已完成但还没打过标签的旧记录批量生成，仿 getAudio 的 "Auto-title"。
+// 模块级状态即可——同一时间只需要一份进度，不需要为每次调用建任务表。
+const tagBackfillState = { running: false, done: 0, total: 0, failed: 0 };
+async function runTagBackfill() {
+  const pending = jobStore.list({ limit: 5000 }).filter((job) => job.status === "done" && !job.tags);
+  tagBackfillState.running = true;
+  tagBackfillState.done = 0;
+  tagBackfillState.total = pending.length;
+  tagBackfillState.failed = 0;
+  for (const job of pending) {
+    try {
+      const tags = await generateTags(job);
+      if (tags) {
+        jobStore.setTags(job.id, tags);
+        events.broadcast("job", jobStore.get(job.id));
+      } else {
+        tagBackfillState.failed += 1;
+      }
+    } catch (error) {
+      tagBackfillState.failed += 1;
+      console.warn(`[标签生成失败] ${job.filename}：${String(error?.message ?? error).slice(0, 160)}`);
+    }
+    tagBackfillState.done += 1;
+    await sleep(300);   // 别把这一批打太快，跟正常转换任务抢配额
+  }
+  tagBackfillState.running = false;
+}
 
 const server = createServer(async (request, response) => {
   cors(response, request);
@@ -1111,6 +1261,48 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    // ---- 个人数据统计面板：总量 / 每日时间线 / 标签占比 ----
+    if (request.method === "GET" && request.url === "/api/stats") {
+      const totals = jobStore.statsTotals();
+      const tagCounts = new Map();
+      for (const row of jobStore.statsTagRows()) {
+        let tags;
+        try {
+          tags = JSON.parse(row.tags);
+        } catch {
+          continue;   // 坏掉的 JSON 直接跳过，不让一条脏数据搞挂整个统计
+        }
+        if (!Array.isArray(tags)) continue;
+        for (const tag of tags) tagCounts.set(tag, (tagCounts.get(tag) ?? 0) + 1);
+      }
+      const topTags = [...tagCounts.entries()]
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 8)
+        .map(([tag, count]) => ({ tag, count }));
+      sendJson(response, 200, {
+        totals: { transcripts: totals.transcripts, pages: totals.pages, chars: totals.chars },
+        timeline: jobStore.statsTimeline(),
+        topTags,
+      });
+      return;
+    }
+
+    // 给旧记录批量补标签（新完成的任务已经会自动打标签，这个只是回填历史）
+    if (request.method === "POST" && request.url === "/api/tags/backfill") {
+      if (tagBackfillState.running) {
+        sendJson(response, 200, { ok: true, alreadyRunning: true, ...tagBackfillState });
+        return;
+      }
+      void runTagBackfill();
+      sendJson(response, 202, { ok: true, ...tagBackfillState });
+      return;
+    }
+
+    if (request.method === "GET" && request.url === "/api/tags/backfill/status") {
+      sendJson(response, 200, tagBackfillState);
+      return;
+    }
+
     // ---- 批次（合集）：一次批量提交归成一组，可整包下载 ----
     if (request.method === "GET" && request.url === "/api/batches") {
       sendJson(response, 200, { batches: jobStore.listBatches() });
@@ -1196,19 +1388,21 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    // 重跑 AI 精校：复用已存的本地初稿，不重新跑 Surya
+    // 重跑 AI 精校：原地覆盖同一条 Library 记录，不再新建——
+    // 新建会让 Library 无限增殖，还会丢掉原有的 batch_id（新记录变成孤儿，
+    // 从合集里"消失"，实测找不到）。原地重跑顺带保住了 batch_id。
     const refineMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/refine$/);
     if (request.method === "POST" && refineMatch) {
-      const source = jobStore.get(refineMatch[1]);
-      if (!source) return sendJson(response, 404, { error: "记录不存在。" });
-      const previous = await jobStore.readResult(source.id);
+      const job = jobStore.get(refineMatch[1]);
+      if (!job) return sendJson(response, 404, { error: "记录不存在。" });
+      if (job.status !== "done") return sendJson(response, 400, { error: "这份任务还没完成，暂时不能重新精校。" });
+      const previous = await jobStore.readResult(job.id);
       if (!previous) return sendJson(response, 404, { error: "没有可复用的初稿。" });
-      const id = randomUUID();
-      jobStore.create({ id, filename: source.filename, fileSize: source.file_size, mode: "ai" });
-      await copyFile(jobStore.sourcePath(source.id), jobStore.sourcePath(id));
-      await writeFile(join(jobStore.dir(id), "previous.json"), JSON.stringify(previous), "utf8");
-      jobQueue.enqueue(id);
-      sendJson(response, 202, { job: jobStore.get(id) });
+      await jobStore.backupResult(job.id);   // 留一份 .prev 备份，万一这次结果更差还能手动捞回来
+      await writeFile(join(jobStore.dir(job.id), "previous.json"), JSON.stringify(previous), "utf8");
+      jobStore.update(job.id, { status: "queued", detail: "重新精校排队中，正在复用当前结果作为初稿", error: null, page: 0 });
+      jobQueue.enqueue(job.id);
+      sendJson(response, 202, { job: jobStore.get(job.id) });
       return;
     }
 

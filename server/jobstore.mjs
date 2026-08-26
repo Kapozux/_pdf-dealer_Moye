@@ -13,7 +13,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
-import { appendFile, readFile, writeFile, rm } from "node:fs/promises";
+import { appendFile, copyFile, readFile, writeFile, rm } from "node:fs/promises";
 import { join } from "node:path";
 
 export const JOB_STATES = ["queued", "running", "done", "failed", "cancelled"];
@@ -50,6 +50,9 @@ export class JobStore {
     if (!columns.has("batch_id")) this.db.exec("ALTER TABLE jobs ADD COLUMN batch_id TEXT");
     if (!columns.has("batch_label")) this.db.exec("ALTER TABLE jobs ADD COLUMN batch_label TEXT");
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_jobs_batch ON jobs(batch_id)");
+    // 同样是后加的：char_count 给统计面板算总字数，tags 是 AI 打的主题标签（JSON 数组字符串）
+    if (!columns.has("char_count")) this.db.exec("ALTER TABLE jobs ADD COLUMN char_count INTEGER NOT NULL DEFAULT 0");
+    if (!columns.has("tags")) this.db.exec("ALTER TABLE jobs ADD COLUMN tags TEXT");
   }
 
   dir(id) {
@@ -85,6 +88,11 @@ export class JobStore {
     if (["done", "failed", "cancelled"].includes(fields.status)) {
       sets.push("finished_at = ?");
       values.push(new Date().toISOString());
+    } else if (fields.status === "queued") {
+      // 重新精校会把一份已经 done 过的任务原地重新排队：finished_at 要清掉，
+      // 否则"完成时间"会一直停在上一次，看着比"重新开始"还早，很奇怪。
+      sets.push("finished_at = ?");
+      values.push(null);
     }
     values.push(id);
     this.db.prepare(`UPDATE jobs SET ${sets.join(", ")} WHERE id = ?`).run(...values);
@@ -145,6 +153,21 @@ export class JobStore {
     return join(this.dir(id), "source.pdf");
   }
 
+  /**
+   * 重新精校前留一份"上一版"的备份（只留一层，不是完整版本历史）。
+   *
+   * 以前"重新精校"会整个新建一份 Library 记录，旧的原样留着——好处是绝不丢数据，
+   * 坏处是 Library 无限增殖，而且新记录不带原来的 batch_id，会从合集里"消失"
+   * （实测就找不到了）。现在改成原地覆盖同一条记录，为了不让"新结果比旧的差"
+   * 变成没有后悔药，覆盖前顺手拷一份 .prev 文件——不接入 Library/UI，纯粹是
+   * 万一需要时能手动把 result.prev.json 改回 result.json 抢救回来。
+   */
+  async backupResult(id) {
+    const dir = this.dir(id);
+    await copyFile(join(dir, "result.json"), join(dir, "result.prev.json")).catch(() => undefined);
+    await copyFile(join(dir, "document.md"), join(dir, "document.prev.md")).catch(() => undefined);
+  }
+
   async saveResult(id, result) {
     await writeFile(join(this.dir(id), "result.json"), JSON.stringify(result), "utf8");
     if (typeof result?.markdown === "string") {
@@ -157,15 +180,53 @@ export class JobStore {
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 240);
+    // 统计面板要用：字数按每页已经算好的 charCount 求和，不用重新扫一遍全文
+    const charCount = pages.reduce((sum, p) => sum + (Number(p?.charCount) || 0), 0);
     this.db
-      .prepare("UPDATE jobs SET page_count = ?, review_count = ?, ai_pages = ?, preview = ? WHERE id = ?")
+      .prepare("UPDATE jobs SET page_count = ?, review_count = ?, ai_pages = ?, char_count = ?, preview = ? WHERE id = ?")
       .run(
         Number(result?.pageCount ?? 0),
         pages.filter((p) => p?.status === "review").length,
         pages.filter((p) => p?.method === "ai").length,
+        charCount,
         preview,
         id
       );
+  }
+
+  /** 给某条记录写入 AI 打的主题标签（数组），供统计面板聚合。 */
+  setTags(id, tags) {
+    this.db.prepare("UPDATE jobs SET tags = ? WHERE id = ?").run(JSON.stringify(tags ?? []), id);
+  }
+
+  /**
+   * 统计面板用的三块聚合，全部走 SQL，不逐份读 result.json——
+   * 跟 listBatches() 是同一个思路：列表页要快，聚合交给数据库。
+   */
+  statsTotals() {
+    return this.db
+      .prepare(
+        `SELECT COUNT(*) AS transcripts, COALESCE(SUM(page_count),0) AS pages, COALESCE(SUM(char_count),0) AS chars
+           FROM jobs WHERE status = 'done'`
+      )
+      .get();
+  }
+
+  /** 按天聚合的页数时间线，前端拿去画累计折线图。 */
+  statsTimeline() {
+    return this.db
+      .prepare(
+        `SELECT date(created_at) AS day, SUM(page_count) AS pages, COUNT(*) AS count
+           FROM jobs WHERE status = 'done' GROUP BY day ORDER BY day`
+      )
+      .all();
+  }
+
+  /** 已经打过标签的记录（标签本身是 JSON 数组字符串，聚合计数交给调用方在 JS 里做）。 */
+  statsTagRows() {
+    return this.db
+      .prepare("SELECT tags FROM jobs WHERE status = 'done' AND tags IS NOT NULL AND tags != ''")
+      .all();
   }
 
   /**

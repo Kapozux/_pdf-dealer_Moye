@@ -117,6 +117,7 @@ export function safeEntryName(name, fallback = "document") {
   const cleaned = String(name || "")
     .replace(/\.pdf$/i, "")
     .replace(/[/\\]/g, "_")
+    // eslint-disable-next-line no-control-regex -- 控制字符正是要过滤的对象
     .replace(/[:*?"<>|\x00-\x1f]/g, "_")
     .replace(/^\.+/, "")
     .trim();

@@ -28,7 +28,11 @@ type BatchItemStatus = "queued" | "processing" | "complete" | "error";
 type BatchItem = {
   id: string;
   jobId?: string;
-  file: File;
+  /** 名字和大小单独存：从 URL 重新打开一个批次时没有 File 对象，只有服务端记录 */
+  name: string;
+  size: number;
+  /** 只有本次会话里刚选的文件才有；提交之后就不再需要 */
+  file?: File;
   status: BatchItemStatus;
   page: number;
   total: number;
@@ -39,6 +43,37 @@ type BatchItem = {
   startedAt?: number;
   finishedAt?: number;
 };
+
+/**
+ * 页面路由（hash）。每个界面有自己的地址：Library、某份文档、某个批次——
+ * 浏览器前进/后退能用，刷新不会丢页面，地址栏能直接分享给自己下次点开。
+ * 用 hash 而不是真路径：vinext 的 app-router 按文件系统分路由，/library 会 404，
+ * hash 对服务端完全透明，零风险。首页就是没有 hash 的裸地址。
+ */
+type Route =
+  | { name: "home" }
+  | { name: "library" }
+  | { name: "doc"; id: string }
+  | { name: "batch"; id: string };
+
+function parseRoute(hash: string): Route {
+  const path = hash.replace(/^#\/?/, "").replace(/\/+$/, "");
+  if (path === "library") return { name: "library" };
+  const doc = path.match(/^doc\/([\w-]+)$/);
+  if (doc) return { name: "doc", id: doc[1] };
+  const batch = path.match(/^batch\/([\w-]+)$/);
+  if (batch) return { name: "batch", id: batch[1] };
+  return { name: "home" };
+}
+
+function routeHash(route: Route): string {
+  switch (route.name) {
+    case "library": return "#/library";
+    case "doc": return `#/doc/${route.id}`;
+    case "batch": return `#/batch/${route.id}`;
+    default: return "";
+  }
+}
 
 const modeNames: Record<ConversionMode, string> = {
   fast: "本地快速",
@@ -241,7 +276,6 @@ export default function Home() {
   const [dragging, setDragging] = useState(false);
   const [mode, setMode] = useState<ConversionMode>("balanced");
   const [status, setStatus] = useState<Status>("idle");
-  const [file, setFile] = useState<File | null>(null);
   const [sourceUrl, setSourceUrl] = useState("");
   const [progress, setProgress] = useState({ page: 0, total: 0 });
   const [progressDetail, setProgressDetail] = useState("正在读取 PDF 结构…");
@@ -270,6 +304,8 @@ export default function Home() {
   const [remoteModels, setRemoteModels] = useState<{ provider: AiProvider; models: AiModelOption[] } | null>(null);
   const [batchItems, setBatchItems] = useState<BatchItem[]>([]);
   const [batchRunning, setBatchRunning] = useState(false);
+  // 当前批次页对应的服务端 batch_id；有了它批次页才能有自己的地址、刷新后从服务端重建
+  const [batchId, setBatchId] = useState("");
   // 选好的文件先暂存，等用户按「开始转换」再提交——不再一选中就自动跑
   const [staged, setStaged] = useState<File[]>([]);
   /**
@@ -442,6 +478,157 @@ export default function Home() {
     }
   }
 
+  // ---------- 路由：地址栏 ⇄ 界面状态 ----------
+  /** 只改地址栏，不动界面。提交任务这种"界面已经在正确状态"的场合用它。 */
+  function setRoute(route: Route, replace = false) {
+    const target = routeHash(route) || `${window.location.pathname}${window.location.search}`;
+    const current = `${window.location.pathname}${window.location.search}${window.location.hash}`;
+    if (replace || current === target) window.history.replaceState(null, "", target);
+    else window.history.pushState(null, "", target);
+  }
+  /** 改地址栏并切到对应界面（点按钮跳转都走这里）。 */
+  function navigate(route: Route) {
+    setRoute(route);
+    void applyRoute(route);
+  }
+  /** 按地址显示界面：初次打开、前进/后退、navigate 都最终落到这里。 */
+  async function applyRoute(route: Route) {
+    if (route.name === "home") { resetState(); return; }
+    if (route.name === "library") { setScreen("library"); void refreshLibrary(); return; }
+    if (route.name === "doc") { await loadDoc(route.id); return; }
+    await loadBatch(route.id);
+  }
+  // popstate 回调只注册一次，但要调用"最新"的 applyRoute（它闭包了最新 state）
+  const applyRouteRef = useRef(applyRoute);
+  applyRouteRef.current = applyRoute;
+  useEffect(() => {
+    const onPop = () => { void applyRouteRef.current(parseRoute(window.location.hash)); };
+    window.addEventListener("popstate", onPop);
+    void applyRouteRef.current(parseRoute(window.location.hash));
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
+
+  /**
+   * 按任务 id 打开一份文档——Library 点开、批次里点"查看"、直接输入地址、刷新，全走这里。
+   * 任务还在跑就先显示进度页，跑完自动切到结果；已完成就直接取结果。
+   */
+  async function loadDoc(id: string) {
+    try {
+      const job = (await listJobs()).find((item) => item.id === id) ?? null;
+      setScreen("converter");
+      setActiveJobId(id);
+      if (sourceUrl) URL.revokeObjectURL(sourceUrl);
+      setSourceUrl(libraryPdfUrl(id));
+      setError("");
+      setRefineWarning("");
+      if (job) setActiveFilename(job.filename);
+      if (job && (job.status === "queued" || job.status === "running")) {
+        setMode(job.mode);
+        setProgress({ page: job.page, total: job.total });
+        setProgressDetail(job.detail || "正在处理…");
+        setRunStartedAt(new Date(job.created_at).getTime());
+        setRunEndedAt(null);
+        setStatus("processing");
+        const finished = await waitForJob(id, (live) => {
+          setProgress({ page: live.page, total: live.total });
+          if (live.detail) setProgressDetail(live.detail);
+        });
+        setRunEndedAt(Date.now());
+        if (finished.status !== "done") throw new Error(finished.error || "转换未完成。");
+      } else if (job && job.status !== "done") {
+        throw new Error(job.error || "这份任务没有完成。");
+      }
+      // listJobs 只取最近 200 条；更老的记录直接按 id 取结果
+      const { job: storedJob, result: stored } = await fetchLibraryEntry(id);
+      setActiveFilename(storedJob.filename);
+      setMode(stored.mode);
+      setResult(stored);
+      setTab(stored.mode === "ai" ? "compare" : "markdown");
+      setStatus("complete");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "无法打开这份记录。");
+      setStatus("error");
+    }
+  }
+
+  /** 跟踪批次里一份任务的进度直到结束（新提交的和从地址重建的都用它）。 */
+  async function trackBatchJob(itemId: string, jobId: string) {
+    try {
+      // 进度回调节流：批量转换时十几份同时推进度，每条都 setState 会卡死界面
+      let lastPaint = 0;
+      const finished = await waitForJob(jobId, (live) => {
+        const now = Date.now();
+        const isEdge = live.status !== "running" || live.page >= live.total;
+        if (!isEdge && now - lastPaint < 500) return;
+        lastPaint = now;
+        updateBatchItem(itemId, {
+          page: live.page,
+          total: live.total,
+          detail: live.detail || "正在转换…",
+          status: live.status === "queued" ? "queued" : "processing",
+        });
+      });
+      if (finished.status !== "done") throw new Error(finished.error || "转换未完成。");
+      updateBatchItem(itemId, {
+        status: "complete",
+        jobId: finished.id,
+        page: finished.total,
+        total: finished.total,
+        detail: `已完成并存入 Library · ${finished.total} 页`,
+        finishedAt: Date.now(),
+      });
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : "转换失败。";
+      updateBatchItem(itemId, { status: "error", detail: "处理失败，其余文件继续", error: message, finishedAt: Date.now() });
+    }
+  }
+
+  /**
+   * 按 batch_id 打开批次页。内存里就是这个批次直接显示；否则（刷新、直接输地址）
+   * 从服务端把这一批任务读回来重建，还在跑的继续订阅进度——以前批次页只存在内存里，
+   * 一刷新就没了，任务明明还在跑，人却只能去 Library 里翻。
+   */
+  async function loadBatch(id: string) {
+    setScreen("converter");
+    if (batchId === id && batchItems.length) { setStatus("batch"); return; }
+    try {
+      const jobs = (await listJobs()).filter((job) => job.batch_id === id);
+      if (!jobs.length) throw new Error("找不到这个批次，可能已被删除。");
+      const toMs = (iso: string | null) => (iso ? new Date(iso).getTime() : undefined);
+      const items: BatchItem[] = jobs.map((job) => ({
+        id: job.id,
+        jobId: job.id,
+        name: job.filename,
+        size: job.file_size,
+        status: job.status === "done" ? "complete" : job.status === "queued" ? "queued" : job.status === "running" ? "processing" : "error",
+        page: job.page,
+        total: job.total,
+        detail: job.status === "done" ? `已完成并存入 Library · ${job.total} 页` : job.status === "failed" ? "处理失败，其余文件继续" : job.detail,
+        error: job.error ?? undefined,
+        startedAt: toMs(job.created_at),
+        finishedAt: toMs(job.finished_at),
+      }));
+      const live = items.filter((item) => item.status === "queued" || item.status === "processing");
+      setBatchId(id);
+      setBatchItems(items);
+      setMode(jobs[0].mode);
+      setError("");
+      setRunStartedAt(Math.min(...items.map((item) => item.startedAt ?? Date.now())));
+      setRunEndedAt(live.length ? null : Math.max(...items.map((item) => item.finishedAt ?? 0)) || Date.now());
+      setBatchRunning(live.length > 0);
+      setStatus("batch");
+      if (live.length) {
+        await Promise.all(live.map((item) => trackBatchJob(item.id, item.jobId!)));
+        setBatchRunning(false);
+        setRunEndedAt(Date.now());
+        await refreshLibrary();
+      }
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : "无法打开这个批次。");
+      setStatus("error");
+    }
+  }
+
   /** 点开统计面板；只在第一次展开时拉数据，避免每次点开都请求一遍。 */
   function toggleStats() {
     setStatsOpen((wasOpen) => {
@@ -546,7 +733,6 @@ export default function Home() {
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
     // PPT 还没转换完，没有 PDF 可预览；等下面转换完了再指到服务端转出的那份。
     setSourceUrl(isPdfFile(selected) ? URL.createObjectURL(selected) : "");
-    setFile(selected);
     setActiveFilename(selected.name);
     setMode(selectedMode);
     setScreen("converter");
@@ -560,6 +746,8 @@ export default function Home() {
     try {
       // 交给服务端跑：这里只提交 + 等结果，关掉页面任务也会继续
       const job = await submitJob(selected, selectedMode);
+      setActiveJobId(job.id);
+      setRoute({ name: "doc", id: job.id });   // 有了 id 就有了地址：刷新会回到这份的进度/结果
       const finished = await waitForJob(job.id, (live) => {
         setProgress({ page: live.page, total: live.total });
         if (live.detail) setProgressDetail(live.detail);
@@ -612,6 +800,8 @@ export default function Home() {
     if (sourceUrl) URL.revokeObjectURL(sourceUrl);
     const queue = pdfFiles.map((selected, index): BatchItem => ({
       id: `${selected.name}-${selected.size}-${selected.lastModified}-${index}`,
+      name: selected.name,
+      size: selected.size,
       file: selected,
       status: "queued",
       page: 0,
@@ -619,7 +809,6 @@ export default function Home() {
       detail: "等待处理",
     }));
     setSourceUrl("");
-    setFile(null);
     setResult(null);
     setError("");
     setMode(selectedMode);
@@ -632,46 +821,23 @@ export default function Home() {
 
     // 多份一起转 = 一个合集：同一个 batch id，Library 里能整包下 zip。
     // 只有一份就不建合集，免得 Library 里全是「1 份文件」的空壳分组。
-    const batch =
-      queue.length > 1
-        ? {
-            id: crypto.randomUUID(),
-            label: `${queue.length} 份 · ${new Date().toLocaleString("zh-CN", {
-              month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
-            })}`,
-          }
-        : undefined;
+    const batch = {
+      id: crypto.randomUUID(),
+      label: `${queue.length} 份 · ${new Date().toLocaleString("zh-CN", {
+        month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
+      })}`,
+    };
+    setBatchId(batch.id);
+    setRoute({ name: "batch", id: batch.id });   // 批次页有了地址：刷新后从服务端重建，任务照跑
 
     // 整批一次性提交给服务端；排队和并发由服务端统一控制，
     // 浏览器只负责显示进度（关掉页面这批也会继续跑完）。
     await Promise.all(
       queue.map(async (item) => {
         try {
-          const job = await submitJob(item.file, selectedMode, batch);
+          const job = await submitJob(item.file!, selectedMode, batch);
           updateBatchItem(item.id, { jobId: job.id, status: "processing", detail: "已提交，等待服务端处理…", startedAt: Date.now() });
-          // 进度回调节流：批量转换时十几份同时推进度，每条都 setState 会卡死界面
-          let lastPaint = 0;
-          const finished = await waitForJob(job.id, (live) => {
-            const now = Date.now();
-            const isEdge = live.status !== "running" || live.page >= live.total;
-            if (!isEdge && now - lastPaint < 500) return;
-            lastPaint = now;
-            updateBatchItem(item.id, {
-              page: live.page,
-              total: live.total,
-              detail: live.detail || "正在转换…",
-              status: live.status === "queued" ? "queued" : "processing",
-            });
-          });
-          if (finished.status !== "done") throw new Error(finished.error || "转换未完成。");
-          updateBatchItem(item.id, {
-            status: "complete",
-            jobId: finished.id,
-            page: finished.total,
-            total: finished.total,
-            detail: `已完成并存入 Library · ${finished.total} 页`,
-            finishedAt: Date.now(),
-          });
+          await trackBatchJob(item.id, job.id);
         } catch (caught) {
           const message = caught instanceof Error ? caught.message : "转换失败。";
           updateBatchItem(item.id, { status: "error", detail: "处理失败，其余文件继续", error: message, finishedAt: Date.now() });
@@ -702,10 +868,10 @@ export default function Home() {
     });
   }
 
-  function reset() {
+  /** 回到首页的界面状态（不动地址栏；地址由 reset / 路由负责）。 */
+  function resetState() {
     setScreen("converter");
     setStatus("idle");
-    setFile(null);
     setResult(null);
     setProgress({ page: 0, total: 0 });
     setError("");
@@ -714,8 +880,12 @@ export default function Home() {
     setSourceUrl("");
     setActiveFilename("");
     setBatchItems([]);
+    setBatchId("");
     setBatchRunning(false);
     if (inputRef.current) inputRef.current.value = "";
+  }
+  function reset() {
+    navigate({ name: "home" });
   }
 
   /**
@@ -723,25 +893,10 @@ export default function Home() {
    * 结果存在服务端，这里按 jobId 现取——以前指望 item.result，但那个字段
    * 从来没被赋过值，所以「查看/下载」按钮永远不显示，等于跑完就打不开。
    */
-  async function openBatchResult(item: BatchItem) {
+  function openBatchResult(item: BatchItem) {
     if (!item.jobId) return;
-    try {
-      const { result: stored } = await fetchLibraryEntry(item.jobId);
-      if (sourceUrl) URL.revokeObjectURL(sourceUrl);
-      setFile(null);
-      setActiveJobId(item.jobId);
-      setActiveFilename(item.file.name);
-      setSourceUrl(libraryPdfUrl(item.jobId));
-      setResult(stored);
-      setMode(stored.mode);
-      setTab(stored.mode === "ai" ? "compare" : "markdown");
-      setCameFrom("batch");
-      setRefineWarning("");
-      setStatus("complete");
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "无法打开这份结果。");
-      setStatus("error");
-    }
+    setCameFrom("batch");
+    navigate({ name: "doc", id: item.jobId });
   }
 
   /** 下载批次里某一份的 Markdown（同样从服务端取）。 */
@@ -757,15 +912,14 @@ export default function Home() {
     const parts = await Promise.all(
       completed.map(async (item) => {
         const { result: stored } = await fetchLibraryEntry(item.jobId!);
-        return `<!-- 来源文件：${item.file.name} -->\n\n${stored.markdown}`;
+        return `<!-- 来源文件：${item.name} -->\n\n${stored.markdown}`;
       })
     );
     download(parts.join("\n\n---\n\n"), `墨页批量转换-${new Date().toISOString().slice(0, 10)}.md`, "text/markdown;charset=utf-8");
   }
 
   function showLibrary() {
-    setScreen("library");
-    void refreshLibrary();
+    navigate({ name: "library" });
   }
 
   function toggleLibrarySelect(id: string) {
@@ -836,24 +990,9 @@ export default function Home() {
     );
   }
 
-  async function openRecord(record: Job) {
-    try {
-      const { result: stored } = await fetchLibraryEntry(record.id);
-      if (sourceUrl) URL.revokeObjectURL(sourceUrl);
-      setFile(null);
-      setActiveJobId(record.id);
-      setActiveFilename(record.filename);
-      setSourceUrl(libraryPdfUrl(record.id));   // 原始 PDF 由服务端提供
-      setMode(stored.mode);
-      setResult(stored);
-      setTab("markdown");
-      setCameFrom("library");
-      setRefineWarning("");
-      setStatus("complete");
-      setScreen("converter");
-    } catch (caught) {
-      setLibraryError(caught instanceof Error ? caught.message : "无法打开这条记录。");
-    }
+  function openRecord(record: Job) {
+    setCameFrom("library");
+    navigate({ name: "doc", id: record.id });   // 结果和原始 PDF 都由 loadDoc 从服务端取
   }
 
   async function removeRecord(record: Job) {
@@ -1021,7 +1160,7 @@ export default function Home() {
                 <ul className="staged-list">
                   {activeJobs.map((j) => (
                     <li key={j.id}>
-                      <span>{j.filename}</span>
+                      <button type="button" className="staged-link" onClick={() => navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id })} title="查看进度">{j.filename}</button>
                       <span className="staged-size">
                         {j.status === "queued" ? "排队中" : j.total ? `${j.page}/${j.total} 页` : "处理中"}
                         {" · ⏱ "}{formatElapsed(now - new Date(j.created_at).getTime())}
@@ -1110,8 +1249,8 @@ export default function Home() {
                   <span className="batch-index">{String(index + 1).padStart(2, "0")}</span>
                   <div className="batch-item-main">
                     <div className="batch-item-title">
-                      <strong>{item.file.name}</strong>
-                      <span>{formatSize(item.file.size)}</span>
+                      <strong>{item.name}</strong>
+                      <span>{formatSize(item.size)}</span>
                       {item.startedAt && (
                         <span className="batch-elapsed">
                           ⏱ {formatElapsed((item.finishedAt ?? now) - item.startedAt)}
@@ -1165,8 +1304,8 @@ export default function Home() {
             <div className="result-actions">
               {cameFrom === "library" ? (
                 <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); showLibrary(); }}>← 返回 Library</button>
-              ) : cameFrom === "batch" || batchItems.length > 1 ? (
-                <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); setStatus("batch"); }}>← 返回批次</button>
+              ) : (cameFrom === "batch" || batchItems.length > 1) && batchId ? (
+                <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); navigate({ name: "batch", id: batchId }); }}>← 返回批次</button>
               ) : (
                 <button type="button" className="secondary-button" onClick={reset}>← 返回首页</button>
               )}
@@ -1260,7 +1399,7 @@ export default function Home() {
               <button type="button" className={settingsDraft.provider === "openrouter" ? "active" : ""} onClick={() => selectProvider("openrouter")}>OpenRouter</button>
             </div>
             <div className="multichannel">
-              <label className="multichannel-main">
+              <label className="multichannel-main" aria-label="多渠道并行">
                 <input
                   type="checkbox"
                   checked={Boolean(settingsDraft.multiChannel)}

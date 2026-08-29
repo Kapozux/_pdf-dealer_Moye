@@ -86,7 +86,7 @@ async function openPdf(pdfPath) {
   return getDocument({ data, useSystemFonts: true, isEvalSupported: false }).promise;
 }
 
-const { document: sharedDoc, Node: DomNode } = parseHTML("<html><body></body></html>");
+const { Node: DomNode } = parseHTML("<html><body></body></html>");
 
 // 一份文档内同时送多少页给模型。AI 调用是纯网络等待，串行等于把 86 页排成
 // 86 段往返。实测这把 key 12 并发零限流，取 6 留足余量（可用 MOYE_AI_PAGE_CONCURRENCY 调）。

@@ -306,6 +306,9 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 .staged-list li button:hover { opacity: 1; text-decoration: underline; }
 .staged-start { width: 100%; }
 
+/* 进行中列表里的文件名是链接：点一下跳到那份/那批的进度页 */
+.staged-list .staged-link { background:none; border:0; padding:0; font:inherit; color:inherit; text-align:left; cursor:pointer; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; opacity:1; }
+.staged-list .staged-link:hover { color:var(--green); text-decoration:underline; }
 /* 服务端进行中的任务：任务不在浏览器里跑，重开页面也要看得见 */
 .active-panel {
   margin-top: 18px; border: 1px solid rgba(0, 0, 0, 0.12); border-radius: 14px;

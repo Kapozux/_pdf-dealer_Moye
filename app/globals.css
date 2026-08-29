@@ -93,6 +93,9 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 .top-actions,.result-actions { display:flex; align-items:center; gap:10px; }
 .quiet-button { border:0; background:transparent; font-size:12px; cursor:pointer; opacity:.64; }
 .settings-button { padding:8px 11px; border:1px solid transparent; border-radius:999px; background:transparent; font-size:12px; cursor:pointer; }
+/* 语言切换：一个小胶囊，显示"切过去会变成什么"（中文界面显示 EN，英文界面显示 中文） */
+.lang-toggle { padding:7px 10px; border:1px solid var(--line); border-radius:999px; background:rgba(255,255,255,.35); font-size:11px; font-weight:650; letter-spacing:.04em; cursor:pointer; }
+.lang-toggle:hover { border-color:var(--green); color:var(--green); }
 .settings-button:hover { border-color:var(--line); background:rgba(255,255,255,.35); }
 .privacy-pill.cloud { color:#74472f; border-color:rgba(166,99,63,.3); background:#f4e8dd; }
 .privacy-pill.cloud i { background:#b66a40; box-shadow:0 0 0 4px rgba(182,106,64,.12); }

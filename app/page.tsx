@@ -8,6 +8,7 @@ import {
   exportZipUrl, listBatches, listLibraryItems, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
   type Batch, type Job, type Stats, type TagBackfillState,
 } from "../lib/api";
+import { t, tServer, getActiveLang, setActiveLang, readStoredLang, storeLang, type Lang } from "../lib/i18n";
 import { marked } from "marked";
 import katex from "katex";
 import "katex/dist/katex.min.css";
@@ -181,16 +182,16 @@ const modelPresets: Record<AiProvider, { value: string; label: string }[]> = {
 function ModelPicker({ id, provider, value, extra = [], onChange }: { id: string; provider: AiProvider; value: string; extra?: AiModelOption[]; onChange: (value: string) => void }) {
   const presets = [...modelPresets[provider]];
   for (const model of extra) {
-    if (!presets.some((item) => item.value === model.id)) presets.push({ value: model.id, label: `${model.label} · 服务商返回` });
+    if (!presets.some((item) => item.value === model.id)) presets.push({ value: model.id, label: `${model.label} ${t("· 服务商返回")}` });
   }
   const isCustom = !presets.some((item) => item.value === value);
   return (
     <div className="model-picker">
-      <select id={id} value={isCustom ? "__custom__" : value} onChange={(event) => { if (event.target.value !== "__custom__") onChange(event.target.value); }} aria-label="选择模型预设">
-        {presets.map((item) => <option value={item.value} key={item.value}>{item.label}</option>)}
-        <option value="__custom__">自定义 Model ID</option>
+      <select id={id} value={isCustom ? "__custom__" : value} onChange={(event) => { if (event.target.value !== "__custom__") onChange(event.target.value); }} aria-label={t("选择模型预设")}>
+        {presets.map((item) => <option value={item.value} key={item.value}>{t(item.label)}</option>)}
+        <option value="__custom__">{t("自定义 Model ID")}</option>
       </select>
-      <input value={value} onChange={(event) => onChange(event.target.value)} aria-label="模型 ID" placeholder="输入 Model ID" />
+      <input value={value} onChange={(event) => onChange(event.target.value)} aria-label={t("模型 ID")} placeholder={t("输入 Model ID")} />
     </div>
   );
 }
@@ -212,14 +213,14 @@ function formatSize(bytes: number) {
 /** 把毫秒变成「1 分 04 秒」这种好读的形式。 */
 function formatElapsed(ms: number) {
   const total = Math.max(0, Math.round(ms / 1000));
-  if (total < 60) return `${total} 秒`;
+  if (total < 60) return t("{n} 秒", { n: total });
   const minutes = Math.floor(total / 60);
-  if (minutes < 60) return `${minutes} 分 ${String(total % 60).padStart(2, "0")} 秒`;
-  return `${Math.floor(minutes / 60)} 时 ${String(minutes % 60).padStart(2, "0")} 分`;
+  if (minutes < 60) return t("{m} 分 {s} 秒", { m: minutes, s: String(total % 60).padStart(2, "0") });
+  return t("{h} 时 {m} 分", { h: Math.floor(minutes / 60), m: String(minutes % 60).padStart(2, "0") });
 }
 
 function formatDate(timestamp: number) {
-  return new Intl.DateTimeFormat("zh-TW", {
+  return new Intl.DateTimeFormat(getActiveLang() === "en" ? "en-US" : "zh-TW", {
     year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit",
   }).format(timestamp);
 }
@@ -236,7 +237,7 @@ function fmtBig(n: number) {
  * 照抄 getAudio 统计面板的手法，这里只是换了配色跟着墨页自己的 --green。
  */
 function sparkline(values: number[], w = 272, h = 78) {
-  if (values.length < 2) return <div className="spark-empty">数据还不够画图</div>;
+  if (values.length < 2) return <div className="spark-empty">{t("数据还不够画图")}</div>;
   const pad = 6;
   const maxY = Math.max(...values, 1);
   const x = (i: number) => pad + (i / (values.length - 1)) * (w - 2 * pad);
@@ -262,13 +263,13 @@ function sparkline(values: number[], w = 272, h = 78) {
 function methodLabel(page: PageResult) {
   if (page.method === "ai") {
     const providerName = { gemini: "Gemini", kimi: "Kimi", qwen: "Qwen", openrouter: "OpenRouter" }[page.provider || "gemini"];
-    return `${providerName} · ${page.model || "视觉模型"}`;
+    return `${providerName} · ${page.model || t("视觉模型")}`;
   }
-  if (page.aiAttempted) return "AI 未通过校验 · 已回退 Surya";
-  if (page.method === "surya") return "Surya 本地视觉识别";
-  if (page.method === "ocr") return "本地 OCR";
-  if (page.method === "text") return "PDF 文字层";
-  return "未识别";
+  if (page.aiAttempted) return t("AI 未通过校验 · 已回退 Surya");
+  if (page.method === "surya") return t("Surya 本地视觉识别");
+  if (page.method === "ocr") return t("本地 OCR");
+  if (page.method === "text") return t("PDF 文字层");
+  return t("未识别");
 }
 
 /**
@@ -308,7 +309,7 @@ function waitForJob(jobId: string, onProgress: (job: Job) => void): Promise<Job>
               settled = true;
               unsubscribe();
               clearInterval(poll);
-              reject(new Error("任务不存在或已被清除。"));
+              reject(new Error(t("任务不存在或已被清除。")));
             }
           })
           .catch(() => undefined);
@@ -324,7 +325,7 @@ export default function Home() {
   const [status, setStatus] = useState<Status>("idle");
   const [sourceUrl, setSourceUrl] = useState("");
   const [progress, setProgress] = useState({ page: 0, total: 0 });
-  const [progressDetail, setProgressDetail] = useState("正在读取 PDF 结构…");
+  const [progressDetail, setProgressDetail] = useState(t("正在读取 PDF 结构…"));
   const [result, setResult] = useState<ConversionResult | null>(null);
   const [error, setError] = useState("");
   // 重新精校失败时服务端会保留旧结果（不是空白报错屏），但要让用户知道这次其实没有真的变化
@@ -381,6 +382,23 @@ export default function Home() {
   const [stats, setStats] = useState<Stats | null>(null);
   const [statsLoaded, setStatsLoaded] = useState(false);
   const [backfillState, setBackfillState] = useState<TagBackfillState | null>(null);
+  // 界面语言。SSR 和首屏都用中文，挂载后按本机存的偏好切换（避免水合不一致）；
+  // 每次渲染开头把当前语言写进 i18n 模块，之后所有 t() 都按它查表。
+  const [lang, setLang] = useState<Lang>("zh");
+  setActiveLang(lang);
+  useEffect(() => {
+    // 放到下一拍：首屏必须和 SSR 一样是中文，水合完成后再切到本机偏好
+    const stored = readStoredLang();
+    if (stored === "zh") return;
+    const timer = setTimeout(() => setLang(stored), 0);
+    return () => clearTimeout(timer);
+  }, []);
+  useEffect(() => { document.documentElement.lang = lang === "en" ? "en" : "zh-Hant"; }, [lang]);
+  function toggleLang() {
+    const next: Lang = lang === "en" ? "zh" : "en";
+    setLang(next);
+    storeLang(next);
+  }
 
   useEffect(() => () => { if (sourceUrl) URL.revokeObjectURL(sourceUrl); }, [sourceUrl]);
   // 计时器只在真的有东西在跑时才转；跑完（runEndedAt 有值）立刻停，避免空转重渲染
@@ -527,7 +545,7 @@ export default function Home() {
       setBatches(groups);
       setLibraryError("");
     } catch (caught) {
-      setLibraryError(caught instanceof Error ? caught.message : "资料库读取失败。");
+      setLibraryError(caught instanceof Error ? caught.message : t("资料库读取失败。"));
     } finally {
       setLibraryLoading(false);
     }
@@ -580,7 +598,7 @@ export default function Home() {
       if (job && (job.status === "queued" || job.status === "running")) {
         setMode(job.mode);
         setProgress({ page: job.page, total: job.total });
-        setProgressDetail(job.detail || "正在处理…");
+        setProgressDetail(job.detail || t("正在处理…"));
         setRunStartedAt(new Date(job.created_at).getTime());
         setRunEndedAt(null);
         setStatus("processing");
@@ -589,9 +607,9 @@ export default function Home() {
           if (live.detail) setProgressDetail(live.detail);
         });
         setRunEndedAt(Date.now());
-        if (finished.status !== "done") throw new Error(finished.error || "转换未完成。");
+        if (finished.status !== "done") throw new Error(finished.error || t("转换未完成。"));
       } else if (job && job.status !== "done") {
-        throw new Error(job.error || "这份任务没有完成。");
+        throw new Error(job.error || t("这份任务没有完成。"));
       }
       // listJobs 只取最近 200 条；更老的记录直接按 id 取结果
       const { job: storedJob, result: stored } = await fetchLibraryEntry(id);
@@ -601,7 +619,7 @@ export default function Home() {
       setTab(stored.mode === "ai" ? "compare" : "markdown");
       setStatus("complete");
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "无法打开这份记录。");
+      setError(caught instanceof Error ? caught.message : t("无法打开这份记录。"));
       setStatus("error");
     }
   }
@@ -619,22 +637,22 @@ export default function Home() {
         updateBatchItem(itemId, {
           page: live.page,
           total: live.total,
-          detail: live.detail || "正在转换…",
+          detail: live.detail || t("正在转换…"),
           status: live.status === "queued" ? "queued" : "processing",
         });
       });
-      if (finished.status !== "done") throw new Error(finished.error || "转换未完成。");
+      if (finished.status !== "done") throw new Error(finished.error || t("转换未完成。"));
       updateBatchItem(itemId, {
         status: "complete",
         jobId: finished.id,
         page: finished.total,
         total: finished.total,
-        detail: `已完成并存入 Library · ${finished.total} 页`,
+        detail: t("已完成并存入 Library · {n} 页", { n: finished.total }),
         finishedAt: Date.now(),
       });
     } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "转换失败。";
-      updateBatchItem(itemId, { status: "error", detail: "处理失败，其余文件继续", error: message, finishedAt: Date.now() });
+      const message = caught instanceof Error ? caught.message : t("转换失败。");
+      updateBatchItem(itemId, { status: "error", detail: t("处理失败，其余文件继续"), error: message, finishedAt: Date.now() });
     }
   }
 
@@ -648,7 +666,7 @@ export default function Home() {
     if (batchId === id && batchItems.length) { setStatus("batch"); return; }
     try {
       const jobs = (await listJobs()).filter((job) => job.batch_id === id);
-      if (!jobs.length) throw new Error("找不到这个批次，可能已被删除。");
+      if (!jobs.length) throw new Error(t("找不到这个批次，可能已被删除。"));
       const toMs = (iso: string | null) => (iso ? new Date(iso).getTime() : undefined);
       const items: BatchItem[] = jobs.map((job) => ({
         id: job.id,
@@ -658,7 +676,7 @@ export default function Home() {
         status: job.status === "done" ? "complete" : job.status === "queued" ? "queued" : job.status === "running" ? "processing" : "error",
         page: job.page,
         total: job.total,
-        detail: job.status === "done" ? `已完成并存入 Library · ${job.total} 页` : job.status === "failed" ? "处理失败，其余文件继续" : job.detail,
+        detail: job.status === "done" ? t("已完成并存入 Library · {n} 页", { n: job.total }) : job.status === "failed" ? t("处理失败，其余文件继续") : job.detail,
         error: job.error ?? undefined,
         startedAt: toMs(job.created_at),
         finishedAt: toMs(job.finished_at),
@@ -679,7 +697,7 @@ export default function Home() {
         await refreshLibrary();
       }
     } catch (caught) {
-      setError(caught instanceof Error ? caught.message : "无法打开这个批次。");
+      setError(caught instanceof Error ? caught.message : t("无法打开这个批次。"));
       setStatus("error");
     }
   }
@@ -733,7 +751,7 @@ export default function Home() {
 
   async function persistSettings() {
     setSettingsBusy(true);
-    setSettingsStatus("正在保存…");
+    setSettingsStatus(t("正在保存…"));
     try {
       const saved = await saveAiSettings({
         ...settingsDraft,
@@ -744,9 +762,9 @@ export default function Home() {
       });
       setSettings(saved);
       setSettingsDraft({ ...saved, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
-      setSettingsStatus("已保存到本机。密钥不会出现在网页数据或 Library 中。");
+      setSettingsStatus(t("已保存到本机。密钥不会出现在网页数据或 Library 中。"));
     } catch (caught) {
-      setSettingsStatus(caught instanceof Error ? caught.message : "设置保存失败。");
+      setSettingsStatus(caught instanceof Error ? caught.message : t("设置保存失败。"));
     } finally {
       setSettingsBusy(false);
     }
@@ -754,12 +772,12 @@ export default function Home() {
 
   async function testSettings() {
     setSettingsBusy(true);
-    setSettingsStatus("正在连接模型…");
+    setSettingsStatus(t("正在连接模型…"));
     try {
       const tested = await testAiSettings(settingsDraft);
-      setSettingsStatus(`连接成功：${tested.provider} / ${tested.model}`);
+      setSettingsStatus(t("连接成功：{provider} / {model}", { provider: tested.provider, model: tested.model }));
     } catch (caught) {
-      setSettingsStatus(caught instanceof Error ? caught.message : "连接测试失败。");
+      setSettingsStatus(caught instanceof Error ? caught.message : t("连接测试失败。"));
     } finally {
       setSettingsBusy(false);
     }
@@ -767,13 +785,13 @@ export default function Home() {
 
   async function syncModels() {
     setSettingsBusy(true);
-    setSettingsStatus("正在从服务商读取可用模型…");
+    setSettingsStatus(t("正在从服务商读取可用模型…"));
     try {
       const loaded = await fetchAiModels(settingsDraft);
       setRemoteModels(loaded);
-      setSettingsStatus(`已同步 ${loaded.models.length} 个支持图片的模型。`);
+      setSettingsStatus(t("已同步 {n} 个支持图片的模型。", { n: loaded.models.length }));
     } catch (caught) {
-      setSettingsStatus(caught instanceof Error ? caught.message : "模型列表同步失败。");
+      setSettingsStatus(caught instanceof Error ? caught.message : t("模型列表同步失败。"));
     } finally {
       setSettingsBusy(false);
     }
@@ -781,7 +799,7 @@ export default function Home() {
 
   async function processFile(selected: File, selectedMode: ConversionMode = mode) {
     if (!isAcceptedFile(selected)) {
-      setError("请选择 PDF 或 PPT 文件。");
+      setError(t("请选择 PDF 或 PPT 文件。"));
       setStatus("error");
       return;
     }
@@ -794,7 +812,7 @@ export default function Home() {
     setResult(null);
     setError("");
     setProgress({ page: 0, total: 0 });
-    setProgressDetail("正在读取 PDF 结构…");
+    setProgressDetail(t("正在读取 PDF 结构…"));
     setStatus("processing");
     setRunStartedAt(Date.now());
     setRunEndedAt(null);
@@ -808,7 +826,7 @@ export default function Home() {
         if (live.detail) setProgressDetail(live.detail);
       });
       if (finished.status !== "done") {
-        throw new Error(finished.error || "转换未完成。");
+        throw new Error(finished.error || t("转换未完成。"));
       }
       const { result: converted } = await fetchLibraryEntry(finished.id);
       setResult(converted);
@@ -823,7 +841,7 @@ export default function Home() {
       setStatus("complete");
       await refreshLibrary();
     } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "转换失败，请换一个 PDF 再试。";
+      const message = caught instanceof Error ? caught.message : t("转换失败，请换一个 PDF 再试。");
       setError(message);
       setStatus("error");
       if (message.includes("AI 精校尚未配置")) openSettings();
@@ -837,12 +855,12 @@ export default function Home() {
   async function processFiles(selectedFiles: File[], selectedMode: ConversionMode = mode) {
     const pdfFiles = selectedFiles.filter(isAcceptedFile);
     if (!pdfFiles.length) {
-      setError("请选择 PDF 或 PPT 文件。");
+      setError(t("请选择 PDF 或 PPT 文件。"));
       setStatus("error");
       return;
     }
     if (selectedMode === "ai" && !settings.aiConfigured) {
-      setError("AI 精校尚未配置。请先在设置中选择服务商、模型并保存 API Key。");
+      setError(t("AI 精校尚未配置。请先在设置中选择服务商、模型并保存 API Key。"));
       setStatus("error");
       openSettings();
       return;
@@ -861,7 +879,7 @@ export default function Home() {
       status: "queued",
       page: 0,
       total: 0,
-      detail: "等待处理",
+      detail: t("等待处理"),
     }));
     setSourceUrl("");
     setResult(null);
@@ -878,9 +896,7 @@ export default function Home() {
     // 只有一份就不建合集，免得 Library 里全是「1 份文件」的空壳分组。
     const batch = {
       id: crypto.randomUUID(),
-      label: `${queue.length} 份 · ${new Date().toLocaleString("zh-CN", {
-        month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit",
-      })}`,
+      label: t("{n} 份 · {time}", { n: queue.length, time: new Date().toLocaleString(getActiveLang() === "en" ? "en-US" : "zh-CN", { month: "numeric", day: "numeric", hour: "2-digit", minute: "2-digit" }) }),
     };
     setBatchId(batch.id);
     setRoute({ name: "batch", id: batch.id });   // 批次页有了地址：刷新后从服务端重建，任务照跑
@@ -891,11 +907,11 @@ export default function Home() {
       queue.map(async (item) => {
         try {
           const job = await submitJob(item.file!, selectedMode, batch);
-          updateBatchItem(item.id, { jobId: job.id, status: "processing", detail: "已提交，等待服务端处理…", startedAt: Date.now() });
+          updateBatchItem(item.id, { jobId: job.id, status: "processing", detail: t("已提交，等待服务端处理…"), startedAt: Date.now() });
           await trackBatchJob(item.id, job.id);
         } catch (caught) {
-          const message = caught instanceof Error ? caught.message : "转换失败。";
-          updateBatchItem(item.id, { status: "error", detail: "处理失败，其余文件继续", error: message, finishedAt: Date.now() });
+          const message = caught instanceof Error ? caught.message : t("转换失败。");
+          updateBatchItem(item.id, { status: "error", detail: t("处理失败，其余文件继续"), error: message, finishedAt: Date.now() });
         }
       })
     );
@@ -914,7 +930,7 @@ export default function Home() {
 
   function addStaged(incoming: File[]) {
     const pdfs = incoming.filter(isAcceptedFile);
-    if (!pdfs.length) { setError("请选择 PDF 或 PPT 文件。"); setStatus("error"); return; }
+    if (!pdfs.length) { setError(t("请选择 PDF 或 PPT 文件。")); setStatus("error"); return; }
     setError("");
     setStatus("idle");
     setStaged((prev) => {
@@ -967,10 +983,10 @@ export default function Home() {
     const parts = await Promise.all(
       completed.map(async (item) => {
         const { result: stored } = await fetchLibraryEntry(item.jobId!);
-        return `<!-- 来源文件：${item.name} -->\n\n${stored.markdown}`;
+        return `<!-- ${t("来源文件")}：${item.name} -->\n\n${stored.markdown}`;
       })
     );
-    download(parts.join("\n\n---\n\n"), `墨页批量转换-${new Date().toISOString().slice(0, 10)}.md`, "text/markdown;charset=utf-8");
+    download(parts.join("\n\n---\n\n"), `${t("墨页批量转换")}-${new Date().toISOString().slice(0, 10)}.md`, "text/markdown;charset=utf-8");
   }
 
   function showLibrary() {
@@ -1000,13 +1016,13 @@ export default function Home() {
         ids.map(async (id) => {
           const record = library.find((item) => item.id === id);
           const { result: stored } = await fetchLibraryEntry(id);
-          return `<!-- 来源文件：${record?.filename ?? id} -->\n\n${stored.markdown}`;
+          return `<!-- ${t("来源文件")}：${record?.filename ?? id} -->\n\n${stored.markdown}`;
         })
       );
       const safeName = filenameHint.replace(/[\\/:*?"<>|]/g, "_");
       download(parts.join("\n\n---\n\n"), `${safeName}-${new Date().toISOString().slice(0, 10)}.md`, "text/markdown;charset=utf-8");
     } catch (caught) {
-      setLibraryError(caught instanceof Error ? caught.message : "合并下载失败，请稍后再试。");
+      setLibraryError(caught instanceof Error ? caught.message : t("合并下载失败，请稍后再试。"));
     } finally {
       setMergingLibrary(false);
     }
@@ -1015,34 +1031,34 @@ export default function Home() {
   function renderLibraryCard(record: Job) {
     return (
       <article className="library-card" key={record.id}>
-        <label className="library-select" title="选中用于合并下载">
+        <label className="library-select" title={t("选中用于合并下载")}>
           <input
             type="checkbox"
             checked={selectedLibraryIds.has(record.id)}
             onChange={() => toggleLibrarySelect(record.id)}
-            aria-label={`选中 ${record.filename} 用于合并下载`}
+            aria-label={t("选中 {name} 用于合并下载", { name: record.filename })}
           />
         </label>
-        <button className="library-open" type="button" onClick={() => openRecord(record)} aria-label={`打开 ${record.filename}`}>
+        <button className="library-open" type="button" onClick={() => openRecord(record)} aria-label={t("打开 {name}", { name: record.filename })}>
           <span className="library-file-icon">MD<i>PDF</i></span>
           <span className="library-card-body">
             <span className="library-card-meta">{formatDate(new Date(record.updated_at).getTime())}</span>
             <strong>{record.filename}</strong>
-            <span className="library-card-preview">{record.preview || "没有可预览的文字"}</span>
+            <span className="library-card-preview">{record.preview || t("没有可预览的文字")}</span>
             {parseTags(record.tags).length > 0 && (
               <span className="card-tags">{parseTags(record.tags).map((tag) => <i key={tag}>{tag}</i>)}</span>
             )}
           </span>
         </button>
         <div className="library-card-footer">
-          <span>{record.page_count} 页</span>
+          <span>{record.page_count} {t("页")}</span>
           <span>{formatSize(record.file_size)}</span>
-          <span>{record.ai_pages ? `${record.ai_pages} 页 AI 精校` : modeNames[record.mode] || "旧版转换"}</span>
+          <span>{record.ai_pages ? t("{n} 页 AI 精校", { n: record.ai_pages }) : t(modeNames[record.mode]) || t("旧版转换")}</span>
           <span className={record.review_count ? "review-count" : ""}>
-            {record.review_count ? `${record.review_count} 页待检查` : "检查通过"}
+            {record.review_count ? t("{n} 页待检查", { n: record.review_count }) : t("检查通过")}
           </span>
-          <a href={exportZipUrl({ ids: [record.id] })} download aria-label={`下载 ${record.filename}`}>下载</a>
-          <button type="button" onClick={() => void removeRecord(record)} aria-label={`删除 ${record.filename}`}>删除</button>
+          <a href={exportZipUrl({ ids: [record.id] })} download aria-label={t("下载 {name}", { name: record.filename })}>{t("下载")}</a>
+          <button type="button" onClick={() => void removeRecord(record)} aria-label={t("删除 {name}", { name: record.filename })}>{t("删除")}</button>
         </div>
       </article>
     );
@@ -1054,7 +1070,7 @@ export default function Home() {
   }
 
   async function removeRecord(record: Job) {
-    if (!window.confirm(`从本机资料库删除“${record.filename}”？此操作无法撤销。`)) return;
+    if (!window.confirm(t("从本机资料库删除“{name}”？此操作无法撤销。", { name: record.filename }))) return;
     try {
       await deleteLibraryEntry(record.id);
       setLibrary((items) => items.filter((item) => item.id !== record.id));
@@ -1066,7 +1082,7 @@ export default function Home() {
       });
       setLibraryError("");
     } catch (caught) {
-      setLibraryError(caught instanceof Error ? caught.message : "删除失败。请稍后再试。");
+      setLibraryError(caught instanceof Error ? caught.message : t("删除失败。请稍后再试。"));
     }
   }
 
@@ -1084,7 +1100,7 @@ export default function Home() {
     setError("");
     setRefineWarning("");
     setProgress({ page: 0, total: result.pageCount });
-    setProgressDetail("正在复用 Library 中的本地初稿…");
+    setProgressDetail(t("正在复用 Library 中的本地初稿…"));
     try {
       // 现在是原地重跑同一条记录：job.id 就是 activeJobId 本身，不再是新 id
       const job = await refineLibraryEntry(activeJobId);
@@ -1092,7 +1108,7 @@ export default function Home() {
         setProgress({ page: live.page, total: live.total });
         if (live.detail) setProgressDetail(live.detail);
       });
-      if (finished.status !== "done") throw new Error(finished.error || "AI 精校未完成。");
+      if (finished.status !== "done") throw new Error(finished.error || t("AI 精校未完成。"));
       const { result: refined } = await fetchLibraryEntry(finished.id);
       setResult(refined);
       setActiveJobId(finished.id);
@@ -1103,7 +1119,7 @@ export default function Home() {
       setRefineWarning(finished.error || "");
       await refreshLibrary();
     } catch (caught) {
-      const message = caught instanceof Error ? caught.message : "AI 精校失败。";
+      const message = caught instanceof Error ? caught.message : t("AI 精校失败。");
       setError(message);
       setStatus("error");
       if (message.includes("AI 精校尚未配置")) openSettings();
@@ -1112,27 +1128,28 @@ export default function Home() {
 
   return (
     <main className={`app-shell ${status !== "idle" || screen === "library" ? "workspace-open" : ""}`}>
-      <nav className="topbar" aria-label="主导航">
-        <button className="brand brand-button" type="button" onClick={reset} aria-label="回到首页" disabled={batchRunning}>
-          <span className="brand-mark">墨</span><span>墨页</span><span className="brand-subtitle">PDF/PPT 转 Markdown</span>
+      <nav className="topbar" aria-label={t("主导航")}>
+        <button className="brand brand-button" type="button" onClick={reset} aria-label={t("回到首页")} disabled={batchRunning}>
+          <span className="brand-mark">{t("墨")}</span><span>{t("墨页")}</span><span className="brand-subtitle">{t("PDF/PPT 转 Markdown")}</span>
         </button>
         <div className="top-actions">
           {activeJobs.length > 0 && (
             // 进行中的任务在哪个界面都看得见，不只是首页
-            <button className="library-nav running-nav" type="button" title="查看进度" onClick={() => { const j = activeJobs[0]; navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id }); }}>
-              <i />进行中 <b>{activeJobs.length}</b>
+            <button className="library-nav running-nav" type="button" title={t("查看进度")} onClick={() => { const j = activeJobs[0]; navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id }); }}>
+              <i />{t("进行中")} <b>{activeJobs.length}</b>
             </button>
           )}
           <button className={`library-nav ${screen === "library" ? "active" : ""}`} type="button" onClick={showLibrary} disabled={batchRunning}>Library <b>{library.length}</b></button>
-          <button className="settings-button" type="button" onClick={openSettings}>⚙ 设置</button>
-          {status !== "idle" && !batchRunning && <button className="quiet-button" type="button" onClick={reset}>＋ 新转换</button>}
+          <button className="lang-toggle" type="button" onClick={toggleLang} aria-label="Switch language" title={lang === "en" ? "切换到中文 / Switch to Chinese" : "Switch to English"}>{lang === "en" ? "中文" : "EN"}</button>
+          <button className="settings-button" type="button" onClick={openSettings}>{t("⚙ 设置")}</button>
+          {status !== "idle" && !batchRunning && <button className="quiet-button" type="button" onClick={reset}>{t("＋ 新转换")}</button>}
           {/* 这颗标签必须说实话：本地模式的正文不上传，但打标签会把开头一小段发给模型——以前这里一律写"文件不上传" */}
           {aiWasUsed ? (
-            <span className="privacy-pill cloud"><i />AI 精校 · 页面图像会发送给所选模型</span>
+            <span className="privacy-pill cloud"><i />{t("AI 精校 · 页面图像会发送给所选模型")}</span>
           ) : settings.autoTag !== false && settings.aiConfigured ? (
-            <button type="button" className="privacy-pill tag" title="转换正文全程在本机；完成后会把文档开头约 3000 字发给当前服务商生成主题标签。点此可在设置里关闭。" onClick={openSettings}><i />本地转换 · 仅摘要用于 AI 打标签</button>
+            <button type="button" className="privacy-pill tag" title={t("转换正文全程在本机；完成后会把文档开头约 3000 字发给当前服务商生成主题标签。点此可在设置里关闭。")} onClick={openSettings}><i />{t("本地转换 · 仅摘要用于 AI 打标签")}</button>
           ) : (
-            <span className="privacy-pill"><i />本地处理 · 文件不上传</span>
+            <span className="privacy-pill"><i />{t("本地处理 · 文件不上传")}</span>
           )}
         </div>
       </nav>
@@ -1140,36 +1157,36 @@ export default function Home() {
       {screen === "library" ? (
         <section className="library-view">
           <header className="library-header">
-            <div><div className="eyebrow">LOCAL DOCUMENT LIBRARY</div><h1>你的分析资料库</h1><p>PDF、Markdown、原始初稿与逐页质量记录都保留在这台设备。</p></div>
-            <button className="primary-button" type="button" onClick={reset}>＋ 新转换</button>
+            <div><div className="eyebrow">LOCAL DOCUMENT LIBRARY</div><h1>{t("你的分析资料库")}</h1><p>{t("PDF、Markdown、原始初稿与逐页质量记录都保留在这台设备。")}</p></div>
+            <button className="primary-button" type="button" onClick={reset}>{t("＋ 新转换")}</button>
           </header>
           <div className="library-toolbar">
-            <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名或标签…" aria-label="搜索资料库" /></label>
-            <div><strong>{library.length}</strong> 份文件 · <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> 页</div>
+            <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索文件名或标签…")} aria-label={t("搜索资料库")} /></label>
+            <div><strong>{library.length}</strong> {t("份文件 ·")} <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> {t("页")}</div>
             {library.length > 0 && (
               // 直接用 <a download>：整包由服务端生成并流式下载，不经过 JS 内存
-              <a className="secondary-button" href={exportZipUrl()} download>⭳ 全部打包下载</a>
+              <a className="secondary-button" href={exportZipUrl()} download>{t("⭳ 全部打包下载")}</a>
             )}
           </div>
           {selectedLibraryIds.size > 0 && (
             <div className="library-selection-bar">
-              <span>已选 {selectedLibraryIds.size} 份</span>
+              <span>{t("已选 {n} 份", { n: selectedLibraryIds.size })}</span>
               <div>
                 <button
                   className="secondary-button"
                   type="button"
                   disabled={mergingLibrary}
-                  onClick={() => void downloadMergedMarkdown([...selectedLibraryIds], "墨页合并")}
+                  onClick={() => void downloadMergedMarkdown([...selectedLibraryIds], t("墨页合并"))}
                 >
-                  {mergingLibrary ? "合并中…" : "⭳ 下载合并 .md"}
+                  {mergingLibrary ? t("合并中…") : t("⭳ 下载合并 .md")}
                 </button>
-                <button className="quiet-button" type="button" onClick={() => setSelectedLibraryIds(new Set())}>清除选择</button>
+                <button className="quiet-button" type="button" onClick={() => setSelectedLibraryIds(new Set())}>{t("清除选择")}</button>
               </div>
             </div>
           )}
           {libraryError && <div className="library-notice" role="status">{libraryError}</div>}
           {libraryLoading ? (
-            <div className="library-empty"><span className="library-empty-mark">墨</span><h2>正在读取资料库…</h2></div>
+            <div className="library-empty"><span className="library-empty-mark">{t("墨")}</span><h2>{t("正在读取资料库…")}</h2></div>
           ) : filteredLibrary.length ? (
             <>
               {libraryTimeline.map((row) => (
@@ -1177,19 +1194,19 @@ export default function Home() {
                   {row.batch && (
                     <div className="library-batch-head">
                       <div>
-                        <strong>{row.batch.label || "批量转换"}</strong>
-                        <span>{row.batch.total} 份 · {row.batch.pages} 页{row.batch.failed ? ` · ${row.batch.failed} 份失败` : ""}{row.batch.active ? ` · ${row.batch.active} 份进行中` : ""}</span>
+                        <strong>{row.batch.label || t("批量转换")}</strong>
+                        <span>{t("{n} 份 · {pages} 页", { n: row.batch.total, pages: row.batch.pages })}{row.batch.failed ? ` ${t("· {n} 份失败", { n: row.batch.failed })}` : ""}{row.batch.active ? ` ${t("· {n} 份进行中", { n: row.batch.active })}` : ""}</span>
                       </div>
                       <div className="library-batch-actions">
                         <button
                           className="secondary-button"
                           type="button"
                           disabled={mergingLibrary}
-                          onClick={() => void downloadMergedMarkdown(row.items.map((item) => item.id), row.batch!.label || "墨页合集")}
+                          onClick={() => void downloadMergedMarkdown(row.items.map((item) => item.id), row.batch!.label || t("墨页合集"))}
                         >
-                          {mergingLibrary ? "合并中…" : "⭳ 下载合并 .md"}
+                          {mergingLibrary ? t("合并中…") : t("⭳ 下载合并 .md")}
                         </button>
-                        <a className="secondary-button" href={exportZipUrl({ batchId: row.batch.id })} download>⭳ 下载这个合集</a>
+                        <a className="secondary-button" href={exportZipUrl({ batchId: row.batch.id })} download>{t("⭳ 下载这个合集")}</a>
                       </div>
                     </div>
                   )}
@@ -1200,37 +1217,37 @@ export default function Home() {
               ))}
             </>
           ) : (
-            <div className="library-empty"><span className="library-empty-mark">墨</span><h2>{query ? "没有匹配的文件" : "资料库还是空的"}</h2><p>{query ? "换个关键词试试。" : "完成第一次转换后，文件会自动出现在这里。"}</p>{!query && <button className="primary-button" type="button" onClick={reset}>开始第一次转换</button>}</div>
+            <div className="library-empty"><span className="library-empty-mark">{t("墨")}</span><h2>{query ? t("没有匹配的文件") : t("资料库还是空的")}</h2><p>{query ? t("换个关键词试试。") : t("完成第一次转换后，文件会自动出现在这里。")}</p>{!query && <button className="primary-button" type="button" onClick={reset}>{t("开始第一次转换")}</button>}</div>
           )}
         </section>
       ) : status === "idle" ? (
         <>
           {/* 首页是工作台不是落地页：每天用的人不需要每天看一遍大标题和产品卖点 */}
           <section className="home-head">
-            <h1>PDF/PPT 转 Markdown</h1>
-            <p>拖进来、选模式、开始。转换在本机服务里排队执行，关掉页面也会继续。</p>
+            <h1>{t("PDF/PPT 转 Markdown")}</h1>
+            <p>{t("拖进来、选模式、开始。转换在本机服务里排队执行，关掉页面也会继续。")}</p>
           </section>
-          <section className="converter-card" aria-label="PDF/PPT 转换器">
+          <section className="converter-card" aria-label={t("PDF/PPT 转换器")}>
             <button className={`dropzone ${dragging ? "is-dragging" : ""}`} type="button" onClick={() => inputRef.current?.click()} onDragEnter={() => setDragging(true)} onDragLeave={() => setDragging(false)} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
-              <span className="paper-icon"><b>PDF</b><i /></span><strong>拖放一个或多个 PDF / PPT</strong><span>或点击批量选择文件</span>
-              <small>{mode === "ai" ? "AI 模式会把页面图像发送给你配置的模型" : "当前模式全程在本机处理"}</small>
+              <span className="paper-icon"><b>PDF</b><i /></span><strong>{t("拖放一个或多个 PDF / PPT")}</strong><span>{t("或点击批量选择文件")}</span>
+              <small>{mode === "ai" ? t("AI 模式会把页面图像发送给你配置的模型") : t("当前模式全程在本机处理")}</small>
             </button>
             <input ref={inputRef} type="file" accept="application/pdf,.pdf,.ppt,.pptx" multiple hidden onChange={(event) => { const selected = Array.from(event.target.files || []); if (selected.length) addStaged(selected); event.target.value = ""; }} />
-            <div className="profile-row" aria-label="转换模式">
-              <div><span className="field-label">转换模式</span><strong>{modeNames[mode]}</strong><small>{modeDescriptions[mode]}</small></div>
+            <div className="profile-row" aria-label={t("转换模式")}>
+              <div><span className="field-label">{t("转换模式")}</span><strong>{t(modeNames[mode])}</strong><small>{t(modeDescriptions[mode])}</small></div>
               <div className="profile-options">
                 {visibleModes.map((item) => (
                   <button key={item} type="button" className={mode === item ? "active" : ""} onClick={() => { setMode(item); if (item === "ai" && !settings.aiConfigured) openSettings(); }}>
-                    {modeNames[item]}<small>{modeMeta[item]}</small>
+                    {t(modeNames[item])}<small>{t(modeMeta[item])}</small>
                   </button>
                 ))}
               </div>
             </div>
             {mode === "ai" && settings.aiConfigured && (
               // 精校范围直接影响这次转换花多少钱、多少页过模型，放在模式旁边而不是藏在设置最底下
-              <div className="scope-inline" role="group" aria-label="精校范围">
-                <span>精校范围</span>
-                {([["all", "全部页面 · 质量最佳"], ["review", "只精校公式、选项与可疑页 · 更省"]] as const).map(([value, label]) => (
+              <div className="scope-inline" role="group" aria-label={t("精校范围")}>
+                <span>{t("精校范围")}</span>
+                {([["all", t("全部页面 · 质量最佳")], ["review", t("只精校公式、选项与可疑页 · 更省")]] as const).map(([value, label]) => (
                   <label key={value} className={settings.aiScope === value ? "on" : ""}>
                     <input type="radio" name="scope-inline" checked={settings.aiScope === value} onChange={() => {
                       void saveAiSettings({ ...settings, aiScope: value, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" }).then(setSettings).catch(() => undefined);
@@ -1238,41 +1255,41 @@ export default function Home() {
                     {label}
                   </label>
                 ))}
-                <span className="scope-inline-meta">{settings.activeChannels?.length ? `通过 ${settings.activeChannels.map((p) => providerNames[p]).join(" + ")}` : ""}</span>
+                <span className="scope-inline-meta">{settings.activeChannels?.length ? t("通过 {providers}", { providers: settings.activeChannels.map((p) => providerNames[p]).join(" + ") }) : ""}</span>
               </div>
             )}
             {activeJobs.length > 0 && (
-              <div className="active-panel" aria-label="正在进行的任务">
+              <div className="active-panel" aria-label={t("正在进行的任务")}>
                 <div className="staged-head">
-                  <strong>服务端进行中 · {activeJobs.length}</strong>
-                  <span className="staged-size">关掉页面也会继续跑</span>
+                  <strong>{t("服务端进行中 · {n}", { n: activeJobs.length })}</strong>
+                  <span className="staged-size">{t("关掉页面也会继续跑")}</span>
                 </div>
                 <ul className="staged-list">
                   {activeJobs.map((j) => (
                     <li key={j.id}>
-                      <button type="button" className="staged-link" onClick={() => navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id })} title="查看进度">{j.filename}</button>
+                      <button type="button" className="staged-link" onClick={() => navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id })} title={t("查看进度")}>{j.filename}</button>
                       <span className="staged-size">
-                        {j.status === "queued" ? "排队中" : j.total ? `${j.page}/${j.total} 页` : "处理中"}
+                        {j.status === "queued" ? t("排队中") : j.total ? `${j.page}/${j.total} ${t("页")}` : t("处理中")}
                         {" · ⏱ "}{formatElapsed(now - new Date(j.created_at).getTime())}
                       </span>
-                      <button type="button" onClick={() => void cancelJob(j.id)}>取消</button>
+                      <button type="button" onClick={() => void cancelJob(j.id)}>{t("取消")}</button>
                     </li>
                   ))}
                 </ul>
               </div>
             )}
             {staged.length > 0 && (
-              <div className="staged-panel" aria-label="待转换文件">
+              <div className="staged-panel" aria-label={t("待转换文件")}>
                 <div className="staged-head">
-                  <strong>已选 {staged.length} 份，待转换</strong>
-                  <button type="button" onClick={() => setStaged([])}>清空</button>
+                  <strong>{t("已选 {n} 份，待转换", { n: staged.length })}</strong>
+                  <button type="button" onClick={() => setStaged([])}>{t("清空")}</button>
                 </div>
                 <ul className="staged-list">
                   {staged.map((f) => (
                     <li key={`${f.name}:${f.size}:${f.lastModified}`}>
                       <span>{f.name}</span>
                       <span className="staged-size">{formatSize(f.size)}</span>
-                      <button type="button" aria-label={`移除 ${f.name}`} onClick={() => setStaged((prev) => prev.filter((x) => x !== f))}>移除</button>
+                      <button type="button" aria-label={t("移除 {name}", { name: f.name })} onClick={() => setStaged((prev) => prev.filter((x) => x !== f))}>{t("移除")}</button>
                     </li>
                   ))}
                 </ul>
@@ -1281,17 +1298,17 @@ export default function Home() {
                   type="button"
                   onClick={() => { const files = staged; setStaged([]); void processFiles(files); }}
                 >
-                  开始转换 · {modeNames[mode]}
+                  {t("开始转换 · {mode}", { mode: t(modeNames[mode]) })}
                 </button>
               </div>
             )}
           </section>
           {library.length > 0 && (
             // 最近转换直接摆在首页：以前要点进 Library 才能找到几分钟前刚转完的那份
-            <section className="recent" aria-label="最近转换">
+            <section className="recent" aria-label={t("最近转换")}>
               <div className="recent-head">
-                <strong>最近转换</strong>
-                <button type="button" className="quiet-button" onClick={showLibrary}>全部 {library.length} 份 →</button>
+                <strong>{t("最近转换")}</strong>
+                <button type="button" className="quiet-button" onClick={showLibrary}>{t("全部 {n} 份 →", { n: library.length })}</button>
               </div>
               <ul className="recent-list">
                 {library.slice(0, 5).map((record) => (
@@ -1299,8 +1316,8 @@ export default function Home() {
                     <button type="button" className="recent-item" onClick={() => openRecord(record)}>
                       <span className="recent-name">{record.filename}</span>
                       <span className="recent-meta">
-                        {record.page_count} 页 · {record.ai_pages ? "AI 精校" : modeNames[record.mode] || "旧版"} · {formatDate(new Date(record.updated_at).getTime())}
-                        {record.review_count ? <em> · {record.review_count} 页待检查</em> : null}
+                        {record.page_count} {t("页")} · {record.ai_pages ? t("AI 精校") : t(modeNames[record.mode]) || t("旧版")} · {formatDate(new Date(record.updated_at).getTime())}
+                        {record.review_count ? <em> · {t("{n} 页待检查", { n: record.review_count })}</em> : null}
                       </span>
                     </button>
                   </li>
@@ -1314,38 +1331,38 @@ export default function Home() {
           <header className="batch-header">
             <div>
               <div className="eyebrow">{batchRunning ? "BATCH CONVERSION IN PROGRESS" : "BATCH CONVERSION COMPLETE"}</div>
-              <h1>{batchRunning ? "正在批量转换" : "批量处理完成"}</h1>
-              <p>{batchItems.length} 份 PDF · {modeNames[mode]} · 已处理 {batchFinished} / {batchItems.length}</p>
+              <h1>{batchRunning ? t("正在批量转换") : t("批量处理完成")}</h1>
+              <p>{t("{n} 份 PDF · {mode} · 已处理 {done} / {total}", { n: batchItems.length, mode: t(modeNames[mode]), done: batchFinished, total: batchItems.length })}</p>
             </div>
             <div className="batch-actions">
-              {!batchRunning && batchCompleted > 0 && <button className="secondary-button" type="button" onClick={downloadBatchMarkdown}>下载合并 .md</button>}
-              {!batchRunning && <button className="primary-button" type="button" onClick={reset}>＋ 新批次</button>}
+              {!batchRunning && batchCompleted > 0 && <button className="secondary-button" type="button" onClick={downloadBatchMarkdown}>{t("下载合并 .md")}</button>}
+              {!batchRunning && <button className="primary-button" type="button" onClick={reset}>{t("＋ 新批次")}</button>}
             </div>
           </header>
           <div className="run-timer" aria-live="off">
             <div className="run-timer-clock">
-              <span className="run-timer-label">{batchRunning ? "已用时" : "总用时"}</span>
+              <span className="run-timer-label">{batchRunning ? t("已用时") : t("总用时")}</span>
               <strong>{formatElapsed(runElapsed)}</strong>
             </div>
             <div className="run-timer-pages">
               <div>
                 <strong>{batchDonePages}<em> / {batchPagesUnknown && !batchTotalPages ? "?" : batchTotalPages}</em></strong>
-                <span>页{batchPagesUnknown && batchTotalPages ? "（部分未读出）" : ""}</span>
+                <span>{t("页")}{batchPagesUnknown && batchTotalPages ? t("（部分未读出）") : ""}</span>
               </div>
               <div>
                 <strong>{pagesPerMin ? pagesPerMin.toFixed(0) : "—"}</strong>
-                <span>页/分钟</span>
+                <span>{t("页/分钟")}</span>
               </div>
               <div>
                 <strong>{batchItems.length}</strong>
-                <span>份文件</span>
+                <span>{t("份文件")}</span>
               </div>
             </div>
           </div>
           <div className="batch-summary">
-            <div><strong>{batchPercent}%</strong><span>总体进度</span></div>
-            <div><strong>{batchCompleted}</strong><span>转换成功</span></div>
-            <div className={batchFailed ? "needs-review" : ""}><strong>{batchFailed}</strong><span>处理失败</span></div>
+            <div><strong>{batchPercent}%</strong><span>{t("总体进度")}</span></div>
+            <div><strong>{batchCompleted}</strong><span>{t("转换成功")}</span></div>
+            <div className={batchFailed ? "needs-review" : ""}><strong>{batchFailed}</strong><span>{t("处理失败")}</span></div>
             <div className="batch-overall-track"><i style={{ width: `${batchPercent}%` }} /></div>
           </div>
           <div className="batch-list">
@@ -1364,15 +1381,15 @@ export default function Home() {
                         </span>
                       )}
                     </div>
-                    <p>{item.error || item.detail}{item.status === "processing" && item.total ? ` · ${Math.floor(item.page)} / ${item.total} 页` : ""}</p>
+                    <p>{tServer(item.error || item.detail)}{item.status === "processing" && item.total ? ` · ${Math.floor(item.page)} / ${item.total} ${t("页")}` : ""}</p>
                     <div className="batch-item-track"><i style={{ width: `${itemPercent}%` }} /></div>
                   </div>
                   <div className="batch-item-status">
-                    <span>{item.status === "queued" ? "等待中" : item.status === "processing" ? `${itemPercent}%` : item.status === "complete" ? "已完成" : "失败"}</span>
+                    <span>{item.status === "queued" ? t("等待中") : item.status === "processing" ? `${itemPercent}%` : item.status === "complete" ? t("已完成") : t("失败")}</span>
                     {item.status === "complete" && item.jobId && (
                       <div>
-                        <button type="button" onClick={() => void openBatchResult(item)}>查看</button>
-                        <button type="button" onClick={() => void downloadBatchItem(item)}>下载</button>
+                        <button type="button" onClick={() => void openBatchResult(item)}>{t("查看")}</button>
+                        <button type="button" onClick={() => void downloadBatchItem(item)}>{t("下载")}</button>
                       </div>
                     )}
                   </div>
@@ -1380,76 +1397,76 @@ export default function Home() {
               );
             })}
           </div>
-          <p className="batch-footnote">可以关掉页面，队列在本机服务里继续跑，回来时从这个地址就能接着看。单个文件失败不会中断后续文件；成功结果已自动存入 Library。</p>
+          <p className="batch-footnote">{t("可以关掉页面，队列在本机服务里继续跑，回来时从这个地址就能接着看。单个文件失败不会中断后续文件；成功结果已自动存入 Library。")}</p>
         </section>
       ) : status === "processing" ? (
         <section className="processing-view" aria-live="polite">
-          <div className="processing-orbit"><span>{percent}%</span><i /></div><div className="eyebrow">{mode === "ai" ? "视觉模型识别中" : "正在本机转换"}</div>
-          <h1>{activeFilename}</h1><p>{progressDetail}</p>
+          <div className="processing-orbit"><span>{percent}%</span><i /></div><div className="eyebrow">{mode === "ai" ? t("视觉模型识别中") : t("正在本机转换")}</div>
+          <h1>{activeFilename}</h1><p>{tServer(progressDetail)}</p>
           <div className="run-timer solo">
             <div className="run-timer-clock">
-              <span className="run-timer-label">已用时</span>
+              <span className="run-timer-label">{t("已用时")}</span>
               <strong>{formatElapsed(runElapsed)}</strong>
             </div>
             <div className="run-timer-pages">
-              <div><strong>{Math.floor(progress.page)}<em> / {progress.total || "?"}</em></strong><span>页</span></div>
+              <div><strong>{Math.floor(progress.page)}<em> / {progress.total || "?"}</em></strong><span>{t("页")}</span></div>
               <div>
                 <strong>{runElapsed > 3000 && progress.page ? (progress.page / (runElapsed / 60000)).toFixed(0) : "—"}</strong>
-                <span>页/分钟</span>
+                <span>{t("页/分钟")}</span>
               </div>
             </div>
           </div>
           <div className="progress-track"><i style={{ width: `${percent}%` }} /></div>
-          <small>{mode === "ai" ? "页面图像会发送给你在设置中选择的模型；识别失败的页面回退 PDF 文字层。" : "转换在本机服务里进行，关掉页面也会继续。"}</small>
+          <small>{mode === "ai" ? t("页面图像会发送给你在设置中选择的模型；识别失败的页面回退 PDF 文字层。") : t("转换在本机服务里进行，关掉页面也会继续。")}</small>
         </section>
       ) : status === "error" ? (
-        <section className="error-card"><span>转换未完成</span><h1>{
-          /PPT/.test(error) ? "PPT 没能转成 PDF"
-            : /AI 精校/.test(error) ? "AI 精校还没配置好"
-            : /页数/.test(error) ? "PDF 和记录对不上"
-            : /不存在|找不到|已被/.test(error) ? "找不到这条记录"
-            : "这个文件暂时没能处理"
-        }</h1><p>{error}</p><div className="error-actions">{error.includes("AI 精校") && <button className="secondary-button" type="button" onClick={openSettings}>打开设置</button>}<button className="primary-button" type="button" onClick={reset}>换一个文件</button></div></section>
+        <section className="error-card"><span>{t("转换未完成")}</span><h1>{
+          /PPT/.test(error) ? t("PPT 没能转成 PDF")
+            : /AI 精校/.test(error) ? t("AI 精校还没配置好")
+            : /页数/.test(error) ? t("PDF 和记录对不上")
+            : /不存在|找不到|已被/.test(error) ? t("找不到这条记录")
+            : t("这个文件暂时没能处理")
+        }</h1><p>{tServer(error)}</p><div className="error-actions">{error.includes("AI 精校") && <button className="secondary-button" type="button" onClick={openSettings}>{t("打开设置")}</button>}<button className="primary-button" type="button" onClick={reset}>{t("换一个文件")}</button></div></section>
       ) : result ? (
         <section className="result-workspace">
           <header className="result-header">
-            <div><span className="success-kicker"><i />转换完成 · 已存入 Library</span><h1>{activeFilename}</h1><p>{result.pageCount} 页 · {modeNames[result.mode] || "旧版转换"} · {(result.durationMs / 1000).toFixed(1)} 秒</p></div>
+            <div><span className="success-kicker"><i />{t("转换完成 · 已存入 Library")}</span><h1>{activeFilename}</h1><p>{t("{pages} 页 · {mode} · {seconds} 秒", { pages: result.pageCount, mode: t(modeNames[result.mode]) || t("旧版转换"), seconds: (result.durationMs / 1000).toFixed(1) })}</p></div>
             <div className="result-actions">
               {cameFrom === "library" ? (
-                <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); showLibrary(); }}>← 返回 Library</button>
+                <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); showLibrary(); }}>{t("← 返回 Library")}</button>
               ) : (cameFrom === "batch" || batchItems.length > 1) && batchId ? (
-                <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); navigate({ name: "batch", id: batchId }); }}>← 返回批次</button>
+                <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); navigate({ name: "batch", id: batchId }); }}>{t("← 返回批次")}</button>
               ) : (
-                <button type="button" className="secondary-button" onClick={reset}>← 返回首页</button>
+                <button type="button" className="secondary-button" onClick={reset}>{t("← 返回首页")}</button>
               )}
-              {!batchRunning && <button type="button" className="secondary-button" onClick={() => void rerunAiRefinement()}>{result.mode === "ai" ? "重新 AI 精校" : "用 AI 精校这份"}</button>}
-              <button type="button" className="secondary-button" onClick={copyMarkdown}>{copied ? "已复制" : "复制 Markdown"}</button>
-              <button type="button" className="primary-button" onClick={() => download(result.markdown, `${result.title}.md`, "text/markdown;charset=utf-8")}>下载 .md</button>
+              {!batchRunning && <button type="button" className="secondary-button" onClick={() => void rerunAiRefinement()}>{result.mode === "ai" ? t("重新 AI 精校") : t("用 AI 精校这份")}</button>}
+              <button type="button" className="secondary-button" onClick={copyMarkdown}>{copied ? t("已复制") : t("复制 Markdown")}</button>
+              <button type="button" className="primary-button" onClick={() => download(result.markdown, `${result.title}.md`, "text/markdown;charset=utf-8")}>{t("下载 .md")}</button>
             </div>
           </header>
           {refineWarning && (
             <div className="result-notice" role="status">
-              ⚠ 重新精校失败，已保留原结果：{refineWarning}
+              ⚠ {t("重新精校失败，已保留原结果：{reason}", { reason: tServer(refineWarning) })}
             </div>
           )}
           <div className="score-strip">
-            <div><strong>{result.pageCount - reviewPages.length}</strong><span>通过校验</span></div>
-            <div className={reviewPages.length ? "needs-review" : ""}><strong>{reviewPages.length}</strong><span>建议检查</span></div>
-            <div><strong>{result.pages.reduce((sum, page) => sum + (page.formulaCount ?? 0), 0)}</strong><span>LaTeX 公式</span></div>
-            <button type="button" onClick={() => download(JSON.stringify(result, null, 2), `${result.title}-report.json`, "application/json")}>导出完整报告 ↗</button>
+            <div><strong>{result.pageCount - reviewPages.length}</strong><span>{t("通过校验")}</span></div>
+            <div className={reviewPages.length ? "needs-review" : ""}><strong>{reviewPages.length}</strong><span>{t("建议检查")}</span></div>
+            <div><strong>{result.pages.reduce((sum, page) => sum + (page.formulaCount ?? 0), 0)}</strong><span>{t("LaTeX 公式")}</span></div>
+            <button type="button" onClick={() => download(JSON.stringify(result, null, 2), `${result.title}-report.json`, "application/json")}>{t("导出完整报告 ↗")}</button>
           </div>
           <div className="result-tabs" role="tablist">
             <button className={tab === "markdown" ? "active" : ""} onClick={() => setTab("markdown")} role="tab">Markdown</button>
-            <button className={tab === "quality" ? "active" : ""} onClick={() => setTab("quality")} role="tab">逐页质量 <b>{reviewPages.length}</b></button>
-            <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")} role="tab">AI 前后对照 <b>{comparedPages.length}</b></button>
-            <button className={tab === "source" ? "active" : ""} onClick={() => setTab("source")} role="tab">原始 PDF</button>
+            <button className={tab === "quality" ? "active" : ""} onClick={() => setTab("quality")} role="tab">{t("逐页质量")} <b>{reviewPages.length}</b></button>
+            <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")} role="tab">{t("AI 前后对照")} <b>{comparedPages.length}</b></button>
+            <button className={tab === "source" ? "active" : ""} onClick={() => setTab("source")} role="tab">{t("原始 PDF")}</button>
           </div>
           <div className="result-panel">
             {tab === "markdown" && (
               <div className="markdown-pane">
-                <div className="md-toolbar" role="group" aria-label="查看方式">
-                  <button type="button" className={mdView === "rendered" ? "active" : ""} onClick={() => setMdView("rendered")}>渲染</button>
-                  <button type="button" className={mdView === "raw" ? "active" : ""} onClick={() => setMdView("raw")}>源码</button>
+                <div className="md-toolbar" role="group" aria-label={t("查看方式")}>
+                  <button type="button" className={mdView === "rendered" ? "active" : ""} onClick={() => setMdView("rendered")}>{t("渲染")}</button>
+                  <button type="button" className={mdView === "raw" ? "active" : ""} onClick={() => setMdView("raw")}>{t("源码")}</button>
                 </div>
                 {mdView === "rendered"
                   ? <div className="markdown-rendered" dangerouslySetInnerHTML={{ __html: renderedMarkdown }} />
@@ -1457,37 +1474,37 @@ export default function Home() {
               </div>
             )}
             {tab === "quality" && <div className="quality-list">{result.pages.map((page) => (
-              <article key={page.page} className={page.status === "good" ? "good-page" : ""}><span>第 {page.page} 页</span><div><strong>{methodLabel(page)}</strong>{page.reasons.length ? page.reasons.map((reason) => <p key={reason}>{reason}</p>) : <p>程序校验通过</p>}<p>{page.formulaCount ?? 0} 个公式 · {page.optionCount ?? 0} 个选项标签</p></div><small>{page.charCount} 字符</small></article>
+              <article key={page.page} className={page.status === "good" ? "good-page" : ""}><span>{t("第 {n} 页", { n: page.page })}</span><div><strong>{methodLabel(page)}</strong>{page.reasons.length ? page.reasons.map((reason) => <p key={reason}>{tServer(reason)}</p>) : <p>{t("程序校验通过")}</p>}<p>{t("{f} 个公式 · {o} 个选项标签", { f: page.formulaCount ?? 0, o: page.optionCount ?? 0 })}</p></div><small>{t("{n} 字符", { n: page.charCount })}</small></article>
             ))}</div>}
             {tab === "compare" && (comparedPages.length ? <div className="compare-list">{comparedPages.map((page) => (
-              <article key={page.page}><header><strong>第 {page.page} 页</strong><span className={`method-badge ${page.method === "ai" ? "accepted" : "fallback"}`}>{page.method === "ai" ? `采用 ${page.model}` : mode === "ai" ? "AI 未通过 · 回退文字层" : "回退本地初稿"}</span></header><div className="compare-columns"><section><h3>最终 Markdown</h3><pre>{page.markdown}</pre></section><section><h3>{mode === "ai" ? "PDF 文字层（提示/回退）" : "Surya 本地初稿"}</h3><pre>{page.rawMarkdown}</pre></section></div></article>
-            ))}</div> : <div className="all-clear"><span>↔</span><h2>这次没有 AI 对照记录</h2><p>使用“重新 AI 精校”后，这里会保留最终结果与本地初稿。</p></div>)}
-            {tab === "source" && sourceUrl && <iframe className="pdf-preview" src={sourceUrl} title="原始 PDF 预览" />}
+              <article key={page.page}><header><strong>{t("第 {n} 页", { n: page.page })}</strong><span className={`method-badge ${page.method === "ai" ? "accepted" : "fallback"}`}>{page.method === "ai" ? t("采用 {model}", { model: page.model ?? "" }) : mode === "ai" ? t("AI 未通过 · 回退文字层") : t("回退本地初稿")}</span></header><div className="compare-columns"><section><h3>{t("最终 Markdown")}</h3><pre>{page.markdown}</pre></section><section><h3>{mode === "ai" ? t("PDF 文字层（提示/回退）") : t("Surya 本地初稿")}</h3><pre>{page.rawMarkdown}</pre></section></div></article>
+            ))}</div> : <div className="all-clear"><span>↔</span><h2>{t("这次没有 AI 对照记录")}</h2><p>{t("使用“重新 AI 精校”后，这里会保留最终结果与本地初稿。")}</p></div>)}
+            {tab === "source" && sourceUrl && <iframe className="pdf-preview" src={sourceUrl} title={t("原始 PDF 预览")} />}
           </div>
         </section>
       ) : null}
 
-      <footer><span>墨页 · Verifiable document tools</span><span>{aiWasUsed ? "本地初稿 · 可选云端精校 · 逐页留痕" : "当前处理仅在你的设备完成"}</span></footer>
+      <footer><span>{t("墨页 · Verifiable document tools")}</span><span>{aiWasUsed ? t("本地初稿 · 可选云端精校 · 逐页留痕") : t("当前处理仅在你的设备完成")}</span></footer>
 
       {/* 统计悬浮球只在首页和 Library 出现：在结果页它会盖住面板左下角 */}
       {((status === "idle" && screen === "converter") || screen === "library") && <div className="stats-fab">
         {statsOpen && (
-          <div className="stats-panel" role="dialog" aria-label="你的墨页数据">
-            <div className="stats-head">你的墨页数据</div>
+          <div className="stats-panel" role="dialog" aria-label={t("你的墨页数据")}>
+            <div className="stats-head">{t("你的墨页数据")}</div>
             <div className="stats-nums">
-              <div className="stat-num"><b>{stats ? stats.totals.pages : "—"}</b><span>页已转换</span></div>
-              <div className="stat-num"><b>{stats ? fmtBig(stats.totals.chars) : "—"}</b><span>字</span></div>
-              <div className="stat-num"><b>{stats ? stats.totals.transcripts : "—"}</b><span>份文档</span></div>
+              <div className="stat-num"><b>{stats ? stats.totals.pages : "—"}</b><span>{t("页已转换")}</span></div>
+              <div className="stat-num"><b>{stats ? fmtBig(stats.totals.chars) : "—"}</b><span>{t("字")}</span></div>
+              <div className="stat-num"><b>{stats ? stats.totals.transcripts : "—"}</b><span>{t("份文档")}</span></div>
             </div>
             <div className="stats-block">
-              <div className="stats-label">累计页数</div>
-              {stats ? sparkline(cumPages) : <div className="spark-empty">正在读取…</div>}
+              <div className="stats-label">{t("累计页数")}</div>
+              {stats ? sparkline(cumPages) : <div className="spark-empty">{t("正在读取…")}</div>}
             </div>
             <div className="stats-block">
               <div className="stats-label-row">
-                <span className="stats-label">关注领域</span>
+                <span className="stats-label">{t("关注领域")}</span>
                 <button type="button" className="stats-lang" disabled={backfillState?.running} onClick={() => void runBackfill()}>
-                  {backfillState?.running ? `补标签中 ${backfillState.done}/${backfillState.total}` : "补标签"}
+                  {backfillState?.running ? t("补标签中 {done}/{total}", { done: backfillState.done, total: backfillState.total }) : t("补标签")}
                 </button>
               </div>
               {stats?.topTags.length ? (
@@ -1501,47 +1518,47 @@ export default function Home() {
                   ))}
                 </div>
               ) : (
-                <div className="spark-empty">还没有标签 —— 点右上角&ldquo;补标签&rdquo;生成</div>
+                <div className="spark-empty">{t("还没有标签 —— 点右上角“补标签”生成")}</div>
               )}
             </div>
           </div>
         )}
         <button type="button" className="stats-toggle" onClick={toggleStats} aria-expanded={statsOpen}>
-          <span className="stats-dot" />我的统计
+          <span className="stats-dot" />{t("我的统计")}
         </button>
       </div>}
 
       {showSettings && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSettings(false); }}>
           <section className="settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-            <header><div><span className="eyebrow">MODEL SETTINGS</span><h2 id="settings-title">AI 精校设置</h2></div><button type="button" onClick={() => setShowSettings(false)} aria-label="关闭设置">×</button></header>
-            <div className="settings-warning"><strong>隐私说明</strong><p>AI 模式下，页面的 JPEG 图像和 PDF 文字层提示会发送给你选择的模型服务。API Key 仅保存在本项目的本机 <code>settings.local.json</code>，不会写入 Library 或浏览器页面数据。</p></div>
-            <div className="settings-provider" role="group" aria-label="模型服务商">
+            <header><div><span className="eyebrow">MODEL SETTINGS</span><h2 id="settings-title">{t("AI 精校设置")}</h2></div><button type="button" onClick={() => setShowSettings(false)} aria-label={t("关闭设置")}>×</button></header>
+            <div className="settings-warning"><strong>{t("隐私说明")}</strong><p>{t("AI 模式下，页面的 JPEG 图像和 PDF 文字层提示会发送给你选择的模型服务。API Key 仅保存在本项目的本机")} <code>settings.local.json</code>{t("，不会写入 Library 或浏览器页面数据。")}</p></div>
+            <div className="settings-provider" role="group" aria-label={t("模型服务商")}>
               <button type="button" className={settingsDraft.provider === "gemini" ? "active" : ""} onClick={() => selectProvider("gemini")}>Google Gemini</button>
               <button type="button" className={settingsDraft.provider === "kimi" ? "active" : ""} onClick={() => selectProvider("kimi")}>Kimi</button>
-              <button type="button" className={settingsDraft.provider === "qwen" ? "active" : ""} onClick={() => selectProvider("qwen")}>Qwen 百炼</button>
+              <button type="button" className={settingsDraft.provider === "qwen" ? "active" : ""} onClick={() => selectProvider("qwen")}>{t("Qwen 百炼")}</button>
               <button type="button" className={settingsDraft.provider === "openrouter" ? "active" : ""} onClick={() => selectProvider("openrouter")}>OpenRouter</button>
             </div>
             <div className="multichannel">
-              <label className="multichannel-main" aria-label="多渠道并行">
+              <label className="multichannel-main" aria-label={t("多渠道并行")}>
                 <input
                   type="checkbox"
                   checked={Boolean(settingsDraft.multiChannel)}
                   onChange={(event) => setSettingsDraft((value) => ({ ...value, multiChannel: event.target.checked }))}
                 />
                 <span>
-                  <strong>多渠道并行</strong>
+                  <strong>{t("多渠道并行")}</strong>
                   <small>
                     {settingsDraft.multiChannel
-                      ? "页面按并发能力分给下面勾选的渠道。上面选的服务商只决定「测试连接」测哪一家。"
-                      : `关闭时只用上面选中的 ${providerNames[settingsDraft.provider]} 一家。不同渠道打的是不同上游，配额互不占用。`}
+                      ? t("页面按并发能力分给下面勾选的渠道。上面选的服务商只决定「测试连接」测哪一家。")
+                      : t("关闭时只用上面选中的 {provider} 一家。不同渠道打的是不同上游，配额互不占用。", { provider: providerNames[settingsDraft.provider] })}
                   </small>
                 </span>
               </label>
               {settingsDraft.multiChannel && (
                 <>
                   <div className="channel-picks">
-                    {configuredProviders.length === 0 && <span className="channel-empty">还没有配置任何 API Key</span>}
+                    {configuredProviders.length === 0 && <span className="channel-empty">{t("还没有配置任何 API Key")}</span>}
                     {configuredProviders.map((p) => {
                       const picked = !settingsDraft.channels?.length || settingsDraft.channels.includes(p);
                       return (
@@ -1557,41 +1574,41 @@ export default function Home() {
                             })}
                           />
                           <b>{providerNames[p]}</b>
-                          <i>{settings.channelWeights?.[p] ?? "?"} 路</i>
+                          <i>{t("{n} 路", { n: settings.channelWeights?.[p] ?? "?" })}</i>
                         </label>
                       );
                     })}
                   </div>
                   <div className="channel-total">
-                    合计并发{" "}
+                    {t("合计并发")}{" "}
                     <b>
                       {configuredProviders
                         .filter((p) => !settingsDraft.channels?.length || settingsDraft.channels.includes(p))
                         .reduce((sum, p) => sum + (settings.channelWeights?.[p] ?? 0), 0)}
                     </b>{" "}
-                    路 · 实测 84 路可靠，再往上会有请求挂死
+                    {t("路 · 实测 84 路可靠，再往上会有请求挂死")}
                   </div>
                 </>
               )}
             </div>
             {settingsDraft.provider === "gemini" ? (
               <div className="settings-fields">
-                <label><span>Gemini API Key</span><input type="password" value={settingsDraft.geminiKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiKey: event.target.value }))} placeholder={settingsDraft.geminiKeyMasked || "AIza…"} /><small>{settingsDraft.geminiConfigured ? `已配置 ${settingsDraft.geminiKeyMasked}；留空则保留原值` : "尚未配置"}</small></label>
+                <label><span>Gemini API Key</span><input type="password" value={settingsDraft.geminiKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiKey: event.target.value }))} placeholder={settingsDraft.geminiKeyMasked || "AIza…"} /><small>{settingsDraft.geminiConfigured ? t("已配置 {masked}；留空则保留原值", { masked: settingsDraft.geminiKeyMasked }) : t("尚未配置")}</small></label>
                 <div className="keypool">
                   <div className="keypool-head">
                     <div>
-                      <span className="keypool-title">并行密钥</span>
-                      <small>实测：同一 Google <b>账号</b>下的 Key（哪怕分属不同项目）共用同一份吞吐，加了不会更快；<b>换一个 Google 账号</b>的 Key 才是独立配额——实测两个账号并行提速 <b>3.3 倍</b>。</small>
+                      <span className="keypool-title">{t("并行密钥")}</span>
+                      <small>{t("实测：同一 Google")} <b>{t("账号")}</b>{t("下的 Key（哪怕分属不同项目）共用同一份吞吐，加了不会更快；")}<b>{t("换一个 Google 账号")}</b>{t("的 Key 才是独立配额——实测两个账号并行提速")} <b>{t("3.3 倍")}</b>。</small>
                     </div>
-                    <span className="keypool-badge" title="并发 = 6 × 独立项目数">
-                      <b>{extraKeys.filter((k) => k.masked || k.value.trim()).length + 1}</b> 把 Key · 并发 {6 * Math.max(1, Math.min(settingsDraft.geminiProjects || 1, extraKeys.filter((k) => k.masked || k.value.trim()).length + 1))}
+                    <span className="keypool-badge" title={t("并发 = 6 × 独立项目数")}>
+                      {t("{n} 把 Key · 并发 {c}", { n: extraKeys.filter((k) => k.masked || k.value.trim()).length + 1, c: 6 * Math.max(1, Math.min(settingsDraft.geminiProjects || 1, extraKeys.filter((k) => k.masked || k.value.trim()).length + 1)) })}
                     </span>
                   </div>
                   <ol className="keypool-list">
                     <li className="keypool-row is-primary">
                       <span className="keypool-index">1</span>
-                      <code>{settingsDraft.geminiKeyMasked || "上方主 Key"}</code>
-                      <span className="keypool-tag">主</span>
+                      <code>{settingsDraft.geminiKeyMasked || t("上方主 Key")}</code>
+                      <span className="keypool-tag">{t("主")}</span>
                     </li>
                     {extraKeys.map((key, i) => (
                       <li className="keypool-row" key={i}>
@@ -1599,64 +1616,64 @@ export default function Home() {
                         {key.masked && !key.value ? (
                           <>
                             <code>{key.masked}</code>
-                            <span className="keypool-tag">已保存</span>
+                            <span className="keypool-tag">{t("已保存")}</span>
                           </>
                         ) : (
                           <input
                             type="password"
                             value={key.value}
                             spellCheck={false}
-                            placeholder={key.masked ? "留空则保留原值" : "AIza… （另一个 Google 账号的 Key）"}
+                            placeholder={key.masked ? t("留空则保留原值") : t("AIza… （另一个 Google 账号的 Key）")}
                             onChange={(event) => updateExtraKey(i, event.target.value)}
                           />
                         )}
-                        <button type="button" className="keypool-remove" aria-label={`移除第 ${i + 2} 把 Key`} onClick={() => removeExtraKey(i)}>✕</button>
+                        <button type="button" className="keypool-remove" aria-label={t("移除第 {n} 把 Key", { n: i + 2 })} onClick={() => removeExtraKey(i)}>✕</button>
                       </li>
                     ))}
                   </ol>
                   <div className="keypool-foot">
-                    <button type="button" className="keypool-add" onClick={addExtraKey}>＋ 添加一把 Key</button>
+                    <button type="button" className="keypool-add" onClick={addExtraKey}>{t("＋ 添加一把 Key")}</button>
                     <label className="keypool-projects">
-                      <span>其中来自几个独立账号</span>
+                      <span>{t("其中来自几个独立账号")}</span>
                       <input type="number" min={1} max={20} value={settingsDraft.geminiProjects || 1}
                         onChange={(event) => setSettingsDraft((v) => ({ ...v, geminiProjects: Math.max(1, Number(event.target.value) || 1) }))} />
                     </label>
                   </div>
                 </div>
-                <label htmlFor="gemini-model"><span>主模型</span><ModelPicker id="gemini-model" provider="gemini" value={settingsDraft.geminiModel} extra={remoteModels?.provider === "gemini" ? remoteModels.models : []} onChange={(geminiModel) => setSettingsDraft((value) => ({ ...value, geminiModel }))} /></label>
-                <label><span>失败回退模型</span><input value={settingsDraft.geminiFallbackModel} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiFallbackModel: event.target.value }))} /></label>
+                <label htmlFor="gemini-model"><span>{t("主模型")}</span><ModelPicker id="gemini-model" provider="gemini" value={settingsDraft.geminiModel} extra={remoteModels?.provider === "gemini" ? remoteModels.models : []} onChange={(geminiModel) => setSettingsDraft((value) => ({ ...value, geminiModel }))} /></label>
+                <label><span>{t("失败回退模型")}</span><input value={settingsDraft.geminiFallbackModel} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiFallbackModel: event.target.value }))} /></label>
                 <label className="wide"><span>API Base URL</span><input value={settingsDraft.geminiBaseUrl} onChange={(event) => setSettingsDraft((value) => ({ ...value, geminiBaseUrl: event.target.value }))} /></label>
               </div>
             ) : settingsDraft.provider === "kimi" ? (
               <div className="settings-fields">
-                <label><span>Moonshot API Key</span><input type="password" value={settingsDraft.kimiKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, kimiKey: event.target.value }))} placeholder={settingsDraft.kimiKeyMasked || "sk-…"} /><small>{settingsDraft.kimiConfigured ? `已配置 ${settingsDraft.kimiKeyMasked}；留空则保留原值` : "在 Kimi 开放平台创建 API Key"}</small></label>
-                <label className="wide" htmlFor="kimi-model"><span>Kimi 视觉模型</span><ModelPicker id="kimi-model" provider="kimi" value={settingsDraft.kimiModel} extra={remoteModels?.provider === "kimi" ? remoteModels.models : []} onChange={(kimiModel) => setSettingsDraft((value) => ({ ...value, kimiModel }))} /></label>
+                <label><span>Moonshot API Key</span><input type="password" value={settingsDraft.kimiKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, kimiKey: event.target.value }))} placeholder={settingsDraft.kimiKeyMasked || "sk-…"} /><small>{settingsDraft.kimiConfigured ? t("已配置 {masked}；留空则保留原值", { masked: settingsDraft.kimiKeyMasked }) : t("在 Kimi 开放平台创建 API Key")}</small></label>
+                <label className="wide" htmlFor="kimi-model"><span>{t("Kimi 视觉模型")}</span><ModelPicker id="kimi-model" provider="kimi" value={settingsDraft.kimiModel} extra={remoteModels?.provider === "kimi" ? remoteModels.models : []} onChange={(kimiModel) => setSettingsDraft((value) => ({ ...value, kimiModel }))} /></label>
                 <label className="wide"><span>API Base URL</span><input value={settingsDraft.kimiBaseUrl} onChange={(event) => setSettingsDraft((value) => ({ ...value, kimiBaseUrl: event.target.value }))} /></label>
               </div>
             ) : settingsDraft.provider === "qwen" ? (
               <div className="settings-fields">
-                <label><span>阿里云百炼 API Key</span><input type="password" value={settingsDraft.qwenKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, qwenKey: event.target.value }))} placeholder={settingsDraft.qwenKeyMasked || "sk-…"} /><small>{settingsDraft.qwenConfigured ? `已配置 ${settingsDraft.qwenKeyMasked}；留空则保留原值` : "Key 与调用地域必须一致"}</small></label>
-                <label className="wide" htmlFor="qwen-model"><span>Qwen 视觉 / OCR 模型</span><ModelPicker id="qwen-model" provider="qwen" value={settingsDraft.qwenModel} extra={remoteModels?.provider === "qwen" ? remoteModels.models : []} onChange={(qwenModel) => setSettingsDraft((value) => ({ ...value, qwenModel }))} /></label>
-                <label className="wide"><span>API Base URL</span><input value={settingsDraft.qwenBaseUrl} onChange={(event) => setSettingsDraft((value) => ({ ...value, qwenBaseUrl: event.target.value }))} /><small>默认使用北京公共兼容地址；也可替换成百炼业务空间专属 compatible-mode/v1 地址。</small></label>
+                <label><span>{t("阿里云百炼 API Key")}</span><input type="password" value={settingsDraft.qwenKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, qwenKey: event.target.value }))} placeholder={settingsDraft.qwenKeyMasked || "sk-…"} /><small>{settingsDraft.qwenConfigured ? t("已配置 {masked}；留空则保留原值", { masked: settingsDraft.qwenKeyMasked }) : t("Key 与调用地域必须一致")}</small></label>
+                <label className="wide" htmlFor="qwen-model"><span>{t("Qwen 视觉 / OCR 模型")}</span><ModelPicker id="qwen-model" provider="qwen" value={settingsDraft.qwenModel} extra={remoteModels?.provider === "qwen" ? remoteModels.models : []} onChange={(qwenModel) => setSettingsDraft((value) => ({ ...value, qwenModel }))} /></label>
+                <label className="wide"><span>API Base URL</span><input value={settingsDraft.qwenBaseUrl} onChange={(event) => setSettingsDraft((value) => ({ ...value, qwenBaseUrl: event.target.value }))} /><small>{t("默认使用北京公共兼容地址；也可替换成百炼业务空间专属 compatible-mode/v1 地址。")}</small></label>
               </div>
             ) : (
               <div className="settings-fields">
-                <label><span>OpenRouter API Key</span><input type="password" value={settingsDraft.openrouterKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, openrouterKey: event.target.value }))} placeholder={settingsDraft.openrouterKeyMasked || "sk-or-…"} /><small>{settingsDraft.openrouterConfigured ? `已配置 ${settingsDraft.openrouterKeyMasked}；留空则保留原值` : "尚未配置"}</small></label>
-                <label className="wide" htmlFor="openrouter-model"><span>视觉模型</span><ModelPicker id="openrouter-model" provider="openrouter" value={settingsDraft.openrouterModel} extra={remoteModels?.provider === "openrouter" ? remoteModels.models : []} onChange={(openrouterModel) => setSettingsDraft((value) => ({ ...value, openrouterModel }))} /></label>
+                <label><span>OpenRouter API Key</span><input type="password" value={settingsDraft.openrouterKey || ""} onChange={(event) => setSettingsDraft((value) => ({ ...value, openrouterKey: event.target.value }))} placeholder={settingsDraft.openrouterKeyMasked || "sk-or-…"} /><small>{settingsDraft.openrouterConfigured ? t("已配置 {masked}；留空则保留原值", { masked: settingsDraft.openrouterKeyMasked }) : t("尚未配置")}</small></label>
+                <label className="wide" htmlFor="openrouter-model"><span>{t("视觉模型")}</span><ModelPicker id="openrouter-model" provider="openrouter" value={settingsDraft.openrouterModel} extra={remoteModels?.provider === "openrouter" ? remoteModels.models : []} onChange={(openrouterModel) => setSettingsDraft((value) => ({ ...value, openrouterModel }))} /></label>
                 <label className="wide"><span>API Base URL</span><input value={settingsDraft.openrouterBaseUrl} onChange={(event) => setSettingsDraft((value) => ({ ...value, openrouterBaseUrl: event.target.value }))} /></label>
               </div>
             )}
-            <div className="model-sync-row"><button type="button" className="secondary-button" disabled={settingsBusy} onClick={() => void syncModels()}>↻ 从服务商同步模型</button><span>需要先填写 API Key；只显示可用于图片输入的模型。</span></div>
-            <fieldset className="scope-field"><legend>精校范围</legend><label><input type="radio" checked={settingsDraft.aiScope === "all"} onChange={() => setSettingsDraft((value) => ({ ...value, aiScope: "all" }))} />全部页面（质量最佳）</label><label><input type="radio" checked={settingsDraft.aiScope === "review"} onChange={() => setSettingsDraft((value) => ({ ...value, aiScope: "review" }))} />只精校公式、选项与可疑页面（更省费用）</label></fieldset>
+            <div className="model-sync-row"><button type="button" className="secondary-button" disabled={settingsBusy} onClick={() => void syncModels()}>{t("↻ 从服务商同步模型")}</button><span>{t("需要先填写 API Key；只显示可用于图片输入的模型。")}</span></div>
+            <fieldset className="scope-field"><legend>{t("精校范围")}</legend><label><input type="radio" checked={settingsDraft.aiScope === "all"} onChange={() => setSettingsDraft((value) => ({ ...value, aiScope: "all" }))} />{t("全部页面（质量最佳）")}</label><label><input type="radio" checked={settingsDraft.aiScope === "review"} onChange={() => setSettingsDraft((value) => ({ ...value, aiScope: "review" }))} />{t("只精校公式、选项与可疑页面（更省费用）")}</label></fieldset>
             <fieldset className="scope-field">
-              <legend>自动打标签</legend>
+              <legend>{t("自动打标签")}</legend>
               <label>
                 <input type="checkbox" checked={settingsDraft.autoTag !== false} onChange={(event) => setSettingsDraft((value) => ({ ...value, autoTag: event.target.checked }))} />
-                转换完成后用当前服务商给文档打 2–4 个主题标签（会把文档开头约 3000 字发出去，本地模式也一样）
+                {t("转换完成后用当前服务商给文档打 2–4 个主题标签（会把文档开头约 3000 字发出去，本地模式也一样）")}
               </label>
             </fieldset>
             {settingsStatus && <div className="settings-status" role="status">{settingsStatus}</div>}
-            <footer><button type="button" className="secondary-button" disabled={settingsBusy} onClick={() => void testSettings()}>测试连接</button><div><button type="button" className="quiet-button" onClick={() => setShowSettings(false)}>取消</button><button type="button" className="primary-button" disabled={settingsBusy} onClick={() => void persistSettings()}>保存设置</button></div></footer>
+            <footer><button type="button" className="secondary-button" disabled={settingsBusy} onClick={() => void testSettings()}>{t("测试连接")}</button><div><button type="button" className="quiet-button" onClick={() => setShowSettings(false)}>{t("取消")}</button><button type="button" className="primary-button" disabled={settingsBusy} onClick={() => void persistSettings()}>{t("保存设置")}</button></div></footer>
           </section>
         </div>
       )}

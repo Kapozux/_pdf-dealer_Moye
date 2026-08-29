@@ -50,6 +50,11 @@ export type AiSettings = {
   openrouterBaseUrl: string;
   aiScope: AiScope;
   aiConfigured: boolean;
+  /**
+   * 转换完成后自动用模型打主题标签。会把文档开头约 3000 字发给当前服务商——
+   * 本地模式也一样，所以必须是可关的，顶栏的隐私标签也据此说话。
+   */
+  autoTag: boolean;
   /** 可用的 Gemini key 数量（每把=独立配额，并发按此放大） */
   geminiKeyCount?: number;
 };
@@ -84,6 +89,7 @@ export const defaultAiSettings: AiSettings = {
   openrouterBaseUrl: "https://openrouter.ai/api/v1",
   aiScope: "all",
   aiConfigured: false,
+  autoTag: true,
 };
 
 async function parseResponse<T>(response: Response): Promise<T> {

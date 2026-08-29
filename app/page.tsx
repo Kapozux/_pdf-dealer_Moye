@@ -8,6 +8,9 @@ import {
   exportZipUrl, listBatches, listLibraryItems, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
   type Batch, type Job, type Stats, type TagBackfillState,
 } from "../lib/api";
+import { marked } from "marked";
+import katex from "katex";
+import "katex/dist/katex.min.css";
 
 // PPT/PPTX 先在服务端转成 PDF 再走原来那套管线（见 server/office2pdf.mjs），
 // 前端这边只需要放宽"只认 PDF"的校验，不用关心转换细节。
@@ -88,6 +91,49 @@ const modeDescriptions: Record<ConversionMode, string> = {
   math: "本机 Surya 逐页识别版面、表格与公式。",
   ai: "直接把页面图像交给视觉模型识别（不跑本地 Surya），文字层作提示与回退。",
 };
+
+/** 选模式时该一眼看到的三件事：多快、花不花钱、上不上传。数字来自实测（见 CLAUDE.md）。 */
+const modeMeta: Record<ConversionMode, string> = {
+  fast: "秒级 · 免费 · 不上传",
+  balanced: "约 1 分钟/页 · 免费 · 不上传",
+  math: "约 1 分钟/页 · 免费 · 不上传",
+  ai: "约 15 秒/页 · 按页计费 · 上传页面图像",
+};
+
+/** tags 在库里是 JSON 数组字符串；坏数据当没有。 */
+function parseTags(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed.map(String).filter(Boolean) : [];
+  } catch {
+    return [];
+  }
+}
+
+const escapeHtml = (s: string) =>
+  s.replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c] ?? c));
+
+/**
+ * Markdown → HTML（含 LaTeX）。输出是带公式的 Markdown，只给源码看等于让人肉眼读 $…$
+ * 判断公式对不对；渲染出来才叫"可验证"。
+ * 公式先换成占位符再交给 marked：否则 LaTeX 里的 _ * \ 会被当成 Markdown 语法吃掉。
+ * 原文里的裸 HTML 一律转义——内容来自 PDF 和模型，不可信。
+ */
+function renderMarkdown(source: string): string {
+  const formulas: string[] = [];
+  const stash = (latex: string, display: boolean) => {
+    formulas.push(katex.renderToString(latex, { displayMode: display, throwOnError: false, strict: "ignore" }));
+    return `\uE000${formulas.length - 1}\uE001`;
+  };
+  const withPlaceholders = source
+    .replace(/\$\$([\s\S]+?)\$\$/g, (_, latex: string) => stash(latex.trim(), true))
+    .replace(/(^|[^\\$])\$((?:\\.|[^$\n])+?)\$/g, (_, lead: string, latex: string) => `${lead}${stash(latex, false)}`);
+  const renderer = new marked.Renderer();
+  renderer.html = ({ text }) => escapeHtml(text);
+  const html = marked.parse(withPlaceholders, { renderer, gfm: true, async: false }) as string;
+  return html.replace(/\uE000(\d+)\uE001/g, (_, index: string) => formulas[Number(index)] ?? "");
+}
 
 const providerNames: Record<AiProvider, string> = {
   gemini: "Gemini",
@@ -284,6 +330,8 @@ export default function Home() {
   // 重新精校失败时服务端会保留旧结果（不是空白报错屏），但要让用户知道这次其实没有真的变化
   const [refineWarning, setRefineWarning] = useState("");
   const [tab, setTab] = useState<ResultTab>("markdown");
+  // Markdown 标签页：默认看渲染结果（公式、表格、标题都成形），要核对原文再切源码
+  const [mdView, setMdView] = useState<"rendered" | "raw">("rendered");
   const [copied, setCopied] = useState(false);
   const [screen, setScreen] = useState<Screen>("converter");
   const [library, setLibrary] = useState<Job[]>([]);
@@ -394,6 +442,8 @@ export default function Home() {
 
   const reviewPages = useMemo(() => result?.pages.filter((page) => page.status === "review") ?? [], [result]);
   const comparedPages = useMemo(() => result?.pages.filter((page) => page.rawMarkdown !== undefined) ?? [], [result]);
+  // 渲染一次缓存住：几百页的文档有上千个公式，切标签页不该每次重算
+  const renderedMarkdown = useMemo(() => (result && mdView === "rendered" ? renderMarkdown(result.markdown) : ""), [result, mdView]);
   // 统计面板的累计页数走势：时间线是按天的增量，前端自己滚成累计和
   const cumPages = useMemo(() => {
     let sum = 0;
@@ -411,7 +461,12 @@ export default function Home() {
   const percent = progress.total ? Math.round((progress.page / progress.total) * 100) : 0;
   const filteredLibrary = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    return normalized ? library.filter((item) => item.filename.toLocaleLowerCase().includes(normalized)) : library;
+    if (!normalized) return library;
+    // 文件名和 AI 打的标签都搜：标签本来只在统计面板里露过面，这才有入口
+    return library.filter((item) =>
+      item.filename.toLocaleLowerCase().includes(normalized)
+      || parseTags(item.tags).some((tag) => tag.toLocaleLowerCase().includes(normalized))
+    );
   }, [library, query]);
   /**
    * 按合集分组显示：一次批量转换是一组（可整包下 zip），单独转的不分组。
@@ -974,6 +1029,9 @@ export default function Home() {
             <span className="library-card-meta">{formatDate(new Date(record.updated_at).getTime())}</span>
             <strong>{record.filename}</strong>
             <span className="library-card-preview">{record.preview || "没有可预览的文字"}</span>
+            {parseTags(record.tags).length > 0 && (
+              <span className="card-tags">{parseTags(record.tags).map((tag) => <i key={tag}>{tag}</i>)}</span>
+            )}
           </span>
         </button>
         <div className="library-card-footer">
@@ -1059,10 +1117,23 @@ export default function Home() {
           <span className="brand-mark">墨</span><span>墨页</span><span className="brand-subtitle">PDF/PPT 转 Markdown</span>
         </button>
         <div className="top-actions">
+          {activeJobs.length > 0 && (
+            // 进行中的任务在哪个界面都看得见，不只是首页
+            <button className="library-nav running-nav" type="button" title="查看进度" onClick={() => { const j = activeJobs[0]; navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id }); }}>
+              <i />进行中 <b>{activeJobs.length}</b>
+            </button>
+          )}
           <button className={`library-nav ${screen === "library" ? "active" : ""}`} type="button" onClick={showLibrary} disabled={batchRunning}>Library <b>{library.length}</b></button>
           <button className="settings-button" type="button" onClick={openSettings}>⚙ 设置</button>
           {status !== "idle" && !batchRunning && <button className="quiet-button" type="button" onClick={reset}>＋ 新转换</button>}
-          <span className={`privacy-pill ${aiWasUsed ? "cloud" : ""}`}><i />{aiWasUsed ? "AI 精校 · 页面会发送给所选模型" : "本地处理 · 文件不上传"}</span>
+          {/* 这颗标签必须说实话：本地模式的正文不上传，但打标签会把开头一小段发给模型——以前这里一律写"文件不上传" */}
+          {aiWasUsed ? (
+            <span className="privacy-pill cloud"><i />AI 精校 · 页面图像会发送给所选模型</span>
+          ) : settings.autoTag !== false && settings.aiConfigured ? (
+            <button type="button" className="privacy-pill tag" title="转换正文全程在本机；完成后会把文档开头约 3000 字发给当前服务商生成主题标签。点此可在设置里关闭。" onClick={openSettings}><i />本地转换 · 仅摘要用于 AI 打标签</button>
+          ) : (
+            <span className="privacy-pill"><i />本地处理 · 文件不上传</span>
+          )}
         </div>
       </nav>
 
@@ -1073,7 +1144,7 @@ export default function Home() {
             <button className="primary-button" type="button" onClick={reset}>＋ 新转换</button>
           </header>
           <div className="library-toolbar">
-            <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名…" aria-label="搜索资料库" /></label>
+            <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索文件名或标签…" aria-label="搜索资料库" /></label>
             <div><strong>{library.length}</strong> 份文件 · <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> 页</div>
             {library.length > 0 && (
               // 直接用 <a download>：整包由服务端生成并流式下载，不经过 JS 内存
@@ -1134,10 +1205,10 @@ export default function Home() {
         </section>
       ) : status === "idle" ? (
         <>
-          <section className="hero">
-            <div className="eyebrow">VERIFIABLE PDF/PPT CONVERTER</div>
-            <h1>让 PDF/PPT 变成<br /><em>可靠的 Markdown</em></h1>
-            <p>选好文件再确认开始。转换在本机服务里排队执行，关掉页面也会继续。</p>
+          {/* 首页是工作台不是落地页：每天用的人不需要每天看一遍大标题和产品卖点 */}
+          <section className="home-head">
+            <h1>PDF/PPT 转 Markdown</h1>
+            <p>拖进来、选模式、开始。转换在本机服务里排队执行，关掉页面也会继续。</p>
           </section>
           <section className="converter-card" aria-label="PDF/PPT 转换器">
             <button className={`dropzone ${dragging ? "is-dragging" : ""}`} type="button" onClick={() => inputRef.current?.click()} onDragEnter={() => setDragging(true)} onDragLeave={() => setDragging(false)} onDragOver={(event) => event.preventDefault()} onDrop={handleDrop}>
@@ -1148,9 +1219,28 @@ export default function Home() {
             <div className="profile-row" aria-label="转换模式">
               <div><span className="field-label">转换模式</span><strong>{modeNames[mode]}</strong><small>{modeDescriptions[mode]}</small></div>
               <div className="profile-options">
-                {visibleModes.map((item) => <button key={item} type="button" className={mode === item ? "active" : ""} onClick={() => { setMode(item); if (item === "ai" && !settings.aiConfigured) openSettings(); }}>{modeNames[item]}</button>)}
+                {visibleModes.map((item) => (
+                  <button key={item} type="button" className={mode === item ? "active" : ""} onClick={() => { setMode(item); if (item === "ai" && !settings.aiConfigured) openSettings(); }}>
+                    {modeNames[item]}<small>{modeMeta[item]}</small>
+                  </button>
+                ))}
               </div>
             </div>
+            {mode === "ai" && settings.aiConfigured && (
+              // 精校范围直接影响这次转换花多少钱、多少页过模型，放在模式旁边而不是藏在设置最底下
+              <div className="scope-inline" role="group" aria-label="精校范围">
+                <span>精校范围</span>
+                {([["all", "全部页面 · 质量最佳"], ["review", "只精校公式、选项与可疑页 · 更省"]] as const).map(([value, label]) => (
+                  <label key={value} className={settings.aiScope === value ? "on" : ""}>
+                    <input type="radio" name="scope-inline" checked={settings.aiScope === value} onChange={() => {
+                      void saveAiSettings({ ...settings, aiScope: value, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" }).then(setSettings).catch(() => undefined);
+                    }} />
+                    {label}
+                  </label>
+                ))}
+                <span className="scope-inline-meta">{settings.activeChannels?.length ? `通过 ${settings.activeChannels.map((p) => providerNames[p]).join(" + ")}` : ""}</span>
+              </div>
+            )}
             {activeJobs.length > 0 && (
               <div className="active-panel" aria-label="正在进行的任务">
                 <div className="staged-head">
@@ -1196,11 +1286,28 @@ export default function Home() {
               </div>
             )}
           </section>
-          <section className="feature-grid" aria-label="产品特点">
-            <article><span>01</span><h2>按需选路</h2><p>本地高精度走 Surya；选 AI 则直接交给视觉模型，不再空跑一遍本地识别。</p></article>
-            <article><span>02</span><h2>结果可验证</h2><p>程序检查公式与选项是否丢失，失败时自动回退。</p></article>
-            <article><span>03</span><h2>批量并发</h2><p>一次加入多份 PDF/PPT：AI 任务并发跑，本地识别按机器能力限流。</p></article>
-          </section>
+          {library.length > 0 && (
+            // 最近转换直接摆在首页：以前要点进 Library 才能找到几分钟前刚转完的那份
+            <section className="recent" aria-label="最近转换">
+              <div className="recent-head">
+                <strong>最近转换</strong>
+                <button type="button" className="quiet-button" onClick={showLibrary}>全部 {library.length} 份 →</button>
+              </div>
+              <ul className="recent-list">
+                {library.slice(0, 5).map((record) => (
+                  <li key={record.id}>
+                    <button type="button" className="recent-item" onClick={() => openRecord(record)}>
+                      <span className="recent-name">{record.filename}</span>
+                      <span className="recent-meta">
+                        {record.page_count} 页 · {record.ai_pages ? "AI 精校" : modeNames[record.mode] || "旧版"} · {formatDate(new Date(record.updated_at).getTime())}
+                        {record.review_count ? <em> · {record.review_count} 页待检查</em> : null}
+                      </span>
+                    </button>
+                  </li>
+                ))}
+              </ul>
+            </section>
+          )}
         </>
       ) : status === "batch" ? (
         <section className="batch-view" aria-live="polite">
@@ -1273,7 +1380,7 @@ export default function Home() {
               );
             })}
           </div>
-          <p className="batch-footnote">请保持页面开启。队列会逐份处理，单个文件失败不会中断后续文件；成功结果已自动存入 Library。</p>
+          <p className="batch-footnote">可以关掉页面，队列在本机服务里继续跑，回来时从这个地址就能接着看。单个文件失败不会中断后续文件；成功结果已自动存入 Library。</p>
         </section>
       ) : status === "processing" ? (
         <section className="processing-view" aria-live="polite">
@@ -1296,7 +1403,13 @@ export default function Home() {
           <small>{mode === "ai" ? "页面图像会发送给你在设置中选择的模型；识别失败的页面回退 PDF 文字层。" : "转换在本机服务里进行，关掉页面也会继续。"}</small>
         </section>
       ) : status === "error" ? (
-        <section className="error-card"><span>转换未完成</span><h1>这个 PDF 暂时没能读取</h1><p>{error}</p><div className="error-actions">{error.includes("AI 精校") && <button className="secondary-button" type="button" onClick={openSettings}>打开设置</button>}<button className="primary-button" type="button" onClick={reset}>换一个文件</button></div></section>
+        <section className="error-card"><span>转换未完成</span><h1>{
+          /PPT/.test(error) ? "PPT 没能转成 PDF"
+            : /AI 精校/.test(error) ? "AI 精校还没配置好"
+            : /页数/.test(error) ? "PDF 和记录对不上"
+            : /不存在|找不到|已被/.test(error) ? "找不到这条记录"
+            : "这个文件暂时没能处理"
+        }</h1><p>{error}</p><div className="error-actions">{error.includes("AI 精校") && <button className="secondary-button" type="button" onClick={openSettings}>打开设置</button>}<button className="primary-button" type="button" onClick={reset}>换一个文件</button></div></section>
       ) : result ? (
         <section className="result-workspace">
           <header className="result-header">
@@ -1309,7 +1422,7 @@ export default function Home() {
               ) : (
                 <button type="button" className="secondary-button" onClick={reset}>← 返回首页</button>
               )}
-              {!batchRunning && <button type="button" className="secondary-button" onClick={() => void rerunAiRefinement()}>复用初稿重新 AI 精校</button>}
+              {!batchRunning && <button type="button" className="secondary-button" onClick={() => void rerunAiRefinement()}>{result.mode === "ai" ? "重新 AI 精校" : "用 AI 精校这份"}</button>}
               <button type="button" className="secondary-button" onClick={copyMarkdown}>{copied ? "已复制" : "复制 Markdown"}</button>
               <button type="button" className="primary-button" onClick={() => download(result.markdown, `${result.title}.md`, "text/markdown;charset=utf-8")}>下载 .md</button>
             </div>
@@ -1332,7 +1445,17 @@ export default function Home() {
             <button className={tab === "source" ? "active" : ""} onClick={() => setTab("source")} role="tab">原始 PDF</button>
           </div>
           <div className="result-panel">
-            {tab === "markdown" && <pre className="markdown-preview">{result.markdown}</pre>}
+            {tab === "markdown" && (
+              <div className="markdown-pane">
+                <div className="md-toolbar" role="group" aria-label="查看方式">
+                  <button type="button" className={mdView === "rendered" ? "active" : ""} onClick={() => setMdView("rendered")}>渲染</button>
+                  <button type="button" className={mdView === "raw" ? "active" : ""} onClick={() => setMdView("raw")}>源码</button>
+                </div>
+                {mdView === "rendered"
+                  ? <div className="markdown-rendered" dangerouslySetInnerHTML={{ __html: renderedMarkdown }} />
+                  : <pre className="markdown-preview">{result.markdown}</pre>}
+              </div>
+            )}
             {tab === "quality" && <div className="quality-list">{result.pages.map((page) => (
               <article key={page.page} className={page.status === "good" ? "good-page" : ""}><span>第 {page.page} 页</span><div><strong>{methodLabel(page)}</strong>{page.reasons.length ? page.reasons.map((reason) => <p key={reason}>{reason}</p>) : <p>程序校验通过</p>}<p>{page.formulaCount ?? 0} 个公式 · {page.optionCount ?? 0} 个选项标签</p></div><small>{page.charCount} 字符</small></article>
             ))}</div>}
@@ -1346,7 +1469,8 @@ export default function Home() {
 
       <footer><span>墨页 · Verifiable document tools</span><span>{aiWasUsed ? "本地初稿 · 可选云端精校 · 逐页留痕" : "当前处理仅在你的设备完成"}</span></footer>
 
-      <div className="stats-fab">
+      {/* 统计悬浮球只在首页和 Library 出现：在结果页它会盖住面板左下角 */}
+      {((status === "idle" && screen === "converter") || screen === "library") && <div className="stats-fab">
         {statsOpen && (
           <div className="stats-panel" role="dialog" aria-label="你的墨页数据">
             <div className="stats-head">你的墨页数据</div>
@@ -1383,9 +1507,9 @@ export default function Home() {
           </div>
         )}
         <button type="button" className="stats-toggle" onClick={toggleStats} aria-expanded={statsOpen}>
-          <span className="stats-dot" />你的数据
+          <span className="stats-dot" />我的统计
         </button>
-      </div>
+      </div>}
 
       {showSettings && (
         <div className="modal-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) setShowSettings(false); }}>
@@ -1524,6 +1648,13 @@ export default function Home() {
             )}
             <div className="model-sync-row"><button type="button" className="secondary-button" disabled={settingsBusy} onClick={() => void syncModels()}>↻ 从服务商同步模型</button><span>需要先填写 API Key；只显示可用于图片输入的模型。</span></div>
             <fieldset className="scope-field"><legend>精校范围</legend><label><input type="radio" checked={settingsDraft.aiScope === "all"} onChange={() => setSettingsDraft((value) => ({ ...value, aiScope: "all" }))} />全部页面（质量最佳）</label><label><input type="radio" checked={settingsDraft.aiScope === "review"} onChange={() => setSettingsDraft((value) => ({ ...value, aiScope: "review" }))} />只精校公式、选项与可疑页面（更省费用）</label></fieldset>
+            <fieldset className="scope-field">
+              <legend>自动打标签</legend>
+              <label>
+                <input type="checkbox" checked={settingsDraft.autoTag !== false} onChange={(event) => setSettingsDraft((value) => ({ ...value, autoTag: event.target.checked }))} />
+                转换完成后用当前服务商给文档打 2–4 个主题标签（会把文档开头约 3000 字发出去，本地模式也一样）
+              </label>
+            </fieldset>
             {settingsStatus && <div className="settings-status" role="status">{settingsStatus}</div>}
             <footer><button type="button" className="secondary-button" disabled={settingsBusy} onClick={() => void testSettings()}>测试连接</button><div><button type="button" className="quiet-button" onClick={() => setShowSettings(false)}>取消</button><button type="button" className="primary-button" disabled={settingsBusy} onClick={() => void persistSettings()}>保存设置</button></div></footer>
           </section>

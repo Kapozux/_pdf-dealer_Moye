@@ -46,6 +46,9 @@ const defaultSettings = {
   openrouterModel: "moonshotai/kimi-k2.6",
   openrouterBaseUrl: "https://openrouter.ai/api/v1",
   aiScope: "all",
+  // 转换完成后自动打标签（会把文档开头约 3000 字发给模型，本地模式也一样）。
+  // 用户可关：顶栏的隐私标签按这个值说话，关了才能诚实地写"文件不上传"。
+  autoTag: true,
   // 关掉时：一份文档只走 provider 选的那一家。开了：所有配了 Key 的渠道
   // 同时用，按各自并发上限加权轮询分配页面——独立的上游（Gemini 服务器
   // 和 OpenRouter/Kimi/Qwen）互不占用配额，同时开是纯加法，没有下限。
@@ -166,6 +169,7 @@ function normalizeSettings(input, previous = defaultSettings) {
     openrouterModel: cleanString(input.openrouterModel) || previous.openrouterModel || defaultSettings.openrouterModel,
     openrouterBaseUrl: cleanString(input.openrouterBaseUrl) || previous.openrouterBaseUrl || defaultSettings.openrouterBaseUrl,
     aiScope,
+    autoTag: input.autoTag === undefined ? previous.autoTag !== false : Boolean(input.autoTag),
     multiChannel: Boolean(input.multiChannel ?? previous.multiChannel ?? defaultSettings.multiChannel),
     channels: (Array.isArray(input.channels) ? input.channels : previous.channels ?? [])
       .filter((p) => ALL_PROVIDERS.includes(p)),
@@ -264,6 +268,7 @@ function publicSettings(settings) {
     openrouterModel: settings.openrouterModel,
     openrouterBaseUrl: settings.openrouterBaseUrl,
     aiScope: settings.aiScope,
+    autoTag: settings.autoTag !== false,
     aiConfigured: activeConfigured,
     // 打码回传：页面要能看见「已经存了哪几把」，否则用户以为没存上、
     // 重新添加就会覆盖掉旧的（明文永远不出这台机器）
@@ -1061,7 +1066,9 @@ jobQueue.on("job", (job) => events.broadcast("job", job));
 // 标签的不用重打，省一次没必要的调用（内容大概率还是那些主题）。
 jobQueue.on("job", (job) => {
   if (job.status !== "done" || job.tags) return;
-  void generateTags(job)
+  // 自动打标签是可关的（设置里）；"补标签"按钮是用户主动点的，不受这个开关影响
+  void loadSettings()
+    .then((settings) => (settings.autoTag === false ? null : generateTags(job)))
     .then((tags) => {
       if (!tags) return;
       jobStore.setTags(job.id, tags);

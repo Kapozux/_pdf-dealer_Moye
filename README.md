@@ -1,51 +1,127 @@
-# 墨页 · PDF 转 Markdown
+# Moye (墨页) — PDF/PPT → Markdown that survives scanned pages, math, and 700-page books
 
-一个在本机浏览器中运行、并支持可选视觉模型精校的 PDF 转 Markdown 工具。默认模式不上传文件；只有启用 AI 精校时，选定页面才会发送给你配置的模型服务。
+Most "PDF to Markdown" tools read the PDF's text layer and stop there. That works on a clean
+export from Word and falls apart on everything you actually need converted: scanned textbooks,
+exam papers full of formulas, tables, slides. Moye is a local tool that runs on your Mac and
+picks the right engine per document — text layer for the easy ones, [Surya](https://github.com/VikParuchuri/surya)
+layout/OCR for the hard ones, and optionally a vision model to proofread each page against its image.
 
-## 启动
+[中文说明 / Chinese README](./README.zh.md)
 
-首次配置请双击 `安装开机自启.command`。它会构建墨页并把以下两个进程注册为 macOS 用户服务：
+<!-- TODO: demo GIF — drop a math exam PDF in, get Markdown with $$…$$ out -->
 
-- 墨页网页（端口 3000）
-- 墨页本机识别服务（端口 8765）
+## What it does that text-layer converters don't
 
-以后登录 macOS 时会自动启动，进程异常退出也会自动恢复。平时若网页没有打开，双击 `启动全部服务.command`（旧的 `start.command` 也会转到同一入口），然后访问 <http://localhost:3000>。
+|                                        | Text-layer tools (`pdf2md`, etc.) | Moye |
+| -------------------------------------- | :---: | :---: |
+| Clean digital PDFs                     | ✓ | ✓ |
+| Scanned pages / photos of paper        | ✗ | ✓ Surya OCR |
+| Math → LaTeX (`$…$`, `$$…$$`)          | ✗ | ✓ |
+| Tables → Markdown tables               | luck | ✓ layout-aware |
+| Reading order on multi-column pages    | ✗ | ✓ |
+| PowerPoint (.ppt/.pptx)                | ✗ | ✓ via LibreOffice |
+| 700-page, 400 MB book                  | browser dies (~10 MB limit) | ✓ tested |
+| Close the tab mid-conversion           | job lost | job keeps running on the server |
+| Per-page quality report                | ✗ | ✓ which pages to double-check, and why |
+| Vision-model refinement with validation | ✗ | ✓ Gemini / Kimi / Qwen / OpenRouter, auto-fallback |
 
-也可以在终端运行：
+## Three modes
 
-```bash
-./启动全部服务.command
-```
+- **Fast** — reads the PDF text layer only. Instant, nothing leaves your machine, flags pages that look scanned.
+- **High accuracy (local)** — runs Surya on every page for layout, tables and formulas. Slower, still 100% local.
+- **AI refine** — renders each page to an image and has a vision model transcribe it, using the text layer
+  as a hint and fallback. Every model result is **validated** (length, formula count, answer-choice labels);
+  anything that fails validation falls back to the local draft instead of silently shipping garbage.
+  Only in this mode do page images leave your machine, and only to the provider you configured.
 
-服务日志保存在项目的 `logs/` 目录。开发代码时仍可使用 `npm run dev`，但不要让开发服务器和后台网页服务同时占用 3000 端口。
+## Quick start (macOS)
 
-这套启动方式参考 GetAudio，但不会接管或修改 GetAudio 自己已有的开机启动，两个应用彼此独立。
-
-## 三种模式
-
-- **本地快速**：只读取 PDF 自带的文字层，速度最快；扫描页会标记出来。
-- **本地高精度**：整份 PDF 使用本机 Surya 识别版面、表格与公式，并将数学内容保存为 LaTeX。
-- **AI 精校**：先生成 Surya 本地初稿，再把全部页面或仅疑难页面交给 Gemini、Kimi、Qwen 百炼或 OpenRouter 视觉模型精校；模型结果未通过长度、公式数和选项标签校验时自动回退本地初稿。
-
-## 输出
-
-- 可预览、复制或下载 Markdown。
-- 可一次选择或拖入多份 PDF；队列逐份处理，单份失败不会中断其他文件，成功结果自动进入 Library，并可下载单份或合并 Markdown。
-- 可对照浏览原始 PDF。
-- 显示逐页处理方法、实际模型、公式数量与待核对原因。
-- 可对照 AI 最终稿和 Surya 本地初稿，并下载完整 JSON 质量报告。
-- 转换完成后自动存入 Library；可搜索历史、重新打开、查看原 PDF 或删除。
-
-Library 保存在本机识别服务这一侧：任务状态在 `data/moye.db`（SQLite），原始 PDF、完整结果 JSON 与导出的 Markdown 在 `data/jobs/<任务id>/`。转换在服务端排队执行，关掉网页任务照跑，重开页面还能接着看进度；服务重启后未完成的任务会从逐页存档续跑。清除浏览器数据不影响 Library，本机任何浏览器打开都能看到同一份。重新精校会原地覆盖同一条记录，覆盖前留一份 `result.prev.json` / `document.prev.md` 备份，需要时可手动改回。
-
-首次使用 Surya 时会加载本机模型。本地高精度与 AI 精校必须通过上述服务入口启动，确保网页和本机识别服务同时运行。
-
-AI 精校的供应商、模型、精校范围和 API Key 在网页右上角“设置”中配置。设置页提供常用模型预设，也允许直接填写新的 Model ID。Key 保存在项目目录的 `settings.local.json`（已加入 `.gitignore`，权限为仅当前用户可读写），不会写入 Library。不要把这个文件提交或分享给他人。
-
-原生模型建议：Kimi 图片识别使用 `kimi-k2.6`；Qwen 稳定首选 `qwen3.7-plus`，Token Plan 可尝试 `qwen3.8-max-preview`，低成本可用 `qwen3.7-flash`，文档/表格/试卷/手写提取可用 `qwen-vl-ocr`。设置页也能在填入 Key 后从服务商实时同步可用视觉模型，避免内置列表过时。阿里云百炼 Key 与 API Base URL 的地域必须一致。
-
-## 构建检查
+Requirements: Node ≥ 22.13, a Python venv with Surya at `../.venv-marker` (sibling of the repo),
+optionally LibreOffice for PPT.
 
 ```bash
-npm run build
+git clone https://github.com/xyzxinlu-max/moye-pdf-to-markdown
+cd moye-pdf-to-markdown
+npm install
+
+# Surya (local OCR). Adjust to your setup if you already have it installed.
+python3 -m venv ../.venv-marker
+../.venv-marker/bin/pip install surya-ocr pypdfium2
+
+# optional: PPT/PPTX support
+brew install --cask libreoffice
+
+# build + register two launchd services (web on :3000, conversion service on :8765)
+./安装开机自启.command
 ```
+
+Then open <http://localhost:3000>. The services start on login and restart if they crash;
+`./启动全部服务.command` brings them up manually. Logs are in `logs/`.
+
+For AI refine, open **Settings** in the UI and paste an API key for Gemini, Kimi (Moonshot),
+Qwen (DashScope) or OpenRouter. Keys are stored in `settings.local.json` (mode 0600, gitignored)
+and never sent to the browser in clear text.
+
+## How it works
+
+```
+browser (:3000)  ──submit / watch progress (SSE)──▶  local service (:8765)  ──▶  Surya / vision models
+React, no logic                                       queue · pipeline · SQLite
+```
+
+- **The browser is only a viewer.** Every conversion runs in the service; closing the tab changes nothing.
+- **Jobs are persistent.** State in `data/moye.db` (SQLite), artifacts in `data/jobs/<id>/`.
+  Long AI jobs checkpoint every page to `pages.jsonl`; a restart resumes from the last page instead of starting over.
+- **Big documents are streamed, not loaded.** Pages are rendered in chunks of 48 as the model consumes them,
+  and text-layer extraction runs in a short-lived subprocess so pdf.js's multi-GB heap for a large book
+  never lands in the long-running service. A 698-page / 428 MB textbook peaks at ~0.8 GB RSS.
+- **Concurrency is measured, not guessed.** An AIMD pacer (like TCP congestion control) keeps one lane per
+  provider, ramps up on success, backs off on timeouts, and routes each page to the lane with the most free
+  slots — so when one provider degrades, traffic drains to the others without configuration.
+- **Three layers of fallback** for AI mode: switch upstream provider → switch model → fall back to the
+  local draft. Every failure path is logged with its reason.
+
+Code map: `local-ocr-server.mjs` (HTTP + provider calls) · `server/queue.mjs` (per-mode lanes, SSE) ·
+`server/convert.mjs` (pipeline, validation, gates) · `server/pacer.mjs` (adaptive throttle) ·
+`server/jobstore.mjs` (SQLite + checkpoints) · `app/page.tsx` (the entire UI).
+
+## Output
+
+- Markdown preview, copy, download; batch drops become a "collection" you can download as one `.md` or a `.zip`.
+- Side-by-side view of the model's final text vs. the local draft, per page.
+- A per-page quality list: which engine produced it, formula/option counts, and every reason a page was
+  flagged for review. Exportable as JSON.
+- A Library of everything you've converted, searchable, with the original PDF viewable in place.
+
+## Tuning
+
+All defaults were set by measurement on real batches (see comments in the code before changing them).
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `MOYE_AI_JOB_CONCURRENCY` | 1 | documents converted at once in AI mode (the real ceiling is the global request gate) |
+| `MOYE_AI_PAGE_CONCURRENCY` | per-provider weights | override the global in-flight request cap |
+| `MOYE_RENDER_CHUNK_PAGES` | 48 | pages rendered per Python call in AI mode |
+| `MOYE_PAGE_TIMEOUT_MS` | 30000 | single model call timeout (per-provider overrides exist) |
+| `MOYE_OPENROUTER_PROVIDERS` | CoreWeave,Parasail,Inceptron,Baidu,Cloudflare | upstream allowlist — unpinned OpenRouter routing measured 20× slower |
+| `MOYE_RENDER_CONCURRENCY` | 16 | concurrent Python render processes |
+
+Live diagnostics: `curl -s http://127.0.0.1:8765/api/debug | python3 -m json.tool`.
+
+## Development
+
+```bash
+npm run dev      # web app (don't run alongside the launchd web service on :3000)
+npm run build    # then: launchctl kickstart -k gui/$(id -u)/com.kapozux.moye-web
+npm test         # build + render tests
+npm run lint
+```
+
+## Privacy
+
+Fast and High-accuracy modes never make a network request with your document. AI refine sends page
+images and the text-layer hint to the provider you chose, nothing else. Nothing is uploaded to us — there is no "us".
+
+## License
+
+MIT

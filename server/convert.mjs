@@ -15,6 +15,76 @@
 import { parseHTML } from "linkedom";
 import { getDocument } from "pdfjs-dist/legacy/build/pdf.mjs";
 import { readFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
+
+/**
+ * 读 PDF 文字层放在**短命子进程**里跑，而不是在服务进程里直接调 pdfjs。
+ *
+ * 实测（428MB、698 页的教材）：pdfjs 光 getTextContent 就把进程堆推到 3GB，
+ * 逐页 page.cleanup()、loadingTask.destroy() 都放不掉（最多降到 2.6GB）——
+ * 这是 pdfjs 在 Node 里的行为，服务进程只要碰过一次这种书就再也瘦不回去，
+ * 之后每份大文档都往上叠，迟早 OOM。子进程读完把几 MB 的 JSON 交回来就退出，
+ * 那 3GB 由操作系统整体回收，服务本体始终干净。
+ * 进度走 stderr 的 `progress <page> <total>` 行，结果走 stdout。
+ */
+const TEXTLAYER_WORKER = join(dirname(fileURLToPath(import.meta.url)), "textlayer-worker.mjs");
+const TEXTLAYER_TIMEOUT_MS = Number(process.env.MOYE_TEXTLAYER_TIMEOUT_MS) || 15 * 60 * 1000;
+
+function runTextLayerWorker(pdfPath, args = [], onProgress = null) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(
+      process.execPath,
+      // 大书的 pdfjs 堆会到 3GB+，Node 默认上限可能不够，子进程单独放宽
+      ["--max-old-space-size=8192", TEXTLAYER_WORKER, pdfPath, ...args],
+      { stdio: ["ignore", "pipe", "pipe"] }
+    );
+    const stdoutChunks = [];
+    let stderrTail = "";
+    let lineBuffer = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      reject(new Error(`读取 PDF 文字层超时（${Math.round(TEXTLAYER_TIMEOUT_MS / 1000)}s 未完成）。`));
+    }, TEXTLAYER_TIMEOUT_MS);
+    child.stdout.on("data", (c) => stdoutChunks.push(c));
+    child.stderr.on("data", (c) => {
+      lineBuffer += c;
+      const lines = lineBuffer.split("\n");
+      lineBuffer = lines.pop();
+      for (const line of lines) {
+        const m = line.match(/^progress (\d+) (\d+)$/);
+        if (m) onProgress?.(Number(m[1]), Number(m[2]));
+        else stderrTail = `${stderrTail}${line}\n`.slice(-4000);   // pdfjs 的 Warning 之类，只在失败时抛出
+      }
+    });
+    child.on("error", (err) => {
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return reject(new Error(stderrTail.trim() || `文字层进程退出码 ${code}`));
+      try {
+        resolve(JSON.parse(Buffer.concat(stdoutChunks).toString("utf8")));
+      } catch {
+        reject(new Error("文字层结果解析失败。"));
+      }
+    });
+  });
+}
+
+/** @returns {Promise<{total:number, pages:object[]}>} 逐页文字层初稿 */
+const extractTextLayer = (pdfPath, onProgress) => runTextLayerWorker(pdfPath, [], onProgress);
+/** 只要页数：同样走子进程，避免为了一个数字在服务进程里解析整本书。 */
+const pdfPageCount = async (pdfPath) => (await runTextLayerWorker(pdfPath, ["--count"])).total;
+
+async function openPdf(pdfPath) {
+  const buffer = await readFile(pdfPath);
+  // 零拷贝视图。以前是 new Uint8Array(buffer)——那是复制，428MB 的文件先占 900MB。
+  const data = new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength);
+  return getDocument({ data, useSystemFonts: true, isEvalSupported: false }).promise;
+}
 
 const { document: sharedDoc, Node: DomNode } = parseHTML("<html><body></body></html>");
 
@@ -22,6 +92,11 @@ const { document: sharedDoc, Node: DomNode } = parseHTML("<html><body></body></h
 // 86 段往返。实测这把 key 12 并发零限流，取 6 留足余量（可用 MOYE_AI_PAGE_CONCURRENCY 调）。
 // 上游 postWithRetries 已对 429/5xx 退避重试，偶发限流不会丢页。
 const AI_PAGE_CONCURRENCY = Number(process.env.MOYE_AI_PAGE_CONCURRENCY) || 6;
+
+// AI 模式一次渲染几页（见 refineWithAi 里分块滚动渲染的说明）。
+// 48 页 ≈ 1.5s 渲染 + ~25MB base64，远在单次 Python 调用的超时和内存舒适区内；
+// 又比 aiGate 的并发（几十路）小一点，保证 worker 总能跨到下一组、预热不断档。
+const RENDER_CHUNK = Math.max(1, Number(process.env.MOYE_RENDER_CHUNK_PAGES) || 48);
 
 const median = (values) => {
   if (!values.length) return 12;
@@ -375,11 +450,6 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
     return limit;
   }
 
-  async function openPdf(pdfPath) {
-    const data = new Uint8Array(await readFile(pdfPath));
-    return getDocument({ data, useSystemFonts: true, isEvalSupported: false }).promise;
-  }
-
   async function convertWithSurya(pdfPath, total, onProgress) {
     onProgress(0, total, "正在使用 Surya 逐页解析版面、表格与公式（首次会较慢）");
     const payload = await runSurya(pdfPath);
@@ -392,10 +462,13 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
     return pages.map((page, index) => renderSuryaPage(page, index + 1));
   }
 
-  /** 单页精校。AI 调用失败时返回带 aiFailed 标记的回退结果，供补救轮识别。 */
-  async function refineOne(draft, images, rescue = false) {
+  /**
+   * 单页精校。AI 调用失败时返回带 aiFailed 标记的回退结果，供补救轮识别。
+   * @param {(page:number)=>Promise<string>} getImage 取该页 base64 JPEG（按需渲染，见 refineWithAi）
+   */
+  async function refineOne(draft, getImage, rescue = false) {
     try {
-      const imageBase64 = images[String(draft.page)];
+      const imageBase64 = await getImage(draft.page);
       if (!imageBase64) throw new Error("页面图像生成失败。");
       // 过全局闸：并发上限约束的是「所有任务合计在飞的请求数」，不是单份文档的
       const refined = await aiGate.run(() => refinePage({
@@ -476,29 +549,73 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
           (draft.formulaCount ?? 0) > 0 ||
           (draft.optionCount ?? 0) > 0)
     );
-    // 需要的页一次性渲染，省掉逐页起 Python 进程
-    let images = {};
+    /**
+     * 分块滚动渲染，而不是一次把所有页渲染完再开始。
+     *
+     * 老做法是「需要的页一次性渲染」——对几十页没问题，但 698 页那份实测：
+     * 渲染本身只要 22s（31ms/页），可每页 base64 约 510KB，698 页拼成一个
+     * ~350MB 的 JSON 经 stdout 传回，120s 硬超时前根本传不完（就算传完，
+     * 一份文档的全部图像还要在内存里驻留到最后一页精校结束）。
+     *
+     * 现在按 RENDER_CHUNK 页一组：某页的 worker 要图时才触发它所在那组的渲染
+     * （同组只渲染一次，Promise 记忆化），并顺手预热下一组，让 AI 并发不必在
+     * 组边界上停等；一组的页全部精校完就把这组图像丢掉。内存上限从「整份文档」
+     * 变成「约两组」，单次 Python 调用也只有几秒——多大的文档都是同一个常数开销。
+     * 不需要把 PDF 拆成几个小文件排队：一条记录、一份 document.md、逐页存档照旧。
+     */
+    const chunks = [];
+    for (let i = 0; i < targets.length; i += RENDER_CHUNK) {
+      chunks.push(targets.slice(i, i + RENDER_CHUNK).map((d) => d.page));
+    }
+    const chunkOfPage = new Map();
+    chunks.forEach((pages, k) => pages.forEach((p) => chunkOfPage.set(p, k)));
+    const chunkPending = chunks.map((pages) => pages.length);   // 该组还有几页没精校完
+    const chunkImages = new Map();                               // k → Promise<{page: base64}>
+    const renderChunk = (k) => {
+      // 已经全部处理完（图像已释放）的组不再碰：两组并行渲染时后一组可能先跑完，
+      // 前一组的 worker 醒来后"预热下一组"会把它重新渲染一遍——实测多渲染整整 48 页。
+      if (k < 0 || k >= chunks.length || chunkPending[k] <= 0 || chunkImages.has(k)) return chunkImages.get(k);
+      const promise = renderGate.run(() => renderer.renderPages(pdfPath, chunks[k]));
+      // 渲染失败不能让整份文档炸掉：由 refineOne 的 catch 转成「该页回退文字层」，
+      // 这里只负责不把 rejected promise 留在缓存里，下次（补救轮）还能再试。
+      promise.catch(() => chunkImages.delete(k));
+      chunkImages.set(k, promise);
+      return promise;
+    };
+    const getImage = async (page) => {
+      const k = chunkOfPage.get(page);
+      if (k === undefined) throw new Error("页面不在渲染计划内。");
+      const images = await renderChunk(k);
+      renderChunk(k + 1);   // 预热下一组；已经在渲染/渲染完了就是空操作
+      return images[String(page)];
+    };
+    const releaseImage = (page) => {
+      const k = chunkOfPage.get(page);
+      if (k !== undefined && --chunkPending[k] <= 0) chunkImages.delete(k);
+    };
+    // 进度从存档页数起步，而不是从 0 数上去：以前存档页在 fanout 里瞬间刷几百次
+    // 回调，全被 queue.mjs 的 300ms 节流吞掉，界面反而停在 0/N 十几秒。
+    let finished = finishedPages.size;
     if (targets.length) {
-      onProgress(0, drafts.length, `正在为 ${targets.length} 页生成图像`);
-      images = await renderGate.run(() => renderer.renderPages(pdfPath, targets.map((d) => d.page)));
+      onProgress(finished, drafts.length, `${targets.length} 页待识别，按 ${RENDER_CHUNK} 页一组滚动生成图像`);
     }
 
-    let finished = 0;
     const concurrency = await pageConcurrency();
     const output = await fanout(drafts, async (draft) => {
       // 存档命中：这一页上次已经跑完了，直接用，省掉一次模型调用
       const archived = finishedPages.get(draft.page);
-      if (archived) {
-        finished += 1;
-        onProgress(finished, drafts.length, `第 ${draft.page} 页（存档）`);
-        return archived;
-      }
+      if (archived) return archived;   // 已计入 finished 的起点，不再逐页报进度
       if (!targets.includes(draft)) {
         finished += 1;
         onProgress(finished, drafts.length, `第 ${draft.page} 页跳过`);
         return draft;
       }
-      const result = await refineOne(draft, images);
+      let result;
+      try {
+        result = await refineOne(draft, getImage);
+      } finally {
+        releaseImage(draft.page);   // 成败都释放，否则一页异常就让整组图像常驻
+      }
       // 每页一落盘：下次重启从这里续，而不是整份重来
       if (checkpoint) await checkpoint.save(draft.page, result).catch(() => undefined);
       finished += 1;
@@ -521,9 +638,18 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
       // 总量本来就由 aiGate 兜底，这里再压一层只会饿死自己。
       const rescueConcurrency = Math.max(4, Math.floor(concurrency / 4));
       onProgress(finished, drafts.length, `补救 ${casualtyIndexes.length} 页失败的识别`);
+      // 主轮的分组图像已经按组释放了，补救的只是零星几页：一次性重新渲染这几页即可，
+      // 代价是几秒，比让主轮为了补救轮把整份文档的图像留在内存里划算得多。
+      const rescuePages = casualtyIndexes.map((index) => drafts[index].page);
+      let rescueImages = {};
+      try {
+        rescueImages = await renderGate.run(() => renderer.renderPages(pdfPath, rescuePages));
+      } catch (error) {
+        console.warn(`[补救] 重新渲染 ${rescuePages.length} 页失败：${String(error?.message ?? error).slice(0, 160)}`);
+      }
       const rescued = await fanout(
         casualtyIndexes,
-        (index) => refineOne(drafts[index], images, true),
+        (index) => refineOne(drafts[index], async (page) => rescueImages[String(page)], true),
         rescueConcurrency
       );
       // JSONL 是追加写，同一页后写的那行会在 load() 时覆盖先写的——
@@ -542,20 +668,26 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
   /** 一份 PDF → ConversionResult。onProgress(page, total, detail) */
   async function convertPdf(pdfPath, title, mode, onProgress = () => {}, checkpoint = null) {
     const started = performance.now();
-    const pdfDoc = await openPdf(pdfPath);
-    const total = pdfDoc.numPages;
     let pages;
+    let total;
     if (mode === "fast") {
-      pages = await extractFastPages(pdfDoc, onProgress);
+      ({ pages, total } = await extractTextLayer(pdfPath, (page, count) =>
+        onProgress(page, count, `读取文字层 ${page}/${count} 页`)
+      ));
     } else if (mode === "ai") {
       // AI 模式直接让视觉模型读页面，**不再先跑一遍慢的 Surya**：
       // 既然要用更强的模型，为了一份会被覆盖的初稿等上几分钟没有意义。
       // 改用 PDF 文字层当提示 + 回退——几乎零成本，电子版 PDF 质量也够；
       // 扫描件没有文字层时提示为空，就是纯视觉识别（本来也该如此）。
-      onProgress(0, total, "读取文字层作为提示，随后交给视觉模型");
-      const hints = await extractFastPages(pdfDoc, () => {});
-      pages = await refineWithAi(pdfPath, hints, onProgress, checkpoint);
+      // 读文字层也要报进度：几百页的书这一步要一两分钟，以前回调是空函数，
+      // 界面停在 0/N 一动不动，看起来就像卡死了。
+      const hints = await extractTextLayer(pdfPath, (page, count) =>
+        onProgress(page, count, `读取文字层作为提示 ${page}/${count} 页，随后交给视觉模型`)
+      );
+      total = hints.total;
+      pages = await refineWithAi(pdfPath, hints.pages, onProgress, checkpoint);
     } else {
+      total = await pdfPageCount(pdfPath);
       pages = await convertWithSurya(pdfPath, total, onProgress);
     }
     return assembleResult(title, mode, total, pages, started);
@@ -564,8 +696,8 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
   /** 复用 Library 里已有的本地初稿，只重跑 AI 精校。 */
   async function refineExisting(pdfPath, title, previous, onProgress = () => {}, checkpoint = null) {
     const started = performance.now();
-    const pdfDoc = await openPdf(pdfPath);
-    if (pdfDoc.numPages !== previous.pageCount) {
+    const pageCount = await pdfPageCount(pdfPath);
+    if (pageCount !== previous.pageCount) {
       throw new Error("原 PDF 页数与 Library 记录不一致，无法复用初稿。");
     }
     const drafts = previous.pages.map((page) => {
@@ -585,13 +717,15 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
       };
     });
     const pages = await refineWithAi(pdfPath, drafts, onProgress, checkpoint);
-    return assembleResult(title, "ai", pdfDoc.numPages, pages, started);
+    return assembleResult(title, "ai", pageCount, pages, started);
   }
 
   return { convertPdf, refineExisting };
 }
 
 export const __test__ = { suryaHtmlToMarkdown, linesToMarkdown, validateAiPage, countFormulas, countOptions };
+/** 给 textlayer-worker.mjs 用：文字层提取的实现留在这里，子进程只是换个进程跑它。 */
+export const __textlayer__ = { openPdf, extractFastPages };
 
 /**
  * 两个闸的实时状态，给 /api/debug 用。

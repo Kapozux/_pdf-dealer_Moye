@@ -42,19 +42,25 @@ export function createRenderer({ python, timeoutMs = 120000 }) {
     if (!available) {
       throw new Error("本机渲染环境不可用：找不到 Surya 的 Python 环境，无法为 AI 精校生成页面图像。");
     }
+    // 超时按页数放大：一次渲染几十页时固定 120s 够用，但调用方若一次塞几百页
+    // （老代码就是这么干的），固定值必超。实测 31ms/页渲染 + 每页 ~500KB base64
+    // 经 stdout 传回，按每页 1s 预算给足余量。
+    const budgetMs = Math.max(timeoutMs, 20000 + pages.length * 1000);
     return new Promise((resolve, reject) => {
       const child = spawn(
         python,
         ["-c", PY_SCRIPT, pdfPath, pages.join(","), String(scale), String(quality)],
         { stdio: ["ignore", "pipe", "pipe"] }
       );
-      let stdout = "";
+      // 用 Buffer 数组攒 stdout，最后一次 concat。以前是 `stdout += chunk` 字符串拼接：
+      // 698 页 ≈ 350MB 时每来一块就复制一次已有内容，O(n²)，本身就能把 120s 烧光。
+      const stdoutChunks = [];
       let stderr = "";
       const timer = setTimeout(() => {
         child.kill("SIGKILL");
-        reject(new Error("页面渲染超时。"));
-      }, timeoutMs);
-      child.stdout.on("data", (c) => (stdout += c));
+        reject(new Error(`页面渲染超时（${pages.length} 页，${Math.round(budgetMs / 1000)}s 未完成）。`));
+      }, budgetMs);
+      child.stdout.on("data", (c) => stdoutChunks.push(c));
       child.stderr.on("data", (c) => (stderr = (stderr + c).slice(-4000)));
       child.on("error", (err) => {
         clearTimeout(timer);
@@ -64,7 +70,7 @@ export function createRenderer({ python, timeoutMs = 120000 }) {
         clearTimeout(timer);
         if (code !== 0) return reject(new Error(stderr || `渲染进程退出码 ${code}`));
         try {
-          resolve(JSON.parse(stdout));
+          resolve(JSON.parse(Buffer.concat(stdoutChunks).toString("utf8")));
         } catch {
           reject(new Error("渲染结果解析失败。"));
         }

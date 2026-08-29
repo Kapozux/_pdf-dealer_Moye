@@ -134,11 +134,15 @@ export class JobQueue extends EventEmitter {
 
     // 进度回调做节流：逐页回调很密集，没必要每次都写库 + 广播
     let lastWrite = 0;
+    let lastPage = -1;
     const onProgress = (page, total, detail = "") => {
       const now = Date.now();
-      const isEdge = page === 0 || page >= total;
+      // 阶段切换（归零、跑满）和跳变（续跑一次跳几百页、换阶段倒退）必须写库，
+      // 只有"逐页 +1"的常规推进才节流——否则续跑的起点会被吞掉，界面停在上一阶段
+      const isEdge = page === 0 || page >= total || page < lastPage || page - lastPage > 1;
       if (!isEdge && now - lastWrite < 300) return;
       lastWrite = now;
+      lastPage = page;
       this.store.update(jobId, {
         page: Math.floor(page),
         total: Math.floor(total),

@@ -123,7 +123,8 @@ server/queue.mjs       按模式（fast/balanced/math/ai）分车道限流 + 协
 server/convert.mjs     转换管线本体：文字层排版还原、Surya HTML→MD、AI 校验/回退、aiGate/renderGate 两个闸
 server/pacer.mjs       AI 模式的自适应节流器（AIMD，按渠道独立车道），local-ocr-server 用它派活
 server/jobstore.mjs    SQLite 任务表 + 磁盘布局 + 重启恢复 + 逐页 checkpoint（pages.jsonl）
-server/render.mjs      spawn Python(pypdfium2) 把 PDF 页转 JPEG，供 AI 模式用
+server/render.mjs      spawn Python(pypdfium2) 把 PDF 页转 JPEG，供 AI 模式用；convert.mjs 按 48 页一组滚动调用它，不是一次渲染整本
+server/textlayer-worker.mjs  读 PDF 文字层的短命子进程（pdfjs 解析大书要 3GB 且释放不掉，放子进程里跑完即退，服务本体不背）
 server/zip.mjs         手写最小 ZIP 打包器，只为 Library 整包下载存在
 lib/ai-settings.ts     AI 设置的类型 + 浏览器→8765 的设置类 API 客户端
 lib/api.ts             浏览器→8765 的任务类 API 客户端（提交/查询/SSE 订阅/Library/导出）
@@ -194,10 +195,12 @@ launchctl kickstart -k gui/$(id -u)/com.kapozux.moye-web   # 重启网页服务
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `MOYE_AI_JOB_CONCURRENCY` | 48 | 同时跑几份文档（喂料口，非上限） |
+| `MOYE_AI_JOB_CONCURRENCY` | 1（2026-08-18 起，原为 48） | 同时跑几份文档（喂料口，非上限）。默认改回 1 是实测结论：全局并发预算（aiGate，约 60 路）是所有文档共享的，开太多份文档只会把预算摊薄，谁都吃不满、谁都不交付；一份文档独占预算跑完最快。只有「一次转很多小文档（每份一两页）」时才该调大，调到「预算 ÷ 平均页数」左右——见 `server/queue.mjs` 里这行的注释 |
 | `MOYE_AI_PAGE_CONCURRENCY` | 按渠道权重 | 覆盖全局 aiGate 上限 |
 | `MOYE_PAGE_TIMEOUT_MS` | 30000 | 单次模型调用超时（实测 p50 约 13s） |
 | `MOYE_RESCUE_TIMEOUT_MS` | 25000 | 补救轮超时（只试一次） |
 | `MOYE_OPENROUTER_PROVIDERS` | CoreWeave,Parasail,Inceptron,Baidu,Cloudflare | 供应商白名单 |
-| `MOYE_OPENROUTER_FALLBACK_MODELS` | z-ai/glm-5v-turbo,qwen/qwen3.7-flash | 模型兜底链 |
+| `MOYE_OPENROUTER_FALLBACK_MODELS` | z-ai/glm-5v-turbo | 模型兜底链。曾经还带 qwen/qwen3.7-flash，2026-08-25 起白名单五家对它全部返回 404（没有供应商在提供了），摘掉了 |
 | `MOYE_RENDER_CONCURRENCY` | 16 | 同时几个 Python 渲染进程 |
+| `MOYE_RENDER_CHUNK_PAGES` | 48 | AI 模式一次渲染几页。2026-08-29 实测：698 页整本一次渲染 = 350MB base64 走 stdout，120s 必超时；分组后单次约 2s / 25MB，内存上限从整本变成约两组，服务进程峰值 3.9GB → 0.8GB |
+| `MOYE_TEXTLAYER_TIMEOUT_MS` | 900000 | 读文字层子进程的超时（698 页实测 20s，给足 15 分钟） |

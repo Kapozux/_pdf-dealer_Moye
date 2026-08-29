@@ -36,7 +36,8 @@ layout/OCR for the hard ones, and optionally a vision model to proofread each pa
 
 ## Quick start (macOS)
 
-Requirements: Node ≥ 22.13, a Python venv with Surya at `../.venv-marker` (sibling of the repo),
+Requirements: Node ≥ 22.13, Python 3.12 with [Surya](https://github.com/VikParuchuri/surya) in a venv at
+`../.venv-marker` (sibling of the repo — the service looks for `../.venv-marker/bin/surya_ocr`),
 optionally LibreOffice for PPT.
 
 ```bash
@@ -44,9 +45,13 @@ git clone https://github.com/xyzxinlu-max/moye-pdf-to-markdown
 cd moye-pdf-to-markdown
 npm install
 
-# Surya (local OCR). Adjust to your setup if you already have it installed.
-python3 -m venv ../.venv-marker
-../.venv-marker/bin/pip install surya-ocr pypdfium2
+# Surya (local OCR) — tested with surya-ocr 0.22 + pypdfium2 5.10 on Python 3.12.
+# With uv:
+uv venv ../.venv-marker --python 3.12
+uv pip install --python ../.venv-marker/bin/python surya-ocr pypdfium2
+# or with plain venv + pip:
+#   python3.12 -m venv ../.venv-marker && ../.venv-marker/bin/pip install surya-ocr pypdfium2
+# First run downloads the Surya models (a few GB).
 
 # optional: PPT/PPTX support
 brew install --cask libreoffice

@@ -258,6 +258,9 @@ export default function Home() {
   const [libraryLoading, setLibraryLoading] = useState(true);
   const [libraryError, setLibraryError] = useState("");
   const [query, setQuery] = useState("");
+  // 自由合并下载：跟批次无关，随便勾几份就能拼成一份 .md
+  const [selectedLibraryIds, setSelectedLibraryIds] = useState<Set<string>>(new Set());
+  const [mergingLibrary, setMergingLibrary] = useState(false);
   const [activeFilename, setActiveFilename] = useState("");
   const [showSettings, setShowSettings] = useState(false);
   const [settings, setSettings] = useState<AiSettings>(defaultAiSettings);
@@ -765,9 +768,52 @@ export default function Home() {
     void refreshLibrary();
   }
 
+  function toggleLibrarySelect(id: string) {
+    setSelectedLibraryIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  /**
+   * 合并下载：把任意几份 Library 记录拼成一份 .md，各自带来源文件名注释分隔。
+   * 跟 downloadBatchMarkdown 同一个套路，只是数据源换成 Library——可以是某个
+   * 合集的全部成员，也可以是跨批次、跨时间随手勾的几份，服务端不需要知道这回事，
+   * 全部现取现拼，在浏览器里完成。
+   */
+  async function downloadMergedMarkdown(ids: string[], filenameHint: string) {
+    if (!ids.length) return;
+    setMergingLibrary(true);
+    setLibraryError("");
+    try {
+      const parts = await Promise.all(
+        ids.map(async (id) => {
+          const record = library.find((item) => item.id === id);
+          const { result: stored } = await fetchLibraryEntry(id);
+          return `<!-- 来源文件：${record?.filename ?? id} -->\n\n${stored.markdown}`;
+        })
+      );
+      const safeName = filenameHint.replace(/[\\/:*?"<>|]/g, "_");
+      download(parts.join("\n\n---\n\n"), `${safeName}-${new Date().toISOString().slice(0, 10)}.md`, "text/markdown;charset=utf-8");
+    } catch (caught) {
+      setLibraryError(caught instanceof Error ? caught.message : "合并下载失败，请稍后再试。");
+    } finally {
+      setMergingLibrary(false);
+    }
+  }
+
   function renderLibraryCard(record: Job) {
     return (
       <article className="library-card" key={record.id}>
+        <label className="library-select" title="选中用于合并下载">
+          <input
+            type="checkbox"
+            checked={selectedLibraryIds.has(record.id)}
+            onChange={() => toggleLibrarySelect(record.id)}
+            aria-label={`选中 ${record.filename} 用于合并下载`}
+          />
+        </label>
         <button className="library-open" type="button" onClick={() => openRecord(record)} aria-label={`打开 ${record.filename}`}>
           <span className="library-file-icon">MD<i>PDF</i></span>
           <span className="library-card-body">
@@ -815,6 +861,12 @@ export default function Home() {
     try {
       await deleteLibraryEntry(record.id);
       setLibrary((items) => items.filter((item) => item.id !== record.id));
+      setSelectedLibraryIds((prev) => {
+        if (!prev.has(record.id)) return prev;
+        const next = new Set(prev);
+        next.delete(record.id);
+        return next;
+      });
       setLibraryError("");
     } catch (caught) {
       setLibraryError(caught instanceof Error ? caught.message : "删除失败。请稍后再试。");
@@ -889,6 +941,22 @@ export default function Home() {
               <a className="secondary-button" href={exportZipUrl()} download>⭳ 全部打包下载</a>
             )}
           </div>
+          {selectedLibraryIds.size > 0 && (
+            <div className="library-selection-bar">
+              <span>已选 {selectedLibraryIds.size} 份</span>
+              <div>
+                <button
+                  className="secondary-button"
+                  type="button"
+                  disabled={mergingLibrary}
+                  onClick={() => void downloadMergedMarkdown([...selectedLibraryIds], "墨页合并")}
+                >
+                  {mergingLibrary ? "合并中…" : "⭳ 下载合并 .md"}
+                </button>
+                <button className="quiet-button" type="button" onClick={() => setSelectedLibraryIds(new Set())}>清除选择</button>
+              </div>
+            </div>
+          )}
           {libraryError && <div className="library-notice" role="status">{libraryError}</div>}
           {libraryLoading ? (
             <div className="library-empty"><span className="library-empty-mark">墨</span><h2>正在读取资料库…</h2></div>
@@ -902,7 +970,17 @@ export default function Home() {
                         <strong>{row.batch.label || "批量转换"}</strong>
                         <span>{row.batch.total} 份 · {row.batch.pages} 页{row.batch.failed ? ` · ${row.batch.failed} 份失败` : ""}{row.batch.active ? ` · ${row.batch.active} 份进行中` : ""}</span>
                       </div>
-                      <a className="secondary-button" href={exportZipUrl({ batchId: row.batch.id })} download>⭳ 下载这个合集</a>
+                      <div className="library-batch-actions">
+                        <button
+                          className="secondary-button"
+                          type="button"
+                          disabled={mergingLibrary}
+                          onClick={() => void downloadMergedMarkdown(row.items.map((item) => item.id), row.batch!.label || "墨页合集")}
+                        >
+                          {mergingLibrary ? "合并中…" : "⭳ 下载合并 .md"}
+                        </button>
+                        <a className="secondary-button" href={exportZipUrl({ batchId: row.batch.id })} download>⭳ 下载这个合集</a>
+                      </div>
                     </div>
                   )}
                   <div className="library-grid">

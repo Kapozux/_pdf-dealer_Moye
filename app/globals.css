@@ -150,8 +150,11 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 /* 重新精校失败时的提示：服务端会保留旧结果（不是报错屏），这条是唯一告诉用户"其实没变"的地方 */
 .result-notice { margin-bottom:14px; padding:11px 16px; border:1px solid rgba(166,99,63,.28); border-radius:10px; color:#874b31; background:#f3e7dc; font-size:12px; }
 .library-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-top:20px; }
-.library-card { min-width:0; border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.34); overflow:hidden; transition:.2s ease; }
+.library-card { position:relative; min-width:0; border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.34); overflow:hidden; transition:.2s ease; }
 .library-card:hover { border-color:rgba(31,91,65,.35); transform:translateY(-2px); box-shadow:0 16px 36px rgba(35,50,41,.07); }
+/* 自由合并下载的勾选框：叠在卡片右上角，不占布局、不影响点开卡片 */
+.library-select { position:absolute; top:12px; right:12px; z-index:2; display:grid; place-items:center; width:22px; height:22px; border:1px solid var(--line); border-radius:6px; background:rgba(255,255,255,.86); cursor:pointer; }
+.library-select input { width:14px; height:14px; margin:0; accent-color:var(--green); cursor:pointer; }
 .library-open { width:100%; min-height:155px; display:grid; grid-template-columns:58px minmax(0,1fr); gap:20px; align-items:start; padding:24px; border:0; background:transparent; text-align:left; cursor:pointer; }
 .library-file-icon { position:relative; width:54px; height:67px; display:grid; place-items:center; border:1px solid rgba(31,91,65,.34); border-radius:4px 10px 4px 4px; color:var(--green); background:#fbfaf6; font-family:Georgia,serif; font-size:15px; box-shadow:6px 6px 0 var(--green-soft); }
 .library-file-icon i { position:absolute; right:5px; bottom:5px; font-family:Inter,sans-serif; font-size:7px; font-style:normal; font-weight:800; letter-spacing:.06em; opacity:.5; }
@@ -170,7 +173,12 @@ footer { max-width:1180px; margin:auto; padding:24px 0 32px; border-top:1px soli
 .library-batch-head>div { min-width:0; display:flex; flex-direction:column; gap:3px; }
 .library-batch-head strong { font-family:Georgia,"Noto Serif TC",serif; font-size:15px; font-weight:500; }
 .library-batch-head span { color:rgba(23,35,29,.5); font-size:10px; }
+.library-batch-actions { display:flex; gap:8px; }
 .library-batch .library-grid { margin-top:14px; }
+/* 自由勾选合并下载的悬浮条：只在选中份数 > 0 时出现 */
+.library-selection-bar { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:14px; padding:10px 10px 10px 16px; border:1px solid var(--green); border-radius:13px; background:var(--green-soft); font-size:12px; }
+.library-selection-bar>span { color:var(--green); font-weight:650; }
+.library-selection-bar>div { display:flex; align-items:center; gap:6px; }
 /* 下载是 <a download>（整包由服务端生成），要和相邻的删除按钮长得一样 */
 .library-toolbar a.secondary-button,.library-batch-head a.secondary-button { text-decoration:none; white-space:nowrap; }
 .library-card-footer a { margin-left:auto; padding:6px 8px; border-radius:6px; color:rgba(23,35,29,.42); background:transparent; font-size:9px; text-decoration:none; }

@@ -37,8 +37,9 @@ test("ships local extraction, a persistent library, bundled workers, Surya, AI r
     readFile(new URL("../local-ocr-server.mjs", import.meta.url), "utf8"),
     readFile(new URL("../start.command", import.meta.url), "utf8"),
     readFile(new URL("../安装开机自启.command", import.meta.url), "utf8"),
-    readFile(new URL("../launchd/com.kapozux.moye-web.plist", import.meta.url), "utf8"),
-    readFile(new URL("../launchd/com.kapozux.moye-ocr.plist", import.meta.url), "utf8"),
+    // 仓库里存的是模板（安装时才填入绝对路径），不是渲染后的 .plist
+    readFile(new URL("../launchd/com.kapozux.moye-web.plist.template", import.meta.url), "utf8"),
+    readFile(new URL("../launchd/com.kapozux.moye-ocr.plist.template", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /download\(result\.markdown/);

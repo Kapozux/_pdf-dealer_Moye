@@ -13,7 +13,18 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
-import { appendFile, copyFile, readFile, writeFile, rm } from "node:fs/promises";
+import { appendFile, copyFile, readFile, rename, writeFile, rm } from "node:fs/promises";
+
+/**
+ * 先写临时文件再 rename 覆盖。rename 在同一文件系统上是原子的：要么是完整的新文件，
+ * 要么还是旧的，不会出现"写到一半被杀、留下半截 JSON"的第三种状态。
+ * settings.local.json 早就是这么写的，结果文件却一直是裸 writeFile——补齐。
+ */
+async function writeFileAtomic(path, content) {
+  const temporary = `${path}.tmp-${process.pid}`;
+  await writeFile(temporary, content, "utf8");
+  await rename(temporary, path);
+}
 import { join } from "node:path";
 
 export const JOB_STATES = ["queued", "running", "done", "failed", "cancelled"];
@@ -169,9 +180,9 @@ export class JobStore {
   }
 
   async saveResult(id, result) {
-    await writeFile(join(this.dir(id), "result.json"), JSON.stringify(result), "utf8");
+    await writeFileAtomic(join(this.dir(id), "result.json"), JSON.stringify(result));
     if (typeof result?.markdown === "string") {
-      await writeFile(join(this.dir(id), "document.md"), result.markdown, "utf8");
+      await writeFileAtomic(join(this.dir(id), "document.md"), result.markdown);
     }
     // 摘要写进库：Library 列表只查 SQLite，不用逐份读 result.json
     const pages = Array.isArray(result?.pages) ? result.pages : [];

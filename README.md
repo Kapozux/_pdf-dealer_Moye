@@ -1,4 +1,4 @@
-# Moye (墨页) — PDF/PPT → Markdown that survives scanned pages, math, and 700-page books
+# Moye (墨页) — PDF/PPT/Word/image → Markdown that survives scanned pages, math, and 700-page books
 
 Most "PDF to Markdown" tools read the PDF's text layer and stop there. That works on a clean
 export from Word and falls apart on everything you actually need converted: scanned textbooks,
@@ -8,7 +8,7 @@ layout/OCR for the hard ones, and optionally a vision model to proofread each pa
 
 [中文说明 / Chinese README](./README.zh.md)
 
-<!-- TODO: demo GIF — drop a math exam PDF in, get Markdown with $$…$$ out -->
+![Moye home: drop PDF / PPT / Word / image files, pick a mode, recent conversions below](./docs/screenshot-home.png)
 
 ## What it does that text-layer converters don't
 
@@ -20,6 +20,9 @@ layout/OCR for the hard ones, and optionally a vision model to proofread each pa
 | Tables → Markdown tables               | luck | ✓ layout-aware |
 | Reading order on multi-column pages    | ✗ | ✓ |
 | PowerPoint (.ppt/.pptx)                | ✗ | ✓ via LibreOffice |
+| Word (.doc/.docx)                      | ✗ | ✓ via LibreOffice |
+| Images (png/jpg/webp/heic/multi-page tiff) | ✗ | ✓ wrapped into a PDF, pixel-exact |
+| "This image has no text in it"         | silent empty output | ✓ the model says so, per page |
 | 700-page, 400 MB book                  | browser dies (~10 MB limit) | ✓ tested |
 | Close the tab mid-conversion           | job lost | job keeps running on the server |
 | Per-page quality report                | ✗ | ✓ which pages to double-check, and why |
@@ -33,12 +36,21 @@ layout/OCR for the hard ones, and optionally a vision model to proofread each pa
   as a hint and fallback. Every model result is **validated** (length, formula count, answer-choice labels);
   anything that fails validation falls back to the local draft instead of silently shipping garbage.
   Only in this mode do page images leave your machine, and only to the provider you configured.
+  When a page genuinely holds no text (a photo, an illustration, a blank page), the model reports
+  `noText` and the page is marked *AI detection: no extractable text* — instead of being logged as a
+  failed recognition, which is what an empty answer used to look like.
+
+Images (png/jpg/jpeg/webp/bmp/gif/tiff/heic) are accepted too: they are wrapped into a PDF first and then
+run through the same pipeline. The wrapping is lossless for the AI path — the page is sized so that the
+renderer's `scale=2` reproduces the original pixels exactly — a multi-page TIFF becomes a multi-page PDF,
+HEIC goes through macOS `sips`, and anything longer than 4000 px is downscaled to that. Note that **Fast
+mode reads a text layer, which an image does not have** — use Balanced or AI refine for images.
 
 ## Quick start (macOS)
 
 Requirements: Node ≥ 22.13, Python 3.12 with [Surya](https://github.com/VikParuchuri/surya) in a venv at
 `../.venv-marker` (sibling of the repo — the service looks for `../.venv-marker/bin/surya_ocr`),
-optionally LibreOffice for PPT.
+optionally LibreOffice for PPT/Word. Image support uses Pillow (already a Surya dependency) and, for HEIC, the built-in `sips`.
 
 ```bash
 git clone https://github.com/xyzxinlu-max/moye-pdf-to-markdown
@@ -53,7 +65,7 @@ uv pip install --python ../.venv-marker/bin/python surya-ocr pypdfium2
 #   python3.12 -m venv ../.venv-marker && ../.venv-marker/bin/pip install surya-ocr pypdfium2
 # First run downloads the Surya models (a few GB).
 
-# optional: PPT/PPTX support
+# optional: PPT/PPTX/Word (.doc/.docx) support
 brew install --cask libreoffice
 
 # build + register two launchd services (web on :3000, conversion service on :8765)

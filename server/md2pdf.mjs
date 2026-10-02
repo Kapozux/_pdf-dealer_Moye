@@ -29,6 +29,7 @@ import { createRequire } from "node:module";
 import { Marked } from "marked";
 import katex from "katex";
 import { PDFDocument } from "pdf-lib";
+import { safeLinkRenderers } from "../lib/safe-url.mjs";
 
 const require = createRequire(import.meta.url);
 
@@ -211,12 +212,19 @@ const obsidianExtensions = [
   },
 ];
 
-const obsidianMarked = new Marked({
+/**
+ * 两份解析器，只差图片要不要加载网上的：
+ * - Library 里转出来的文档（内容来自 PDF 和模型，不可信）→ 只认内嵌图片；
+ * - 用户自己拖进来的 .md（多半是自己的笔记，网上的图是有意放的）→ 网上的图照常加载。
+ * 链接两边一样过白名单（lib/safe-url.mjs）；本机路径的图片两边都不加载。
+ */
+const makeObsidianMarked = ({ remoteImages }) => new Marked({
   gfm: true,
   breaks: true,
   async: false,
   renderer: {
     html: ({ text }) => escapeHtml(text),
+    ...safeLinkRenderers("图片", { remoteImages }),
     // 列表按 Obsidian 阅读视图的 DOM 出：ul.has-list-bullet，任务项 li.task-list-item[data-task] + input.task-list-item-checkbox，
     // 圆点和勾选框都由 CSS 画（见 PRINT_CSS），这里只负责挂对类名
     list(token) {
@@ -235,6 +243,8 @@ const obsidianMarked = new Marked({
   },
   extensions: obsidianExtensions,
 });
+const obsidianMarked = makeObsidianMarked({ remoteImages: false });
+const obsidianMarkedRemote = makeObsidianMarked({ remoteImages: true });
 
 /** 开头的 YAML 属性区（--- … ---，里面至少有一行 key: value）去掉；不像属性区的 --- 当分隔线留着。 */
 function stripFrontmatter(source) {
@@ -243,7 +253,7 @@ function stripFrontmatter(source) {
 }
 
 /** Markdown（含 $…$ / $$…$$ 公式）→ HTML 片段，按 Obsidian 的语法习惯解析（见文件头）。 */
-export function renderMarkdownHtml(source) {
+export function renderMarkdownHtml(source, { remoteImages = false } = {}) {
   const formulas = [];
   const stash = (latex, display) => {
     formulas.push(katex.renderToString(latex, { displayMode: display, throwOnError: false, strict: "ignore" }));
@@ -252,7 +262,7 @@ export function renderMarkdownHtml(source) {
   const withPlaceholders = stripFrontmatter(String(source ?? ""))
     .replace(/\$\$([\s\S]+?)\$\$/g, (_, latex) => stash(latex.trim(), true))
     .replace(/(^|[^\\$])\$((?:\\.|[^$\n])+?)\$/g, (_, lead, latex) => `${lead}${stash(latex, false)}`);
-  const html = obsidianMarked.parse(withPlaceholders);
+  const html = (remoteImages ? obsidianMarkedRemote : obsidianMarked).parse(withPlaceholders);
   return html.replace(/\uE000(\d+)\uE001/g, (_, index) => formulas[Number(index)] ?? "");
 }
 
@@ -347,17 +357,20 @@ tr, pre, blockquote, .callout, img { break-inside: avoid; page-break-inside: avo
 `;
 
 /** 完整的可打印 HTML 文档。 */
-export async function buildPrintableHtml(markdown, { title, heading } = {}) {
+export async function buildPrintableHtml(markdown, { title, heading, remoteImages = false } = {}) {
   const docTitle = title || markdownTitle(markdown, "document");
+  // 打印页是本机 file:// 页面：不许跑任何脚本，样式 / 字体 / 图片只认内嵌的（KaTeX 字体本来就内联成 data URI），
+  // 用户自己的 .md 再放开网上的图片。上面的白名单漏了什么，这一层兜底
+  const csp = `default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:${remoteImages ? " https: http:" : ""}`;
   return [
     "<!doctype html>",
-    `<html lang="zh"><head><meta charset="utf-8"><title>${escapeHtml(docTitle)}</title>`,
+    `<html lang="zh"><head><meta charset="utf-8"><meta http-equiv="Content-Security-Policy" content="${csp}"><title>${escapeHtml(docTitle)}</title>`,
     `<style>${await katexCss()}</style>`,
     `<style>${PRINT_CSS}</style>`,
     "</head><body>",
     // Obsidian 导出对话框的「包含文件名作为标题」（默认开）：正文最前面一个普通 h1，内容就是文件名
     heading ? `<h1>${escapeHtml(heading)}</h1>` : "",
-    renderMarkdownHtml(markdown),
+    renderMarkdownHtml(markdown, { remoteImages }),
     "</body></html>",
   ].join("\n");
 }
@@ -584,17 +597,18 @@ async function htmlToPdfWithRetry(html, label) {
  * title 是源文件名（不带扩展名）：作 PDF 元数据标题，并像 Obsidian 一样印在正文最前面（includeName，默认开）；
  * 没给 title 就退回正文第一个一级标题，此时不再额外印一遍。
  */
-export async function markdownToPdf(markdown, { title, includeName = true } = {}) {
+/** @param {{ title?: string, includeName?: boolean, remoteImages?: boolean }} [options] remoteImages 见 makeObsidianMarked */
+export async function markdownToPdf(markdown, { title, includeName = true, remoteImages = false } = {}) {
   const docTitle = title || markdownTitle(markdown, "document");
   // 墨页自己转出来的 document.md 第一行就是「# 文件名」，这种再印一遍就重复了（Obsidian 会重复，我们不必）
   const heading = includeName && title && markdownTitle(markdown, "") !== title ? title : null;
   const chunks = splitMarkdownForPrint(stripFrontmatter(String(markdown ?? "")));
   if (chunks.length === 1) {
-    return htmlToPdfWithRetry(await buildPrintableHtml(chunks[0], { title: docTitle, heading }), docTitle);
+    return htmlToPdfWithRetry(await buildPrintableHtml(chunks[0], { title: docTitle, heading, remoteImages }), docTitle);
   }
   // 各段并行交给 printGate 排队（同时最多 MOYE_PDF_CONCURRENCY 个 Chrome）；文件名标题只印在第一段
   const parts = await Promise.all(chunks.map(async (chunk, index) =>
-    htmlToPdfWithRetry(await buildPrintableHtml(chunk, { title: docTitle, heading: index === 0 ? heading : null }), `${docTitle} 第 ${index + 1}/${chunks.length} 段`)));
+    htmlToPdfWithRetry(await buildPrintableHtml(chunk, { title: docTitle, heading: index === 0 ? heading : null, remoteImages }), `${docTitle} 第 ${index + 1}/${chunks.length} 段`)));
   const merged = await PDFDocument.create();
   for (const part of parts) {
     const source = await PDFDocument.load(part);

@@ -1789,7 +1789,8 @@ const server = createServer(async (request, response) => {
       if (!markdown.trim()) return sendJson(response, 400, { error: "缺少 Markdown 内容。" });
       // title 是拖进来的 .md 文件名；没有就只用正文第一个标题起文件名，不印到 PDF 里
       const title = cleanString(body?.title).replace(/\.(md|markdown)$/i, "") || null;
-      const pdf = await markdownToPdf(markdown, { title });
+      // 用户自己的笔记：网上的图片照常打进 PDF（Library 文档那条路不加载，见 md2pdf.mjs 的 makeObsidianMarked）
+      const pdf = await markdownToPdf(markdown, { title, remoteImages: true });
       sendPdf(response, pdf, `${title || markdownTitle(markdown)}.pdf`);
       return;
     }

@@ -62,3 +62,16 @@ test("用真的 marked 渲染：外链图片不加载，只给一个链接；链
   assert.match(html, /\[图片：追踪像素\]/);
   assert.match(html, /<strong>粗体<\/strong>链接<\/a>/);
 });
+
+test("打 PDF（md2pdf）也过同一套白名单：Library 文档不加载外链和本机图片，用户自己的 .md 加载网上的图", async () => {
+  const { renderMarkdownHtml, buildPrintableHtml } = await import("../../server/md2pdf.mjs");
+  const source = "[x](javascript:alert(1)) ![网图](https://example.com/a.png) ![本机](file:///Users/someone/secret.png)";
+  const library = renderMarkdownHtml(source);
+  assert.doesNotMatch(library, /javascript:|<img|file:/);
+  const own = renderMarkdownHtml(source, { remoteImages: true });
+  assert.match(own, /<img src="https:\/\/example\.com\/a\.png"/);
+  assert.doesNotMatch(own, /file:|javascript:/);
+  const page = await buildPrintableHtml("# 标题", { title: "t" });
+  assert.match(page, /Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; font-src data:; img-src data:"/);
+  assert.match(await buildPrintableHtml("# 标题", { title: "t", remoteImages: true }), /img-src data: https: http:"/);
+});

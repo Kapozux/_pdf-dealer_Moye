@@ -84,3 +84,9 @@ test("toDraft：剥掉 AI 写的原因，保留初稿自己的；重跑多次不
 test("toDraft：status 沿用上一轮——回退页仍是 review，AI 范围不是全部页时也会被重跑", () => {
   assert.equal(toDraft(aiFailed(draft, new Error("x"))).status, "review");
 });
+
+test("toDraft：回退页保留初稿的真实出处，结果页才不会把 PDF 文字层说成 Surya", () => {
+  assert.equal(toDraft(aiFailed(draft, new Error("x"))).method, "text");
+  assert.equal(toDraft(aiOk(draft, reply)).method, "surya");               // 被采用的页出处没记，沿用老口径
+  assert.equal(toDraft(aiNoText({ ...draft, markdown: "" }, {})).method, "empty");
+});

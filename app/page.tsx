@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { aiStaysLocal, defaultAiSettings, fetchAiModels, fetchSetup, getAiSettings, installComponent, saveAiSettings, testAiSettings, type AiModelOption, type AiProvider, type AiSettings, type ModelSource, type SetupComponent, type SetupStatus } from "../lib/ai-settings";
 import { type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
-import { isFallback } from "../lib/page-result.mjs";
+import { isFallback, outcome } from "../lib/page-result.mjs";
 import {
   cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPdfUrl, listJobs,
   exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
@@ -468,12 +468,21 @@ function pageTimeLabel(page: PageResult) {
   return t("耗时 {n} 秒", { n: total });
 }
 
+/**
+ * 回退页留下的是交给模型的那份初稿：AI 模式下是 PDF 文字层（method "text"），本地模式下是 Surya。
+ * 分不清出处的（重新精校过的老记录）只说「本地初稿」，不冒充 Surya。
+ */
+function fallbackLabel(page: PageResult) {
+  return page.method === "text" ? t("AI 未通过 · 已回退 PDF 文字层") : t("AI 未通过 · 已回退本地初稿");
+}
+
 function methodLabel(page: PageResult) {
-  if (page.method === "ai") {
+  const result = outcome(page);
+  if (result === "ai" || result === "noText") {
     const providerName = providerNames[page.provider || "gemini"] ?? page.provider;
     return `${providerName} · ${page.model || t("视觉模型")}`;
   }
-  if (page.aiAttempted) return t("AI 未通过校验 · 已回退 Surya");
+  if (result === "fallback") return fallbackLabel(page);
   if (page.method === "surya") return t("Surya 本地视觉识别");
   if (page.method === "ocr") return t("本地 OCR");
   if (page.method === "text") return t("PDF 文字层");
@@ -742,7 +751,10 @@ export default function Home() {
   }
 
   const stagedHasImage = useMemo(() => staged.some(isImageFile), [staged]);
-  const reviewPages = useMemo(() => result?.pages.filter((page) => page.status === "review") ?? [], [result]);
+  // 「这页本来就没有文字」（照片、空白页）单独数：它在服务端也是 review（要出现在逐页质量里），
+  // 但混进「建议检查」会把真正要看的页淹掉——笔记类文档几乎每张插图都会命中
+  const noTextPages = useMemo(() => result?.pages.filter((page) => outcome(page) === "noText") ?? [], [result]);
+  const reviewPages = useMemo(() => result?.pages.filter((page) => page.status === "review" && outcome(page) !== "noText") ?? [], [result]);
   // 逐页耗时的概览：平均 + 最慢的那页，具体每页看「逐页质量」tab。旧记录没这个字段就不显示
   const pageTimeSummary = useMemo(() => {
     const timed = result?.pages.filter((page) => page.durationMs !== undefined) ?? [];
@@ -2001,8 +2013,8 @@ export default function Home() {
             </div>
           )}
           <div className="score-strip">
-            <div><strong>{result.pageCount - reviewPages.length}</strong><span>{t("通过校验")}</span></div>
-            <div className={reviewPages.length ? "needs-review" : ""}><strong>{reviewPages.length}</strong><span>{t("建议检查")}</span></div>
+            <div><strong>{result.pageCount - reviewPages.length - noTextPages.length}</strong><span>{t("通过校验")}</span></div>
+            <div className={reviewPages.length ? "needs-review" : ""}><strong>{reviewPages.length}</strong><span>{t("建议检查")}{noTextPages.length > 0 && <> · {t("另有 {n} 页无文字", { n: noTextPages.length })}</>}</span></div>
             <div><strong>{result.pages.reduce((sum, page) => sum + (page.formulaCount ?? 0), 0)}</strong><span>{t("LaTeX 公式")}</span></div>
             <button type="button" onClick={() => download(JSON.stringify(result, null, 2), `${result.title}-report.json`, "application/json")}>{t("导出完整报告 ↗")}</button>
           </div>
@@ -2025,10 +2037,10 @@ export default function Home() {
               </div>
             )}
             {tab === "quality" && <div className="quality-list">{result.pages.map((page) => (
-              <article key={page.page} className={page.status === "good" ? "good-page" : ""}><span>{t("第 {n} 页", { n: page.page })}</span><div><strong>{methodLabel(page)}</strong>{page.reasons.length ? page.reasons.map((reason) => <p key={reason}>{tServer(reason)}</p>) : <p>{t("程序校验通过")}</p>}<p>{t("{f} 个公式 · {o} 个选项标签", { f: page.formulaCount ?? 0, o: page.optionCount ?? 0 })}</p></div><small>{t("{n} 字符", { n: page.charCount })}{pageTimeLabel(page) && <><br />{pageTimeLabel(page)}</>}{page.usage && <><br />{t("{i}+{o} token", { i: page.usage.inputTokens, o: page.usage.outputTokens })}{page.usage.costUsd !== null ? ` · ${fmtUsd(page.usage.costUsd)}` : ` · ${t("未计价")}`}</>}</small></article>
+              <article key={page.page} className={outcome(page) === "noText" ? "notext-page" : page.status === "good" ? "good-page" : ""}><span>{t("第 {n} 页", { n: page.page })}</span><div><strong>{methodLabel(page)}</strong>{page.reasons.length ? page.reasons.map((reason) => <p key={reason}>{tServer(reason)}</p>) : <p>{t("程序校验通过")}</p>}<p>{t("{f} 个公式 · {o} 个选项标签", { f: page.formulaCount ?? 0, o: page.optionCount ?? 0 })}</p></div><small>{t("{n} 字符", { n: page.charCount })}{pageTimeLabel(page) && <><br />{pageTimeLabel(page)}</>}{page.usage && <><br />{t("{i}+{o} token", { i: page.usage.inputTokens, o: page.usage.outputTokens })}{page.usage.costUsd !== null ? ` · ${fmtUsd(page.usage.costUsd)}` : ` · ${t("未计价")}`}</>}</small></article>
             ))}</div>}
             {tab === "compare" && (comparedPages.length ? <div className="compare-list">{comparedPages.map((page) => (
-              <article key={page.page}><header><strong>{t("第 {n} 页", { n: page.page })}</strong><span className={`method-badge ${page.method === "ai" ? "accepted" : "fallback"}`}>{page.method === "ai" ? t("采用 {model}", { model: page.model ?? "" }) : mode === "ai" ? t("AI 未通过 · 回退文字层") : t("回退本地初稿")}</span></header><div className="compare-columns"><section><h3>{t("最终 Markdown")}</h3><pre>{page.markdown}</pre></section><section><h3>{mode === "ai" ? t("PDF 文字层（提示/回退）") : t("Surya 本地初稿")}</h3><pre>{page.rawMarkdown}</pre></section></div></article>
+              <article key={page.page}><header><strong>{t("第 {n} 页", { n: page.page })}</strong><span className={`method-badge ${outcome(page) === "noText" ? "notext" : page.method === "ai" ? "accepted" : "fallback"}`}>{outcome(page) === "noText" ? t("AI 判定无文字") : page.method === "ai" ? t("采用 {model}", { model: page.model ?? "" }) : fallbackLabel(page)}</span></header><div className="compare-columns"><section><h3>{t("最终 Markdown")}</h3>{outcome(page) === "noText" ? <p className="compare-empty">{page.note ? t("本页没有可提取的文字：{note}", { note: page.note }) : t("本页没有可提取的文字")}</p> : <pre>{page.markdown}</pre>}</section><section><h3>{result.mode === "ai" ? t("PDF 文字层（提示/回退）") : t("Surya 本地初稿")}</h3><pre>{page.rawMarkdown}</pre></section></div></article>
             ))}</div> : <div className="all-clear"><span>↔</span><h2>{t("这次没有 AI 对照记录")}</h2><p>{t("使用“重新 AI 精校”后，这里会保留最终结果与本地初稿。")}</p></div>)}
             {tab === "source" && sourceUrl && <iframe className="pdf-preview" src={sourceUrl} title={t("原始 PDF 预览")} />}
           </div>

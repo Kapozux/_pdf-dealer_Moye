@@ -12,7 +12,8 @@ import { randomUUID } from "node:crypto";
 import { createZip, safeEntryName } from "./server/zip.mjs";
 import { JobStore } from "./server/jobstore.mjs";
 import { JobQueue, EventHub } from "./server/queue.mjs";
-import { createConverter, gateStats, isFallbackPage } from "./server/convert.mjs";
+import { createConverter, gateStats } from "./server/convert.mjs";
+import { isFallback } from "./lib/page-result.mjs";
 import { createRenderer } from "./server/render.mjs";
 import { createOfficeConverter, isOfficeFile } from "./server/office2pdf.mjs";
 import { createImageConverter, isImageFile } from "./server/image2pdf.mjs";
@@ -1981,7 +1982,7 @@ const server = createServer(async (request, response) => {
       // body 可选：{ only: "fallback" } 表示只重跑上次回退的页（见 convert.mjs 的 refineExisting）
       const body = await readJson(request);
       const only = body?.only === "fallback" ? "fallback" : "all";
-      if (only === "fallback" && !(previous.pages ?? []).some(isFallbackPage)) {
+      if (only === "fallback" && !(previous.pages ?? []).some(isFallback)) {
         return sendJson(response, 400, { error: "没有回退的页面需要重跑。" });
       }
       await jobStore.backupResult(job.id);   // 留一份 .prev 备份，万一这次结果更差还能手动捞回来
@@ -1990,7 +1991,7 @@ const server = createServer(async (request, response) => {
       jobStore.update(job.id, {
         status: "queued",
         detail: only === "fallback"
-          ? `重新精校排队中，只重跑 ${previous.pages.filter(isFallbackPage).length} 页回退页，其余保留`
+          ? `重新精校排队中，只重跑 ${previous.pages.filter(isFallback).length} 页回退页，其余保留`
           : "重新精校排队中，正在复用当前结果作为初稿",
         error: null,
         page: 0,

@@ -14,6 +14,7 @@
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { appendFile, copyFile, readFile, rename, writeFile, rm } from "node:fs/promises";
+import { countFallback } from "../lib/page-result.mjs";
 
 /**
  * 先写临时文件再 rename 覆盖。rename 在同一文件系统上是原子的：要么是完整的新文件，
@@ -219,7 +220,7 @@ export class JobStore {
         pages.filter((p) => p?.method === "ai").length,
         charCount,
         preview,
-        countFallbackPages(pages),
+        countFallback(pages),
         Number.isFinite(result?.durationMs) ? Math.round(result.durationMs) : null,
         id
       );
@@ -422,13 +423,8 @@ export class JobStore {
     for (const { id } of rows) {
       const result = await this.readResult(id);
       const pages = Array.isArray(result?.pages) ? result.pages : [];
-      write.run(countFallbackPages(pages), id);
+      write.run(countFallback(pages), id);
     }
     return rows.length;
   }
-}
-
-/** 与 server/convert.mjs 的 isFallbackPage 同定义：交给过模型但最终没用模型结果的页。 */
-function countFallbackPages(pages) {
-  return pages.filter((p) => Boolean(p?.aiAttempted) && p?.method !== "ai").length;
 }

@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { aiStaysLocal, defaultAiSettings, fetchAiModels, fetchSetup, getAiSettings, installComponent, saveAiSettings, testAiSettings, type AiModelOption, type AiProvider, type AiSettings, type ModelSource, type SetupComponent, type SetupStatus } from "../lib/ai-settings";
 import { type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
+import { isFallback } from "../lib/page-result.mjs";
 import {
   cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPdfUrl, listJobs,
   exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
@@ -467,11 +468,6 @@ function pageTimeLabel(page: PageResult) {
   return t("耗时 {n} 秒", { n: total });
 }
 
-/** 「回退页」：交给过模型但最终没采用模型结果的页。与 server/convert.mjs 的 isFallbackPage 同定义。 */
-function isFallbackPage(page: PageResult) {
-  return Boolean(page.aiAttempted) && page.method !== "ai";
-}
-
 function methodLabel(page: PageResult) {
   if (page.method === "ai") {
     const providerName = providerNames[page.provider || "gemini"] ?? page.provider;
@@ -757,7 +753,7 @@ export default function Home() {
   }, [result]);
   const comparedPages = useMemo(() => result?.pages.filter((page) => page.rawMarkdown !== undefined) ?? [], [result]);
   // 上次 AI 没成功的页数：决定要不要露出「只重跑回退页」按钮（全部成功就没必要）
-  const fallbackPages = useMemo(() => result?.pages.filter(isFallbackPage) ?? [], [result]);
+  const fallbackPages = useMemo(() => result?.pages.filter(isFallback) ?? [], [result]);
   // 渲染一次缓存住：几百页的文档有上千个公式，切标签页不该每次重算
   const renderedMarkdown = useMemo(() => (result && mdView === "rendered" ? renderMarkdown(result.markdown) : ""), [result, mdView]);
   const aiWasUsed = mode === "ai" || result?.pages.some((page) => page.method === "ai" || page.aiAttempted);

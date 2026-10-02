@@ -56,7 +56,6 @@ test("ships local extraction, a persistent library, bundled workers, Surya, AI r
   assert.match(page, /ModelPicker/);
   assert.match(page, /refineLibraryEntry/);
   assert.match(page, /只重跑 \{n\} 页回退页/);          // 只重跑回退页，不整份重来
-  assert.match(library, /export function isFallbackPage/);
   assert.match(ocrServer, /only === "fallback"/);
   assert.match(page, /下载 PDF/);                      // Markdown → PDF（结果页按钮 + 首页拖入 .md）
   assert.match(page, /isMarkdownFile/);
@@ -80,7 +79,7 @@ test("ships local extraction, a persistent library, bundled workers, Surya, AI r
   assert.match(page, /合成一份 PDF · \{n\} 张图片/);
   assert.match(ocrServer, /\/api\/images2pdf\/part/);
   assert.match(ocrServer, /\/api\/images2pdf\/build/);
-  assert.match(library, /AI 检测：未发现可提取的文字/);
+  // noText / 回退页的判定：行为测试见 tests/behaviour/page-result.test.mjs
   // 转换在服务端跑：管线、AI 校验回退、公式保护都应在 server/convert.mjs
   assert.match(library, /export function createConverter/);
   assert.match(library, /validateAiPage/);

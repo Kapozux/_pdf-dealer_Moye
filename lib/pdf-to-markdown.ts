@@ -23,7 +23,12 @@ export type PageResult = {
   formulaCount?: number;
   optionCount?: number;
   uncertain?: string[];
+  /** 交给过模型（不管结果用没用上）。「这页最后算什么」见 lib/page-result.mjs 的 outcome() */
   aiAttempted?: boolean;
+  /** 模型判定这页本来就没有可提取的文字（照片、空白页）——算成功，不算回退 */
+  noText?: boolean;
+  /** noText 时模型说这张图是什么，例如「photo of a cat」 */
+  note?: string;
   /** 这一页的墙钟耗时（毫秒）：AI 页含等渲染、等并发闸门；文字层页就是解析时间 */
   durationMs?: number;
   /** AI 页真正打向模型那次调用的耗时（毫秒），不含本机排队 */

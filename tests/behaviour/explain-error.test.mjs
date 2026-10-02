@@ -17,6 +17,8 @@ const real = [
   ["模型请求失败（401）：Invalid Authentication", "auth", false],
   ["模型请求失败（401）：Incorrect API key provided", "auth", false],
   ["The PDF file is empty, i.e. its size is zero bytes.", "emptyFile", false],
+  ["上传的文件是空的（0 字节）。", "emptyFile", false],
+  ["上传没有完成：aborted", "unknown", null],
   ["页面渲染超时（48 页，68s 未完成）。", "timeout", true],
   ["连不上本机 Ollama（http://127.0.0.1:11434）：ECONNREFUSED。请确认 Ollama 已经打开（菜单栏有它的图标）。", "network", true],
   ["请先在设置中填写 Kimi API Key。", "auth", false],

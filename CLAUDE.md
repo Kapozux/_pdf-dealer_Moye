@@ -244,6 +244,7 @@ launchctl kickstart -k gui/$(id -u)/com.kapozux.moye-web   # 重启网页服务
 | `MOYE_RENDER_CHUNK_PAGES` | 48 | AI 模式一次渲染几页。2026-08-29 实测：698 页整本一次渲染 = 350MB base64 走 stdout，120s 必超时；分组后单次约 2s / 25MB，内存上限从整本变成约两组，服务进程峰值 3.9GB → 0.8GB |
 | `MOYE_TEXTLAYER_TIMEOUT_MS` | 900000 | 读文字层子进程的超时（698 页实测 20s，给足 15 分钟） |
 | `MOYE_IMAGEBOOK_TIMEOUT_MS` | 300000 | 「很多图片 → 一份 PDF」里单次 Pillow / sips 调用的超时 |
+| `MOYE_UPLOAD_BUFFER_MB` | 512 | Office 文档和图片要整份收进内存再转 PDF，超过这个大小直接拒收（让用户先导出成 PDF） |
 | `MOYE_VENV` | `.venv`，没有就 `../.venv-marker` | Python 环境（pypdfium2 / Pillow / 可选 Surya） |
 | `MOYE_OLLAMA_CONCURRENCY` | 1 | 本机 Ollama 同时几页。Ollama 默认一个模型只并行 1 路（OLLAMA_NUM_PARALLEL），调大它之后再跟着调这个 |
 | `MOYE_TIMEOUT_OLLAMA` | 180000 | 本机 Ollama 单次调用超时（实测正常页 5～15s，只测过一份 4 页文档） |

@@ -16,6 +16,8 @@ import { createConverter, gateStats } from "./server/convert.mjs";
 import { isFallback } from "./lib/page-result.mjs";
 import { maskedKey, splitKeys } from "./lib/key-pool.mjs";
 import { foreignRequestReason, LOCAL_ORIGIN } from "./server/request-guard.mjs";
+import { fetchWithTimeout } from "./server/fetch-timeout.mjs";
+import { failoverChain } from "./server/openrouter-failover.mjs";
 import { ALL_PROVIDERS, createSettingsStore, defaultSettings, normalizeSettings, providerConfigured } from "./server/settings.mjs";
 import { createRenderer } from "./server/render.mjs";
 import { createOfficeConverter, isOfficeFile } from "./server/office2pdf.mjs";
@@ -44,6 +46,8 @@ const settingsPath = resolve(root, "settings.local.json");
 const usage = createUsage(resolve(root, "data"));
 const port = Number(process.env.MOYE_PORT) || 8765;
 const maxJsonBytes = 24 * 1024 * 1024;
+// Office 文档和图片要整份收进内存再转 PDF（soffice / Pillow 都要完整文件），这是上限
+const MAX_PRECONVERT_BYTES = (Number(process.env.MOYE_UPLOAD_BUFFER_MB) || 512) * 1024 * 1024;
 
 const settingsStore = createSettingsStore(settingsPath);
 const loadSettings = () => settingsStore.load();
@@ -292,20 +296,6 @@ function normalizeAiResult(raw, provider, model, used = null) {
   };
 }
 
-async function fetchWithTimeout(url, options, timeoutMs = 180000) {
-  const controller = new AbortController();
-  let timedOut = false;
-  const timer = setTimeout(() => { timedOut = true; controller.abort(); }, timeoutMs);
-  try {
-    return await fetch(url, { ...options, signal: controller.signal });
-  } catch (error) {
-    // 换成看得懂的信息：否则日志里只有一句 "This operation was aborted"
-    if (timedOut) throw new Error(`请求超时（${Math.round(timeoutMs / 1000)}s 未返回）。`);
-    throw error;
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 const sleep = (ms) => new Promise((resolvePromise) => setTimeout(resolvePromise, ms));
 
@@ -544,61 +534,30 @@ function noteModelSuccess(model) {
  */
 async function callOpenRouterFailover(settings, input, opts = {}) {
   const base = directProviderConfig("openrouter", settings);
-  const pool = OPENROUTER_PROVIDERS;
-  if (!pool.length) return callOpenAiCompatible(base, input.imageBase64 || "", input.mimeType || "image/jpeg", input.draft || "", false, opts);
-
-  const perTry = opts.timeoutMs ?? PAGE_CALL_TIMEOUT_MS;
-  const overallDeadline = Date.now() + (opts.budgetMs ?? PAGE_TIME_BUDGET_MS);
-  let lastError;
-
-  // 外层换模型，内层换供应商。已熔断的模型直接跳过——除非它是唯一剩下的。
-  const chain = [base.model, ...OPENROUTER_FALLBACK_MODELS].filter((m, i, a) => m && a.indexOf(m) === i);
-  const usable = chain.filter((m) => !modelIsDown(m));
-  const models = usable.length ? usable : chain;
-
-  for (const model of models) {
-    if (Date.now() >= overallDeadline) break;
-
-    // 按 OPENROUTER_PROVIDERS 的顺序试，**不做轮转**。
-    // 曾经这里用 openrouterCursor++ 轮转起点，想着「分散负载」，实测是灾难：
-    // 五家速度差 4 倍（CoreWeave p50 12s、Baidu 41s、Cloudflare 51s），轮转把
-    // 80% 的请求发给了慢的四家，而后两家的 p50 本身就超过 30s 超时线——必然
-    // 超时、换家、再等，平均每页 236 秒，吞吐 14 页/分钟。
-    // 而按顺序优先最快的一家：32 路里 31 个落在 CoreWeave，p50 3.3s、2.17 页/秒。
-    // 分散负载该由 OpenRouter 在它那侧做，客户端硬分只会把活推给慢的。
-    // 第 0 次尝试不钉死任何一家：把整个白名单交给 OpenRouter，让它自己在
-    // 健康的几家之间做负载均衡（实测 32 路里 31 个落到最快的 CoreWeave，
-    // p50 3.3s、2.17 页/秒——比客户端自己分片快 15 倍）。
-    // 只有它挑的那家失败了，才逐家钉死重试。
-    const attempts = [null, ...pool];
-    for (const pinned of attempts) {
-      if (Date.now() >= overallDeadline) break;
-      try {
-        const result = await callOpenAiCompatible(
-          { ...base, model, pinProvider: pinned },
-          input.imageBase64 || "", input.mimeType || "image/jpeg", input.draft || "", false,
-          // 每家只给一次机会：失败就换人，不在同一家身上重试
-          { attempts: 1, timeoutMs: perTry, budgetMs: perTry + 2000, page: opts.page }
-        );
-        noteModelSuccess(model);
-        if (model !== base.model) {
-          console.warn(`[换模型] 第 ${input.page ?? "?"} 页：${base.model} 不可用，改用 ${model} 成功`);
-        }
-        return result;
-      } catch (error) {
-        lastError = error;
-        console.warn(`[换供应商] 第 ${input.page ?? "?"} 页：${model} @ ${pinned} 失败（${String(error?.message ?? error).slice(0, 50)}）`);
-      }
-    }
-    // 走到这里 = 这个模型在所有供应商上都失败了，才算模型本身的一次失败
-    // （成功的路径在上面直接 return 了）
-    noteModelFailure(model);
-  }
-  throw lastError || new Error("OpenRouter 所有模型与供应商都失败。");
+  const image = [input.imageBase64 || "", input.mimeType || "image/jpeg", input.draft || ""];
+  if (!OPENROUTER_PROVIDERS.length) return callOpenAiCompatible(base, ...image, false, opts);
+  // 顺序（先交给 OpenRouter 挑、再逐家钉死、不轮转）和预算规则的实测依据见 server/openrouter-failover.mjs
+  const { result, model } = await failoverChain({
+    models: [base.model, ...OPENROUTER_FALLBACK_MODELS].filter((m, i, a) => m && a.indexOf(m) === i),
+    providers: OPENROUTER_PROVIDERS,
+    perTryMs: opts.timeoutMs ?? PAGE_CALL_TIMEOUT_MS,
+    budgetMs: opts.budgetMs ?? PAGE_TIME_BUDGET_MS,
+    health: { isDown: modelIsDown, success: noteModelSuccess, failure: noteModelFailure },
+    // 每家只给一次机会：失败就换人，不在同一家身上重试
+    call: ({ model, pinned, timeoutMs, deadline }) =>
+      callOpenAiCompatible({ ...base, model, pinProvider: pinned }, ...image, false, { attempts: 1, timeoutMs, deadline, page: opts.page }),
+    log: (model, pinned, error) =>
+      console.warn(`[换供应商] 第 ${input.page ?? "?"} 页：${model} @ ${pinned} 失败（${String(error?.message ?? error).slice(0, 50)}）`),
+  });
+  if (model !== base.model) console.warn(`[换模型] 第 ${input.page ?? "?"} 页：${base.model} 不可用，改用 ${model} 成功`);
+  return result;
 }
 
 async function callOpenAiCompatible(config, imageBase64, mimeType, draft, testOnly = false, opts = {}) {
   if (!config.key) throw new Error(`请先在设置中填写 ${config.label} API Key。`);
+  // 截止时间是绝对时刻，只算一次：调用方（换供应商的兜底链）可以直接传进来；
+  // 下面「强制推理」重发时沿用同一个，不再另拿一份预算
+  const deadline = testOnly ? Infinity : (opts.deadline ?? Date.now() + (opts.budgetMs ?? PAGE_TIME_BUDGET_MS));
   if (config.provider === "openrouter" && forcedReasoningModels.has(config.model)) {
     config = { ...config, noReasoningToggle: true };
   }
@@ -655,12 +614,11 @@ async function callOpenAiCompatible(config, imageBase64, mimeType, draft, testOn
       ...(config.provider === "openrouter" ? { usage: { include: true } } : {}),
       messages: [{ role: "user", content }],
     }),
-  }, opts.attempts ?? 3, testOnly ? 60000 : (opts.timeoutMs ?? PAGE_CALL_TIMEOUT_MS),
-     testOnly ? Infinity : Date.now() + (opts.budgetMs ?? PAGE_TIME_BUDGET_MS)).catch((error) => {
+  }, opts.attempts ?? 3, testOnly ? 60000 : (opts.timeoutMs ?? PAGE_CALL_TIMEOUT_MS), deadline).catch((error) => {
     // 强制推理的端点：记下来，之后这个模型都不再带该字段，然后立刻重发一次。
     if (config.provider === "openrouter" && !config.noReasoningToggle && /reasoning is mandatory/i.test(String(error?.message))) {
       forcedReasoningModels.add(config.model);
-      return callOpenAiCompatible({ ...config, noReasoningToggle: true }, imageBase64, mimeType, draft, testOnly, opts)
+      return callOpenAiCompatible({ ...config, noReasoningToggle: true }, imageBase64, mimeType, draft, testOnly, { ...opts, deadline })
         .then((result) => ({ __done: result }));
     }
     throw error;
@@ -1625,7 +1583,13 @@ const server = createServer(async (request, response) => {
       if (preConvert) {
         try {
           const chunks = [];
-          for await (const chunk of request) chunks.push(chunk);
+          let received = 0;
+          for await (const chunk of request) {
+            received += chunk.length;
+            // 要整份收进内存才能交给 soffice / Pillow：没上限的话一个超大文件能把服务撑爆
+            if (received > MAX_PRECONVERT_BYTES) throw new Error(`文件超过 ${Math.round(MAX_PRECONVERT_BYTES / 1024 / 1024)}MB，先在 Office 或预览里导出成 PDF 再拖进来`);
+            chunks.push(chunk);
+          }
           const pdfBuffer = await preConvert.converter.convertToPdf(Buffer.concat(chunks), filename);
           await writeFile(jobStore.sourcePath(id), pdfBuffer);
         } catch (error) {
@@ -1634,9 +1598,22 @@ const server = createServer(async (request, response) => {
           throw new Error(`${preConvert.label}转 PDF 失败：${message}`);
         }
       } else {
-        await pipeline(request, createWriteStream(jobStore.sourcePath(id)));
+        try {
+          await pipeline(request, createWriteStream(jobStore.sourcePath(id)));
+        } catch (error) {
+          // 上传中途断了（关页面、断网、磁盘满）：以前这条记录永远停在「排队中」，
+          // 下次重启 recover 还会拿半截 PDF 去转换
+          await rm(jobStore.sourcePath(id), { force: true });
+          const message = `上传没有完成：${String(error?.message ?? error).slice(0, 160)}`;
+          jobStore.update(id, { status: "failed", error: message });
+          throw new Error(message);
+        }
       }
       const { size } = await stat(jobStore.sourcePath(id));
+      if (!size) {
+        jobStore.update(id, { status: "failed", error: "上传的文件是空的（0 字节）。" });
+        throw new Error("上传的文件是空的（0 字节）。");
+      }
       jobStore.db.prepare("UPDATE jobs SET file_size = ? WHERE id = ?").run(size, id);
       jobQueue.enqueue(id);
       sendJson(response, 202, { job: { ...job, file_size: size } });

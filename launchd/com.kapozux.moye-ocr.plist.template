@@ -6,7 +6,7 @@
   <string>com.kapozux.moye-ocr</string>
   <key>ProgramArguments</key>
   <array>
-    <string>/opt/homebrew/bin/node</string>
+    <string>__NODE_DIR__/node</string>
     <string>__PROJECT_DIR__/local-ocr-server.mjs</string>
   </array>
   <key>WorkingDirectory</key>
@@ -16,7 +16,7 @@
     <key>HOME</key>
     <string>__HOME__</string>
     <key>PATH</key>
-    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    <string>__NODE_DIR__:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
   </dict>
   <key>RunAtLoad</key>
   <true/>

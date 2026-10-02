@@ -64,6 +64,24 @@ export class JobStore {
     // 同样是后加的：char_count 给统计面板算总字数，tags 是 AI 打的主题标签（JSON 数组字符串）
     if (!columns.has("char_count")) this.db.exec("ALTER TABLE jobs ADD COLUMN char_count INTEGER NOT NULL DEFAULT 0");
     if (!columns.has("tags")) this.db.exec("ALTER TABLE jobs ADD COLUMN tags TEXT");
+    // 再后加的三列（回顾 / 下载文件名用）：AI 标题、一句话简介、原文件名是否本身像个标题（NULL = 还没判过）
+    if (!columns.has("ai_title")) this.db.exec("ALTER TABLE jobs ADD COLUMN ai_title TEXT");
+    if (!columns.has("ai_one_line")) this.db.exec("ALTER TABLE jobs ADD COLUMN ai_one_line TEXT");
+    if (!columns.has("filename_meaningful")) this.db.exec("ALTER TABLE jobs ADD COLUMN filename_meaningful INTEGER");
+    // 首页/资料库用来区分「真回退了」和「只是建议复核」：review_count 把 noText、可疑符号、
+    // 回退文字层全混在一起，AI 模式下笔记类文档几乎每页命中，红字等于没标。
+    // NULL = 老记录还没算过，启动时 backfillFallbackCounts 从 result.json 补。
+    if (!columns.has("fallback_count")) this.db.exec("ALTER TABLE jobs ADD COLUMN fallback_count INTEGER");
+    // 费用摘要（明细在 data/usage.db，见 server/usage.mjs）：任务跑完时从 usage.costFor 抄一份进来，
+    // Library 列表和结果页只查 jobs 表就够。NULL = 这份没有过模型调用（fast/本地模式）或老记录。
+    if (!columns.has("cost_usd")) this.db.exec("ALTER TABLE jobs ADD COLUMN cost_usd REAL");
+    if (!columns.has("cost_calls")) this.db.exec("ALTER TABLE jobs ADD COLUMN cost_calls INTEGER");
+    if (!columns.has("cost_unpriced")) this.db.exec("ALTER TABLE jobs ADD COLUMN cost_unpriced INTEGER");
+    if (!columns.has("tokens_in")) this.db.exec("ALTER TABLE jobs ADD COLUMN tokens_in INTEGER");
+    if (!columns.has("tokens_out")) this.db.exec("ALTER TABLE jobs ADD COLUMN tokens_out INTEGER");
+    // 转换本身的墙钟（result.durationMs，不含排队），给「预计剩余时间」按模式算每页秒数用。
+    // NULL = 老记录还没从 result.json 补过，启动时 backfillDurations 补。
+    if (!columns.has("duration_ms")) this.db.exec("ALTER TABLE jobs ADD COLUMN duration_ms INTEGER");
   }
 
   dir(id) {
@@ -194,20 +212,97 @@ export class JobStore {
     // 统计面板要用：字数按每页已经算好的 charCount 求和，不用重新扫一遍全文
     const charCount = pages.reduce((sum, p) => sum + (Number(p?.charCount) || 0), 0);
     this.db
-      .prepare("UPDATE jobs SET page_count = ?, review_count = ?, ai_pages = ?, char_count = ?, preview = ? WHERE id = ?")
+      .prepare("UPDATE jobs SET page_count = ?, review_count = ?, ai_pages = ?, char_count = ?, preview = ?, fallback_count = ?, duration_ms = ? WHERE id = ?")
       .run(
         Number(result?.pageCount ?? 0),
         pages.filter((p) => p?.status === "review").length,
         pages.filter((p) => p?.method === "ai").length,
         charCount,
         preview,
+        countFallbackPages(pages),
+        Number.isFinite(result?.durationMs) ? Math.round(result.durationMs) : null,
         id
       );
+  }
+
+  /** 把这份任务的费用摘要抄进 jobs 表（明细在 usage.db）。传 null 表示没有过模型调用。 */
+  setCost(id, cost) {
+    this.db
+      .prepare("UPDATE jobs SET cost_usd = ?, cost_calls = ?, cost_unpriced = ?, tokens_in = ?, tokens_out = ? WHERE id = ?")
+      .run(
+        cost ? cost.costUsd : null,
+        cost ? cost.calls : null,
+        cost ? cost.unpriced : null,
+        cost ? cost.inputTokens : null,
+        cost ? cost.outputTokens : null,
+        id
+      );
+  }
+
+  /**
+   * 按模式的「每页秒数」中位数，给预计剩余时间用。
+   *
+   * 数据源是每份已完成任务的 duration_ms ÷ page_count（转换本身的墙钟，不含排队），
+   * 各模式只取最近 50 份；样本少于 3 份就不给数（返回 null，前端只显示已用时）。
+   * 用整份文档的吞吐而不是逐页 modelMs：AI 模式几十路并发，单次调用 13 秒
+   * 不等于每页 13 秒，按文档算出来的才是用户真正等的时间。
+   */
+  speedTable() {
+    const rows = this.db
+      .prepare(
+        `SELECT mode, duration_ms, page_count FROM jobs
+          WHERE status = 'done' AND duration_ms > 0 AND page_count > 0
+          ORDER BY finished_at DESC LIMIT 400`
+      )
+      .all();
+    const byMode = new Map();
+    for (const row of rows) {
+      const list = byMode.get(row.mode) || [];
+      if (list.length < 50) list.push(row.duration_ms / 1000 / row.page_count);
+      byMode.set(row.mode, list);
+    }
+    const table = {};
+    for (const [mode, list] of byMode) {
+      const sorted = [...list].sort((a, b) => a - b);
+      const mid = Math.floor(sorted.length / 2);
+      const median = sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+      table[mode] = { n: sorted.length, secPerPage: sorted.length >= 3 ? Math.round(median * 100) / 100 : null };
+    }
+    return table;
+  }
+
+  /** duration_ms 列是后加的：老记录从 result.json 里的 durationMs 补一次。读不到的记 0，不再重试。 */
+  async backfillDurations() {
+    const rows = this.db.prepare("SELECT id FROM jobs WHERE status = 'done' AND duration_ms IS NULL").all();
+    const write = this.db.prepare("UPDATE jobs SET duration_ms = ? WHERE id = ?");
+    for (const { id } of rows) {
+      const result = await this.readResult(id);
+      write.run(Number.isFinite(result?.durationMs) ? Math.round(result.durationMs) : 0, id);
+    }
+    return rows.length;
   }
 
   /** 给某条记录写入 AI 打的主题标签（数组），供统计面板聚合。 */
   setTags(id, tags) {
     this.db.prepare("UPDATE jobs SET tags = ? WHERE id = ?").run(JSON.stringify(tags ?? []), id);
+  }
+
+  /** 一次写入 AI 生成的整套卡片元数据：标签 + 标题 + 一句话 + 原文件名是否有意义。 */
+  setCardMeta(id, { tags, title, oneLine, filenameMeaningful }) {
+    this.db
+      .prepare("UPDATE jobs SET tags = ?, ai_title = ?, ai_one_line = ?, filename_meaningful = ? WHERE id = ?")
+      .run(JSON.stringify(tags ?? []), title ?? null, oneLine ?? null,
+        filenameMeaningful === null || filenameMeaningful === undefined ? null : (filenameMeaningful ? 1 : 0), id);
+  }
+
+  /** 回顾 / 资料库统计用的精简行：不带 preview 这种大字段。 */
+  reflectRows() {
+    return this.db
+      .prepare(
+        `SELECT id, filename, mode, created_at, page_count, char_count, tags, ai_title, ai_one_line
+           FROM jobs WHERE status = 'done' ORDER BY created_at`
+      )
+      .all();
   }
 
   /**
@@ -316,4 +411,24 @@ export class JobStore {
     for (const job of requeued) requeue(job);
     return { requeued: requeued.length, failed: pending.length - requeued.length };
   }
+
+  /**
+   * fallback_count 列是后加的，老记录是 NULL。逐份读 result.json 算一次写回去，
+   * 之后就只走 SQL。读不到 result.json 的记为 0，别每次启动都再试一遍。
+   */
+  async backfillFallbackCounts() {
+    const rows = this.db.prepare("SELECT id FROM jobs WHERE status = 'done' AND fallback_count IS NULL").all();
+    const write = this.db.prepare("UPDATE jobs SET fallback_count = ? WHERE id = ?");
+    for (const { id } of rows) {
+      const result = await this.readResult(id);
+      const pages = Array.isArray(result?.pages) ? result.pages : [];
+      write.run(countFallbackPages(pages), id);
+    }
+    return rows.length;
+  }
+}
+
+/** 与 server/convert.mjs 的 isFallbackPage 同定义：交给过模型但最终没用模型结果的页。 */
+function countFallbackPages(pages) {
+  return pages.filter((p) => Boolean(p?.aiAttempted) && p?.method !== "ai").length;
 }

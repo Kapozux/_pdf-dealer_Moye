@@ -12,6 +12,8 @@
 
 import { deflateRawSync } from "node:zlib";
 
+import { stripSourceExtension } from "./filenames.mjs";
+
 // CRC32 查表法。ZIP 的每条记录都要带校验和，解压工具会核对。
 const crcTable = (() => {
   const table = new Int32Array(256);
@@ -114,8 +116,7 @@ export function createZip(entries) {
 
 /** 去掉路径分隔符和 Windows 非法字符，避免解压时跑到目录外或直接失败。 */
 export function safeEntryName(name, fallback = "document") {
-  const cleaned = String(name || "")
-    .replace(/\.pdf$/i, "")
+  const cleaned = stripSourceExtension(name || "")
     .replace(/[/\\]/g, "_")
     // eslint-disable-next-line no-control-regex -- 控制字符正是要过滤的对象
     .replace(/[:*?"<>|\x00-\x1f]/g, "_")

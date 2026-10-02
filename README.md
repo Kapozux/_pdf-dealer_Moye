@@ -26,7 +26,7 @@ layout/OCR for the hard ones, and optionally a vision model to proofread each pa
 | 700-page, 400 MB book                  | browser dies (~10 MB limit) | ✓ tested |
 | Close the tab mid-conversion           | job lost | job keeps running on the server |
 | Per-page quality report                | ✗ | ✓ which pages to double-check, and why |
-| Vision-model refinement with validation | ✗ | ✓ Gemini / Kimi / Qwen / OpenRouter, auto-fallback |
+| Vision-model refinement with validation | ✗ | ✓ local Ollama, or Gemini / Kimi / Qwen / OpenRouter, auto-fallback |
 
 ## Three modes
 
@@ -48,36 +48,54 @@ mode reads a text layer, which an image does not have** — use Balanced or AI r
 
 ## Quick start (macOS)
 
-Requirements: Node ≥ 22.13, Python 3.12 with [Surya](https://github.com/VikParuchuri/surya) in a venv at
-`../.venv-marker` (sibling of the repo — the service looks for `../.venv-marker/bin/surya_ocr`),
-optionally LibreOffice for PPT/Word. Image support uses Pillow (already a Surya dependency) and, for HEIC, the built-in `sips`.
+One command on a fresh Mac — no Homebrew, no sudo, no Python or Node needed beforehand:
 
 ```bash
-git clone https://github.com/xyzxinlu-max/moye-pdf-to-markdown
-cd moye-pdf-to-markdown
-npm install
-
-# Surya (local OCR) — tested with surya-ocr 0.22 + pypdfium2 5.10 on Python 3.12.
-# With uv:
-uv venv ../.venv-marker --python 3.12
-uv pip install --python ../.venv-marker/bin/python surya-ocr pypdfium2
-# or with plain venv + pip:
-#   python3.12 -m venv ../.venv-marker && ../.venv-marker/bin/pip install surya-ocr pypdfium2
-# First run downloads the Surya models (a few GB).
-
-# optional: PPT/PPTX/Word (.doc/.docx) support
-brew install --cask libreoffice
-
-# build + register two launchd services (web on :3000, conversion service on :8765)
-./安装开机自启.command
+curl -fsSL https://raw.githubusercontent.com/xyzxinlu-max/moye-pdf-to-markdown/main/install.sh | zsh
 ```
 
-Then open <http://localhost:3000>. The services start on login and restart if they crash;
-`./启动全部服务.command` brings them up manually. Logs are in `logs/`.
+Or, from a clone, double-click `一键安装.command` (first time: right-click → Open) or run `./install.sh`.
 
-For AI refine, open **Settings** in the UI and paste an API key for Gemini, Kimi (Moonshot),
+The installer puts Node and Python **inside the project folder** (`.runtime/`, `.venv/`), installs the
+small required pieces, asks about the optional ones, registers the two launchd services (web on :3000,
+conversion service on :8765) and opens <http://localhost:3000>. It is safe to run again; finished steps are skipped.
+
+| Component | Needed for | Size |
+|---|---|---|
+| Node + npm packages | everything | required |
+| Python + pypdfium2 + Pillow | AI refine (page rendering), images | required, ~60 MB |
+| **Ollama + a vision model** | AI refine **without an API key**, nothing uploaded | ~3–6 GB, asked (default yes) |
+| Surya + llama.cpp | Local high-accuracy mode | ~2 GB, asked; needs Homebrew for llama.cpp |
+| LibreOffice | PPT / Word | ~700 MB, asked |
+| chrome-headless-shell | Download PDF, .md → PDF | ~100 MB |
+
+Anything skipped can be installed later from **Settings → Environment** in the app, which shows what is
+missing, what it affects, and installs it with one click (same `install.sh`, via `--only <component>`).
+Install output goes to `logs/setup.log`. `./uninstall.sh` removes the login services; deleting the
+folder removes everything else.
+
+**AI refine** works with a local model through [Ollama](https://ollama.com) (free, page images stay on
+this Mac, much slower than the cloud, one page at a time; not yet benchmarked here) or with an API key for Gemini, Kimi (Moonshot),
 Qwen (DashScope) or OpenRouter. Keys are stored in `settings.local.json` (mode 0600, gitignored)
-and never sent to the browser in clear text.
+and never sent to the browser in clear text. The recommended local model is picked by RAM:
+`qwen3-vl:8b-instruct` with 16 GB or more, `qwen3-vl:4b-instruct` below that. The Ollama registry can be nearly
+unreachable on some networks (its files sit on Cloudflare R2), so the installer and the Environment page
+measure both the registry and the [ModelScope](https://modelscope.cn) mirror of the same model and use
+the faster one (`MOYE_MODEL_SOURCE=ollama|modelscope` forces a choice).
+
+<details><summary>Manual setup</summary>
+
+Requirements: Node ≥ 22.13; a Python 3.12 venv at `.venv/` (or `../.venv-marker/`, or `MOYE_VENV`) with
+`pypdfium2 pillow`; optionally `surya-ocr` in that venv plus `llama-server` (`brew install llama.cpp`) for
+Local high-accuracy; LibreOffice for PPT/Word; Ollama for local AI.
+
+```bash
+npm install
+uv venv .venv --python 3.12 && uv pip install --python .venv/bin/python pypdfium2 pillow
+# optional: uv pip install --python .venv/bin/python surya-ocr && brew install llama.cpp
+./安装开机自启.command      # build + register the launchd services
+```
+</details>
 
 ## How it works
 
@@ -136,8 +154,9 @@ npm run lint
 
 ## Privacy
 
-Fast and High-accuracy modes never make a network request with your document. AI refine sends page
-images and the text-layer hint to the provider you chose, nothing else. Nothing is uploaded to us — there is no "us".
+Fast and High-accuracy modes never make a network request with your document. AI refine with Ollama
+stays on this machine too. AI refine with a cloud provider sends page images and the text-layer hint to
+the provider you chose, nothing else. Nothing is uploaded to us — there is no "us".
 
 ## License
 

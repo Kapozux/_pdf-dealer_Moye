@@ -1,6 +1,6 @@
 const serviceBase = "http://127.0.0.1:8765";
 
-export type AiProvider = "gemini" | "kimi" | "qwen" | "openrouter";
+export type AiProvider = "gemini" | "kimi" | "qwen" | "openrouter" | "ollama";
 export type AiScope = "all" | "review";
 export type AiModelOption = { id: string; label: string };
 
@@ -48,6 +48,10 @@ export type AiSettings = {
   openrouterKey?: string;
   openrouterModel: string;
   openrouterBaseUrl: string;
+  /** 本机 Ollama：没有 Key，「已配置」= 选了模型。页面图像不离开这台电脑。 */
+  ollamaConfigured: boolean;
+  ollamaModel: string;
+  ollamaBaseUrl: string;
   aiScope: AiScope;
   aiConfigured: boolean;
   /**
@@ -87,6 +91,9 @@ export const defaultAiSettings: AiSettings = {
   openrouterKey: "",
   openrouterModel: "google/gemini-2.5-flash",
   openrouterBaseUrl: "https://openrouter.ai/api/v1",
+  ollamaConfigured: false,
+  ollamaModel: "",
+  ollamaBaseUrl: "http://127.0.0.1:11434",
   aiScope: "all",
   aiConfigured: false,
   autoTag: true,
@@ -123,7 +130,8 @@ export async function testAiSettings(settings: AiSettings) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(settings),
   });
-  return parseResponse<{ ok: boolean; provider: AiProvider; model: string }>(response);
+  // balance 只有 OpenRouter 会带：已用美元 / 上限（null = 无上限）
+  return parseResponse<{ ok: boolean; provider: AiProvider; model: string; balance?: { usage: number; limit: number | null } }>(response);
 }
 
 export async function fetchAiModels(settings: AiSettings) {
@@ -133,4 +141,59 @@ export async function fetchAiModels(settings: AiSettings) {
     body: JSON.stringify(settings),
   });
   return parseResponse<{ provider: AiProvider; models: AiModelOption[] }>(response);
+}
+
+/** 这次 AI 精校的页面图像会不会离开这台电脑：只走本机 Ollama 时不会。 */
+export function aiStaysLocal(settings: AiSettings) {
+  const channels = settings.multiChannel ? settings.activeChannels ?? [] : [settings.provider];
+  return channels.length > 0 && channels.every((provider) => provider === "ollama");
+}
+
+// ===== 「设置 → 环境」：组件检测与一键补装（服务端 server/setup.mjs） =====
+
+export type SetupComponent = "python" | "surya" | "browser" | "libreoffice" | "ollama" | "ollama-model";
+export type SetupTask = {
+  name: SetupComponent;
+  model?: string;
+  running: boolean;
+  ok: boolean | null;
+  lines: string[];
+  startedAt: number;
+  finishedAt: number | null;
+  progress?: { completed: number; total: number } | null;
+};
+export type OllamaModelInfo = { id: string; sizeBytes: number; vision: boolean; thinking?: boolean };
+export type ModelSource = "ollama" | "modelscope";
+export type SetupStatus = {
+  /** 模型下载源测速（server/setup.mjs）：官方库在一些网络上几乎下不动，魔搭有同一模型的镜像 */
+  modelSource: {
+    probing: boolean;
+    official: number | null;
+    modelscope: number | null;
+    recommended: ModelSource;
+    mirrors: Record<string, string>;
+  };
+  components: {
+    python: { ok: boolean; path: string };
+    surya: { ok: boolean; package: boolean; llamaServer: string | null };
+    browser: { ok: boolean };
+    libreoffice: { ok: boolean; path: string | null };
+    ollama: { ok: boolean; reachable: boolean; installed: boolean; version: string | null; models: OllamaModelInfo[]; recommended: string; memGb: number; error: string | null };
+    ai: { ok: boolean; provider: AiProvider; ollamaModel: string };
+  };
+  tasks: Partial<Record<SetupComponent, SetupTask>>;
+};
+
+export async function fetchSetup() {
+  const response = await fetch(`${serviceBase}/api/setup`);
+  return parseResponse<SetupStatus>(response);
+}
+
+export async function installComponent(component: SetupComponent, model?: string) {
+  const response = await fetch(`${serviceBase}/api/setup/install`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ component, model }),
+  });
+  return parseResponse<SetupTask>(response);
 }

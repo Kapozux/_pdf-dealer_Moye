@@ -24,6 +24,12 @@ export type PageResult = {
   optionCount?: number;
   uncertain?: string[];
   aiAttempted?: boolean;
+  /** 这一页的墙钟耗时（毫秒）：AI 页含等渲染、等并发闸门；文字层页就是解析时间 */
+  durationMs?: number;
+  /** AI 页真正打向模型那次调用的耗时（毫秒），不含本机排队 */
+  modelMs?: number;
+  /** 这一页那次模型调用的用量；costUsd 为 null 表示模型没有价格表（未计价） */
+  usage?: { inputTokens: number; outputTokens: number; costUsd: number | null };
 };
 
 export type ConversionResult = {

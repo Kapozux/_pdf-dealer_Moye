@@ -15,6 +15,11 @@ const eslintConfig = defineConfig([
     "build/**",
     "public/**",
     "next-env.d.ts",
+    // 运行时数据和一键安装放进项目里的环境（自带浏览器、Node、Python），都不是我们的代码
+    "data/**",
+    ".runtime/**",
+    ".venv/**",
+    "tmp/**",
   ]),
   eslint.configs.recommended,
   ...tseslint.configs.recommended,

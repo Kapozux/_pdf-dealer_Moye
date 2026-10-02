@@ -344,6 +344,7 @@ async function extractFastPages(pdfDoc, onProgress) {
   const pages = [];
   for (let pageNumber = 1; pageNumber <= pdfDoc.numPages; pageNumber += 1) {
     onProgress(pageNumber - 1, pdfDoc.numPages, `读取第 ${pageNumber} 页文字层`);
+    const pageStarted = performance.now();
     const page = await pdfDoc.getPage(pageNumber);
     const content = await page.getTextContent();
     const items = [];
@@ -372,6 +373,7 @@ async function extractFastPages(pdfDoc, onProgress) {
       reasons,
       formulaCount: countFormulas(markdown),
       optionCount: countOptions(markdown),
+      durationMs: Math.round(performance.now() - pageStarted),
     });
     onProgress(pageNumber, pdfDoc.numPages, `第 ${pageNumber} 页完成`);
   }
@@ -380,6 +382,9 @@ async function extractFastPages(pdfDoc, onProgress) {
 
 function validateAiPage(draft, refined) {
   const failures = [];
+  // 模型明确回答「这一页没有可提取的文字」时，下面每条校验（空白、比初稿短、
+  // 丢公式）都会误判成失败。这是一个正常结论，直接放行，由调用方标成 noText。
+  if (refined.noText) return { failures, finalFormulaCount: 0, finalOptionCount: 0 };
   const draftLength = visibleLength(draft.markdown);
   const finalLength = visibleLength(refined.markdown ?? "");
   const finalFormulaCount = countFormulas(refined.markdown ?? "");
@@ -397,7 +402,34 @@ function validateAiPage(draft, refined) {
   return { failures, finalFormulaCount, finalOptionCount };
 }
 
-function assembleResult(title, mode, pageCount, pages, startedMs) {
+/**
+ * 「回退页」：这一页交给过模型，但最终没采用模型的结果——调用失败回退了文字层，
+ * 或结果没过 validateAiPage。noText（模型说这页本来没字）算成功，不算回退。
+ * 前端「只重跑回退页」按钮的计数和服务端筛选共用这一个定义（app/page.tsx 的 isFallbackPage 是它的镜像）。
+ */
+export function isFallbackPage(page) {
+  return Boolean(page?.aiAttempted) && page?.method !== "ai";
+}
+
+/** refineOne 写进 reasons 的几种前缀；重跑前要从初稿里剥掉（见 refineExisting）。 */
+function isAiReason(reason) {
+  return /^(AI 识别失败|AI 结果未通过程序校验|AI 检测：|模型标记不确定：|结果中仍有无法辨认的符号)/.test(String(reason));
+}
+
+/** 图片任务转成 PDF 之后仍然是「第 N 张图」，正文里写「PDF 第 1 页」会让人莫名其妙。 */
+function pageHeading(pageNumber, pageNoun) {
+  return pageNoun === "图" ? `## 第 ${pageNumber} 张图` : `## PDF 第 ${pageNumber} 页`;
+}
+
+function emptyPageNote(page, pageNoun) {
+  const subject = pageNoun === "图" ? "这张图" : "此页";
+  if (page.noText) {
+    return `_[AI 检测：${subject}没有可提取的文字${page.note ? `（${page.note}）` : ""}。]_`;
+  }
+  return pageNoun === "图" ? "_[未检测到文字，请查看原图。]_" : "_[此页未检测到文字，请查看原始 PDF。]_";
+}
+
+function assembleResult(title, mode, pageCount, pages, startedMs, pageNoun = "页") {
   const aiPages = pages.filter((page) => page.method === "ai").length;
   const provenance =
     mode === "ai"
@@ -409,12 +441,12 @@ function assembleResult(title, mode, pageCount, pages, startedMs) {
     [
       `# ${escapeMarkdown(title)}`,
       "",
-      `> 由墨页转换，共 ${pageCount} 页。${provenance}`,
+      `> 由墨页转换，共 ${pageCount} ${pageNoun === "图" ? "张图" : "页"}。${provenance}`,
       "",
       ...pages.flatMap((page) => [
-        `## PDF 第 ${page.page} 页`,
+        pageHeading(page.page, pageNoun),
         "",
-        page.markdown || "_[此页未检测到文字，请查看原始 PDF。]_",
+        page.markdown || emptyPageNote(page, pageNoun),
         "",
         "---",
         "",
@@ -467,20 +499,37 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
    * @param {(page:number)=>Promise<string>} getImage 取该页 base64 JPEG（按需渲染，见 refineWithAi）
    */
   async function refineOne(draft, getImage, rescue = false) {
+    // 逐页计时，两段分开记：durationMs 是这一页从排上队到出结果的墙钟
+    //（含等渲染、等 aiGate 闸门），modelMs 只算真正打向模型的那次调用。
+    // 两者差得大 = 在本机排队，差得小而 modelMs 大 = 上游慢，看结果页就能分清。
+    const startedAt = performance.now();
+    let modelMs;
+    const timed = (result) => ({
+      ...result,
+      durationMs: Math.round(performance.now() - startedAt),
+      ...(modelMs !== undefined ? { modelMs } : {}),
+    });
     try {
       const imageBase64 = await getImage(draft.page);
       if (!imageBase64) throw new Error("页面图像生成失败。");
       // 过全局闸：并发上限约束的是「所有任务合计在飞的请求数」，不是单份文档的
-      const refined = await aiGate.run(() => refinePage({
-        page: draft.page,
-        draft: draft.markdown,
-        imageBase64,
-        mimeType: "image/jpeg",
-        rescue,   // 补救轮：只试一次、超时更短，失败就痛快回退
-      }));
+      const refined = await aiGate.run(async () => {
+        const callStarted = performance.now();
+        try {
+          return await refinePage({
+            page: draft.page,
+            draft: draft.markdown,
+            imageBase64,
+            mimeType: "image/jpeg",
+            rescue,   // 补救轮：只试一次、超时更短，失败就痛快回退
+          });
+        } finally {
+          modelMs = Math.round(performance.now() - callStarted);
+        }
+      });
       const validation = validateAiPage(draft, refined);
       if (validation.failures.length) {
-        return {
+        return timed({
           ...draft,
           rawMarkdown: draft.markdown,
           aiAttempted: true,
@@ -488,12 +537,37 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
           reasons: [...draft.reasons, `AI 结果未通过程序校验：${validation.failures.join("；")}`],
           model: refined.model,
           provider: refined.provider,
-        };
+          ...(refined.usage ? { usage: refined.usage } : {}),
+        });
+      }
+      if (refined.noText) {
+        // 「图里就是没有字」——照实记下来，不要回退文字层假装识别过。
+        // status 仍走 review，是为了让它出现在结果页的「需复核」清单里：
+        // 用户要的正是这条提示，而不是一页空白。
+        return timed({
+          page: draft.page,
+          markdown: "",
+          rawMarkdown: draft.markdown,
+          charCount: 0,
+          lineCount: 0,
+          method: "ai",
+          status: "review",
+          noText: true,
+          note: refined.note ?? "",
+          reasons: [`AI 检测：未发现可提取的文字${refined.note ? `（${refined.note}）` : ""}`],
+          model: refined.model,
+          provider: refined.provider,
+          formulaCount: 0,
+          optionCount: 0,
+          uncertain: [],
+          aiAttempted: true,
+          ...(refined.usage ? { usage: refined.usage } : {}),
+        });
       }
       const uncertain = refined.uncertain ?? [];
       const reasons = [...uncertain.map((item) => `模型标记不确定：${item}`)];
       if (refined.markdown.includes("[unclear]")) reasons.push("结果中仍有无法辨认的符号");
-      return {
+      return timed({
         page: draft.page,
         markdown: refined.markdown.trim(),
         rawMarkdown: draft.markdown,
@@ -508,12 +582,14 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
         optionCount: validation.finalOptionCount,
         uncertain,
         aiAttempted: true,
-      };
+        // 这次调用的 token / 美元（provider 路径记账时顺手带回来的；完整账在 usage.db）
+        ...(refined.usage ? { usage: refined.usage } : {}),
+      });
     } catch (error) {
       // 以前这里静默吞掉：AI 失败只体现为「某页回退了文字层」，日志里一个字都没有，
       // 排查时只能靠猜。失败原因是唯一能区分「超时 / 限流 / 认证 / 格式」的线索。
       console.warn(`[AI失败] 第 ${draft.page} 页：${String(error?.message ?? error).slice(0, 160)}`);
-      return {
+      return timed({
         ...draft,
         rawMarkdown: draft.markdown,
         aiAttempted: true,
@@ -525,19 +601,27 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
             ? `AI 识别失败，已回退 PDF 文字层：${error?.message ?? "未知错误"}`
             : `AI 识别失败，且此页没有文字层可回退：${error?.message ?? "未知错误"}`,
         ],
-      };
+      });
     }
   }
 
-  async function refineWithAi(pdfPath, drafts, onProgress, checkpoint = null) {
+  /**
+   * @param {Map<number, object>} keep  调用方已经决定「原样保留」的页（page → 该页结果）。
+   *   「只重跑回退页」用它把上次成功的 AI 页直接带过来，不再渲染、不再调模型；
+   *   与逐页存档走同一条路径，存档（续跑）优先级更高——同一页两边都有时以存档为准。
+   */
+  async function refineWithAi(pdfPath, drafts, onProgress, checkpoint = null, keep = new Map()) {
     const settings = await loadSettings();
     if (!settings.aiConfigured) {
       throw new Error("AI 精校尚未配置。请点击右上角“设置”，填写当前服务的 API Key。");
     }
     // 重启续跑：已经存档的页直接拿来用，不重新调模型也不重新渲染
-    const finishedPages = checkpoint ? await checkpoint.load() : new Map();
-    if (finishedPages.size) {
-      onProgress(finishedPages.size, drafts.length, `续跑：已有 ${finishedPages.size} 页存档，跳过`);
+    const archivedPages = checkpoint ? await checkpoint.load() : new Map();
+    const finishedPages = new Map([...keep, ...archivedPages]);
+    if (archivedPages.size) {
+      onProgress(finishedPages.size, drafts.length, `续跑：已有 ${archivedPages.size} 页存档，跳过`);
+    } else if (keep.size) {
+      onProgress(finishedPages.size, drafts.length, `保留 ${keep.size} 页上次已成功的 AI 结果`);
     }
     // 注意：初稿现在来自文字层，大多数页会是 "good"。若仍按 review 过滤，
     // 选了 AI 却几乎没有页面被精校，所以 aiScope=all 时一律精校。
@@ -666,7 +750,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
   }
 
   /** 一份 PDF → ConversionResult。onProgress(page, total, detail) */
-  async function convertPdf(pdfPath, title, mode, onProgress = () => {}, checkpoint = null) {
+  async function convertPdf(pdfPath, title, mode, onProgress = () => {}, checkpoint = null, { pageNoun = "页" } = {}) {
     const started = performance.now();
     let pages;
     let total;
@@ -690,15 +774,28 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
       total = await pdfPageCount(pdfPath);
       pages = await convertWithSurya(pdfPath, total, onProgress);
     }
-    return assembleResult(title, mode, total, pages, started);
+    return assembleResult(title, mode, total, pages, started, pageNoun);
   }
 
-  /** 复用 Library 里已有的本地初稿，只重跑 AI 精校。 */
-  async function refineExisting(pdfPath, title, previous, onProgress = () => {}, checkpoint = null) {
+  /**
+   * 复用 Library 里已有的本地初稿，只重跑 AI 精校。
+   *
+   * @param {object} [options]
+   * @param {"all"|"fallback"} [options.only]  "fallback" = 只重跑上次 AI 没成功的页
+   *   （调用失败回退文字层、或结果没过校验），上次成功的 AI 页原样保留。
+   *   加它是因为一份 912 页的书有 409 页因上游超时回退，而「重新精校」会把 503 页
+   *   已经好了的也再过一遍模型——多花一倍的钱和时间，还可能把好页跑坏。
+   */
+  async function refineExisting(pdfPath, title, previous, onProgress = () => {}, checkpoint = null, { pageNoun = "页", only = "all" } = {}) {
     const started = performance.now();
     const pageCount = await pdfPageCount(pdfPath);
     if (pageCount !== previous.pageCount) {
       throw new Error("原 PDF 页数与 Library 记录不一致，无法复用初稿。");
+    }
+    const keep = new Map();
+    if (only === "fallback") {
+      for (const page of previous.pages) if (!isFallbackPage(page)) keep.set(page.page, page);
+      if (keep.size === previous.pages.length) throw new Error("没有回退的页面需要重跑。");
     }
     const drafts = previous.pages.map((page) => {
       const markdown = page.rawMarkdown ?? page.markdown;
@@ -710,14 +807,17 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
         aiAttempted: false,
         model: undefined,
         provider: undefined,
+        // 上一轮 AI 留下的原因不能带进初稿：refineOne 失败时会在 draft.reasons 后面
+        // 追加，重跑几次就叠几条「AI 识别失败」，逐页质量里看起来像失败了好几次
+        reasons: (page.reasons ?? []).filter((reason) => !isAiReason(reason)),
         formulaCount: countFormulas(markdown),
         optionCount: countOptions(markdown),
         charCount: visibleLength(markdown),
         lineCount: markdown ? markdown.split(/\n+/).length : 0,
       };
     });
-    const pages = await refineWithAi(pdfPath, drafts, onProgress, checkpoint);
-    return assembleResult(title, "ai", pageCount, pages, started);
+    const pages = await refineWithAi(pdfPath, drafts, onProgress, checkpoint, keep);
+    return assembleResult(title, "ai", pageCount, pages, started, pageNoun);
   }
 
   return { convertPdf, refineExisting };

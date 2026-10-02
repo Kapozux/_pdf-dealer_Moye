@@ -2,7 +2,7 @@
 
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
-import { createReadStream, createWriteStream } from "node:fs";
+import { createReadStream, createWriteStream, existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
@@ -12,15 +12,32 @@ import { randomUUID } from "node:crypto";
 import { createZip, safeEntryName } from "./server/zip.mjs";
 import { JobStore } from "./server/jobstore.mjs";
 import { JobQueue, EventHub } from "./server/queue.mjs";
-import { createConverter, gateStats } from "./server/convert.mjs";
+import { createConverter, gateStats, isFallbackPage } from "./server/convert.mjs";
 import { createRenderer } from "./server/render.mjs";
 import { createOfficeConverter, isOfficeFile } from "./server/office2pdf.mjs";
+import { createImageConverter, isImageFile } from "./server/image2pdf.mjs";
+import { createImageBookBuilder, decodePartName } from "./server/images2pdf.mjs";
+import { stripSourceExtension } from "./server/filenames.mjs";
+import { bundledHeadlessShell, forgetChromePath, markdownToPdf, markdownTitle, pdfGateStats } from "./server/md2pdf.mjs";
+import { createSetup, findSoffice } from "./server/setup.mjs";
 import { AdaptivePacer } from "./server/pacer.mjs";
+import { createReflect } from "./server/reflect.mjs";
+import { createUsage } from "./server/usage.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
-const surya = resolve(root, "../.venv-marker/bin/surya_ocr");
+// Python 环境（pypdfium2 渲染页面、Pillow 处理图片、可选的 Surya）。
+// 老安装在仓库外的 ../.venv-marker；一键安装（install.sh）建在仓库里的 .venv，
+// 不往用户目录里乱放东西。MOYE_VENV 可以指到别处。
+const venv = process.env.MOYE_VENV
+  ? resolve(process.env.MOYE_VENV)
+  : [resolve(root, ".venv"), resolve(root, "../.venv-marker")].find((dir) => existsSync(join(dir, "bin/python")))
+    ?? resolve(root, ".venv");
+const venvPython = join(venv, "bin/python");
+const surya = join(venv, "bin/surya_ocr");
 const jobRoot = resolve(root, "tmp/pdfs/moye-web-job-");
 const settingsPath = resolve(root, "settings.local.json");
+// 用量记账（data/usage.db）：四条 provider 路径拿到响应体后各记一笔，归属靠 usage.scope 传
+const usage = createUsage(resolve(root, "data"));
 const port = Number(process.env.MOYE_PORT) || 8765;
 const maxJsonBytes = 24 * 1024 * 1024;
 
@@ -45,6 +62,10 @@ const defaultSettings = {
   // 数学/理科 PDF 用 kimi，纯文字文档换 qwen3.7-flash 可以快一倍、便宜 20 倍。
   openrouterModel: "moonshotai/kimi-k2.6",
   openrouterBaseUrl: "https://openrouter.ai/api/v1",
+  // 本机 Ollama：不要 Key、图片不出这台机器。模型为空 = 没配置（用户得先下一个视觉模型）。
+  // 地址是 Ollama 的根地址（走它的原生 /api/chat，不走 /v1 兼容层，理由见 callOllama）。
+  ollamaModel: "",
+  ollamaBaseUrl: "http://127.0.0.1:11434",
   aiScope: "all",
   // 转换完成后自动打标签（会把文档开头约 3000 字发给模型，本地模式也一样）。
   // 用户可关：顶栏的隐私标签按这个值说话，关了才能诚实地写"文件不上传"。
@@ -58,7 +79,7 @@ const defaultSettings = {
   channels: [],
 };
 
-const ALL_PROVIDERS = ["gemini", "kimi", "qwen", "openrouter"];
+const ALL_PROVIDERS = ["gemini", "kimi", "qwen", "openrouter", "ollama"];
 
 await mkdir(resolve(root, "tmp/pdfs"), { recursive: true });
 
@@ -74,7 +95,7 @@ function cors(response, request) {
   );
   response.setHeader("Vary", "Origin");
   // 漏加自定义头 = 浏览器直接拦掉整个请求（之前 x-mode 漏过一次，表现是提交任务毫无反应）
-  response.setHeader("Access-Control-Allow-Headers", "content-type,x-filename,x-mode,x-batch-id,x-batch-label");
+  response.setHeader("Access-Control-Allow-Headers", "content-type,x-filename,x-mode,x-batch-id,x-batch-label,x-session,x-index");
   response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
 }
 
@@ -82,6 +103,17 @@ function sendJson(response, status, payload) {
   // CORS 头已在请求入口按 Origin 设置好，这里不要再覆盖
   response.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
   response.end(JSON.stringify(payload));
+}
+
+function sendPdf(response, buffer, filename, extraHeaders = {}) {
+  cors(response);
+  response.writeHead(200, {
+    "Content-Type": "application/pdf",
+    "Content-Length": buffer.length,
+    "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(filename)}`,
+    ...extraHeaders,
+  });
+  response.end(buffer);
 }
 
 async function readJson(request, limit = maxJsonBytes) {
@@ -138,8 +170,9 @@ function mergeExtraKeys(input, previousValue) {
 }
 
 function normalizeSettings(input, previous = defaultSettings) {
-  const provider = ["gemini", "kimi", "qwen", "openrouter"].includes(input.provider) ? input.provider : "gemini";
-  const aiScope = input.aiScope === "review" ? "review" : "all";
+  const provider = ALL_PROVIDERS.includes(input.provider) ? input.provider : (previous.provider || "gemini");
+  // 没传就沿用：只带几个字段的 partial 请求（一键安装写 Ollama 模型）不该把「只精校可疑页」冲回「全部」
+  const aiScope = input.aiScope === "review" || input.aiScope === "all" ? input.aiScope : (previous.aiScope === "review" ? "review" : "all");
   return {
     provider,
     geminiKey: cleanString(input.geminiKey) || previous.geminiKey || "",
@@ -168,6 +201,9 @@ function normalizeSettings(input, previous = defaultSettings) {
     openrouterKey: cleanString(input.openrouterKey) || previous.openrouterKey || "",
     openrouterModel: cleanString(input.openrouterModel) || previous.openrouterModel || defaultSettings.openrouterModel,
     openrouterBaseUrl: cleanString(input.openrouterBaseUrl) || previous.openrouterBaseUrl || defaultSettings.openrouterBaseUrl,
+    // 模型名跟 Key 一样「没传就沿用」：partial 请求不能把已选的模型冲掉
+    ollamaModel: cleanString(input.ollamaModel) || previous.ollamaModel || "",
+    ollamaBaseUrl: cleanString(input.ollamaBaseUrl) || previous.ollamaBaseUrl || defaultSettings.ollamaBaseUrl,
     aiScope,
     autoTag: input.autoTag === undefined ? previous.autoTag !== false : Boolean(input.autoTag),
     multiChannel: Boolean(input.multiChannel ?? previous.multiChannel ?? defaultSettings.multiChannel),
@@ -242,6 +278,7 @@ function publicSettings(settings) {
         kimi: settings.kimiKey,
         qwen: settings.qwenKey,
         openrouter: settings.openrouterKey,
+        ollama: settings.ollamaModel,
       }[settings.provider]);
   return {
     provider: settings.provider,
@@ -267,6 +304,10 @@ function publicSettings(settings) {
     openrouterKeyMasked: maskedKey(settings.openrouterKey),
     openrouterModel: settings.openrouterModel,
     openrouterBaseUrl: settings.openrouterBaseUrl,
+    // Ollama 没有 Key 可打码：「已配置」= 选了模型。能不能连上是另一回事，看 /api/setup
+    ollamaConfigured: Boolean(settings.ollamaModel),
+    ollamaModel: settings.ollamaModel,
+    ollamaBaseUrl: settings.ollamaBaseUrl,
     aiScope: settings.aiScope,
     autoTag: settings.autoTag !== false,
     aiConfigured: activeConfigured,
@@ -320,10 +361,11 @@ Requirements:
 - Reconstruct the page in natural reading order. Preserve question numbers, answer choices A/B/C/D, headings, tables and captions.
 - Convert every visible mathematical expression to valid LaTeX. Use $...$ inline and $$...$$ for display equations.
 - Never solve questions, explain content, or invent missing text.
-- Put handwritten annotations in a final Markdown blockquote beginning with “手写批注：”.
+- Put handwritten annotations in a final Markdown blockquote beginning with “手写批注：”. Group them by ink colour, one line per colour, each line prefixed with the colour in Chinese in full-width brackets: 【红笔】, 【蓝笔】, 【黑笔】, 【铅笔】, 【荧光笔】 (say the colour, e.g. 【黄色荧光笔】). Use the same 【颜色】 prefix inline for any printed text set in a non-black colour when the colour carries meaning (e.g. a red answer key, a blue correction). Do not tag black or grey printed body text.
 - If a symbol truly cannot be read, write [unclear] instead of guessing.
+- If the page holds no extractable text at all (a photograph, an illustration, a blank page, an unlabelled diagram), do not invent or describe text: set "noText" to true, leave "markdown" empty, and say in "note" what the image actually is, in one short phrase (e.g. "photo of a cat", "blank page", "unlabelled circuit diagram"). Otherwise "noText" is false and "note" is "".
 - Return JSON only with this exact shape:
-  {"markdown":"...","formulaCount":0,"questionNumbers":["1"],"optionLabels":["A","B"],"uncertain":["brief note"]}
+  {"markdown":"...","formulaCount":0,"questionNumbers":["1"],"optionLabels":["A","B"],"uncertain":["brief note"],"noText":false,"note":""}
 
 LOCAL OCR DRAFT:
 `;
@@ -337,8 +379,12 @@ const refinementSchema = {
     questionNumbers: { type: "array", items: { type: "string" } },
     optionLabels: { type: "array", items: { type: "string" } },
     uncertain: { type: "array", items: { type: "string" } },
+    // 「这张图里根本没有字」是一个正常答案，不是失败。OpenAI 的 strict json_schema
+    // 要求 required 列全所有字段，所以这两个也进 required，模型没话说时给 false/""。
+    noText: { type: "boolean" },
+    note: { type: "string" },
   },
-  required: ["markdown", "formulaCount", "questionNumbers", "optionLabels", "uncertain"],
+  required: ["markdown", "formulaCount", "questionNumbers", "optionLabels", "uncertain", "noText", "note"],
 };
 
 function extractJson(text) {
@@ -353,17 +399,28 @@ function extractJson(text) {
   }
 }
 
-function normalizeAiResult(raw, provider, model) {
+function normalizeAiResult(raw, provider, model, used = null) {
   const markdown = cleanString(raw.markdown);
-  if (!markdown) throw new Error("模型返回了空白 Markdown。");
+  const note = cleanString(raw.note).slice(0, 200);
+  // 模型说「这页没有可提取的文字」时，空 markdown 就是正确答案。以前这里一律抛错，
+  // 一张风景照会被记成「AI 识别失败，已回退文字层」，用户根本分不清是模型炸了
+  // 还是图里本来就没字（仓库规矩第四条：失败路径要留下真实原因，这条同样适用于
+  // 「其实没失败」）。只有既没内容、也没给出说明时才算真失败。
+  const noText = raw.noText === true || (!markdown && Boolean(note));
+  if (!markdown && !noText) throw new Error("模型返回了空白 Markdown。");
   return {
     markdown,
+    noText,
+    note,
     formulaCount: Number.isFinite(raw.formulaCount) ? Math.max(0, Math.round(raw.formulaCount)) : 0,
     questionNumbers: Array.isArray(raw.questionNumbers) ? raw.questionNumbers.map(String).slice(0, 200) : [],
     optionLabels: Array.isArray(raw.optionLabels) ? raw.optionLabels.map(String).slice(0, 400) : [],
     uncertain: Array.isArray(raw.uncertain) ? raw.uncertain.map(String).filter(Boolean).slice(0, 30) : [],
     provider,
     model,
+    // 这次调用的用量（token / 美元），由 usage.record* 返回；逐页写进结果，结果页能看每页花了多少。
+    // 完整账在 usage.db，这里只是随手带一份，没有就不带。
+    ...(used ? { usage: { inputTokens: used.inputTokens, outputTokens: used.outputTokens, costUsd: used.costUsd } } : {}),
   };
 }
 
@@ -425,6 +482,8 @@ const PROVIDER_TIMEOUT_MS = {
   qwen: Number(process.env.MOYE_TIMEOUT_QWEN) || 45000,
   kimi: Number(process.env.MOYE_TIMEOUT_KIMI) || 45000,
   gemini: Number(process.env.MOYE_TIMEOUT_GEMINI) || 75000,
+  // 本机小模型：实测正常页 5～15s（2026-09-24，只测过一份 4 页文档），180s 是留给慢机器和死循环重试的余量
+  ollama: Number(process.env.MOYE_TIMEOUT_OLLAMA) || 180000,
 };
 const providerTimeout = (provider) => PROVIDER_TIMEOUT_MS[provider] ?? PAGE_CALL_TIMEOUT_MS;
 
@@ -517,9 +576,11 @@ async function callGemini(settings, imageBase64, mimeType, draft, testOnly = fal
           },
         }),
       }, opts.attempts ?? 3, testOnly ? 60000 : (opts.timeoutMs ?? PAGE_CALL_TIMEOUT_MS), deadline);
+      // 先记账再解析：响应回来就已经花了钱，JSON 坏了也得算
+      const used = usage.recordGemini(payload, model, { page: opts.page });
       const text = payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
       if (testOnly) return { ok: true, provider: "gemini", model };
-      return normalizeAiResult(extractJson(text), "gemini", model);
+      return normalizeAiResult(extractJson(text), "gemini", model, used);
     } catch (error) {
       lastError = error;
     }
@@ -649,7 +710,7 @@ async function callOpenRouterFailover(settings, input, opts = {}) {
           { ...base, model, pinProvider: pinned },
           input.imageBase64 || "", input.mimeType || "image/jpeg", input.draft || "", false,
           // 每家只给一次机会：失败就换人，不在同一家身上重试
-          { attempts: 1, timeoutMs: perTry, budgetMs: perTry + 2000 }
+          { attempts: 1, timeoutMs: perTry, budgetMs: perTry + 2000, page: opts.page }
         );
         noteModelSuccess(model);
         if (model !== base.model) {
@@ -722,6 +783,8 @@ async function callOpenAiCompatible(config, imageBase64, mimeType, draft, testOn
       // 少数端点（如 stepfun）强制推理，会返回 "Reasoning is mandatory"，
       // 那种情况下退回不带该字段重发一次（见 callOpenAiCompatible 的兜底）。
       ...(config.provider === "openrouter" && !config.noReasoningToggle ? { reasoning: { enabled: false } } : {}),
+      // OpenRouter 只有带这个才会在 usage 里回实价（usage.cost），否则只回 token 数
+      ...(config.provider === "openrouter" ? { usage: { include: true } } : {}),
       messages: [{ role: "user", content }],
     }),
   }, opts.attempts ?? 3, testOnly ? 60000 : (opts.timeoutMs ?? PAGE_CALL_TIMEOUT_MS),
@@ -729,18 +792,185 @@ async function callOpenAiCompatible(config, imageBase64, mimeType, draft, testOn
     // 强制推理的端点：记下来，之后这个模型都不再带该字段，然后立刻重发一次。
     if (config.provider === "openrouter" && !config.noReasoningToggle && /reasoning is mandatory/i.test(String(error?.message))) {
       forcedReasoningModels.add(config.model);
-      return callOpenAiCompatible({ ...config, noReasoningToggle: true }, imageBase64, mimeType, draft, testOnly)
+      return callOpenAiCompatible({ ...config, noReasoningToggle: true }, imageBase64, mimeType, draft, testOnly, opts)
         .then((result) => ({ __done: result }));
     }
     throw error;
   });
   if (payload?.__done) return payload.__done;
+  // 先记账再解析：响应回来就已经花了钱，JSON 坏了也得算
+  const used = usage.recordOpenAi(payload, config.provider, config.model, { page: opts.page });
   if (testOnly) return { ok: true, provider: config.provider, model: payload?.model || config.model };
   const responseContent = payload?.choices?.[0]?.message?.content || "";
   const text = Array.isArray(responseContent)
     ? responseContent.map((part) => typeof part === "string" ? part : part?.text || "").join("")
     : responseContent;
-  return normalizeAiResult(extractJson(text), config.provider, payload?.model || config.model);
+  return normalizeAiResult(extractJson(text), config.provider, payload?.model || config.model, used);
+}
+
+// ===== 本机 Ollama =====
+//
+// 走 Ollama 原生的 /api/chat，而不是它的 OpenAI 兼容层 /v1/chat/completions：
+// 兼容层不能设上下文长度（num_ctx），而 Ollama 默认的上下文只有几千 token——
+// 一页图像约 2–3k token，再加文字层初稿和提示词，会被**静默截掉前面的内容**，
+// 模型看不到提示词也不报错（仓库规矩第四条）。原生接口还能直接给 JSON Schema（format）。
+//
+// 下面这些数字是按 8B 级视觉模型 + 16GB 内存的 Mac 估的，**还没有实测**，
+// 跑过真实文档后按规矩改成实测值：
+//   num_ctx 16384      ≈ 图像 3k + 提示 1k + 初稿 ≤6k + 输出 ≤6k；8B 模型 KV 缓存约 2.4GB
+//   初稿截到 6000 字   云端给 60000 字，本机上下文装不下
+//   单次超时 180s      本机小模型一页几十秒，给足余量；云端那套 30s 会把每页都判超时
+//   并发 1             Ollama 默认一个模型只并行跑 1 路（OLLAMA_NUM_PARALLEL），
+//                      多发只是在它那边排队，排队时间照样算进我们的超时
+const OLLAMA_NUM_CTX = Number(process.env.MOYE_OLLAMA_NUM_CTX) || 16384;
+const OLLAMA_DRAFT_CHARS = Number(process.env.MOYE_OLLAMA_DRAFT_CHARS) || 6000;
+const OLLAMA_NUM_PREDICT = Number(process.env.MOYE_OLLAMA_NUM_PREDICT) || 6144;
+
+const ollamaRoot = (settings) => String(settings.ollamaBaseUrl || defaultSettings.ollamaBaseUrl)
+  .replace(/\/+$/, "").replace(/\/v1$/, "");   // 有人会照 OpenAI 习惯填 …/v1，这里容错
+
+/** 连接失败时 fetch 只说 "fetch failed"，换成人话。 */
+function ollamaUnreachable(settings, error) {
+  const cause = String(error?.cause?.code || error?.message || error);
+  return new Error(`连不上本机 Ollama（${ollamaRoot(settings)}）：${cause}。请确认 Ollama 已经打开（菜单栏有它的图标）。`);
+}
+
+/** 模型能力（vision / thinking）缓存：每页都去问一次 /api/show 没必要。 */
+const ollamaCapabilities = new Map();   // `${root}|${model}` → string[]
+
+async function ollamaModelCapabilities(settings, model) {
+  const cacheKey = `${ollamaRoot(settings)}|${model}`;
+  if (ollamaCapabilities.has(cacheKey)) return ollamaCapabilities.get(cacheKey);
+  let response;
+  try {
+    response = await fetchWithTimeout(`${ollamaRoot(settings)}/api/show`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model }),
+    }, 15000);
+  } catch (error) {
+    throw ollamaUnreachable(settings, error);
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (response.status === 404) throw new Error(`本机 Ollama 里还没有模型 ${model}。在「设置 → 环境」里一键下载，或终端运行：ollama pull ${model}`);
+  if (!response.ok) throw new Error(`Ollama 读取模型信息失败（${response.status}）：${String(payload?.error || "").slice(0, 200)}`);
+  // 老版本 Ollama（< 0.6）不回 capabilities，只能按名字猜；猜错了真跑时模型会自己报错
+  const capabilities = Array.isArray(payload.capabilities)
+    ? payload.capabilities
+    : [/vl|vision|llava|minicpm-v|gemma3|moondream|granite.*vision|ocr/i.test(model) ? "vision" : "completion"];
+  ollamaCapabilities.set(cacheKey, capabilities);
+  return capabilities;
+}
+
+async function callOllama(settings, imageBase64, draft, testOnly = false, opts = {}) {
+  const model = settings.ollamaModel;
+  if (!model) throw new Error("请先在设置里选择一个 Ollama 视觉模型。");
+  // 「测试连接」必须真的去连一次：走缓存的话 Ollama 关了也会报成功
+  if (testOnly) ollamaCapabilities.delete(`${ollamaRoot(settings)}|${model}`);
+  const capabilities = await ollamaModelCapabilities(settings, model);
+  if (!capabilities.includes("vision")) {
+    throw new Error(`Ollama 模型 ${model} 不支持图片输入，AI 精校需要视觉模型（例如 qwen3-vl:8b-instruct、qwen2.5vl、gemma3）。`);
+  }
+  // 会思考的模型不能用。2026-09-24 实测（Ollama 0.34.3、官方 qwen3-vl:8b，它就是思考版）：
+  //   think:false + JSON Schema → 回答被写进 message.thinking、content 为空，而且只有半截（275 token 就停）
+  //   think:false、不给格式    → think:false 被无视，照样先想 1.4 万字
+  // 同一页换成 Instruct 版（qwen3-vl:8b-instruct / 魔搭 Qwen3-VL-8B-Instruct-GGUF）一次就出合法 JSON。
+  // 在「测试连接」就挡住，别等整份文档每页都回退了才发现。
+  if (capabilities.includes("thinking")) {
+    throw new Error(`Ollama 模型 ${model} 是会「思考」的版本，Ollama 关不掉它的思考，结构化输出会坏掉。请换成 Instruct 版，例如 qwen3-vl:8b-instruct。`);
+  }
+  if (testOnly) return { ok: true, provider: "ollama", model };
+  const chat = async (sampling) => {
+    try {
+      return await postWithRetries(`${ollamaRoot(settings)}/api/chat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model,
+          stream: false,
+          format: refinementSchema,
+          options: { temperature: 0, ...sampling, num_ctx: OLLAMA_NUM_CTX, num_predict: OLLAMA_NUM_PREDICT },
+          messages: [{
+            role: "user",
+            content: `${refinementPrompt}${draft.slice(0, OLLAMA_DRAFT_CHARS)}`,
+            images: [imageBase64],
+          }],
+        }),
+      }, opts.attempts ?? 2, opts.timeoutMs ?? providerTimeout("ollama"), Date.now() + (opts.budgetMs ?? PAGE_TIME_BUDGET_MS));
+    } catch (error) {
+      if (/fetch failed|ECONNREFUSED/i.test(String(error?.message)) || error?.cause?.code === "ECONNREFUSED") throw ollamaUnreachable(settings, error);
+      throw error;
+    }
+  };
+  let payload = await chat({});
+  let used = usage.recordOllama(payload, model, { page: opts.page });
+  // 输出到上限几乎都是「死循环」而不是页面真有那么多字。2026-09-24 实测（魔搭 Qwen3-VL-8B-Instruct Q4_K_M，
+  // 一页 IB 物理作业，云端结果只有 372 字）：temperature 0 时在 JSON 字符串里无限输出 "\n"，写满 6144 token
+  // 耗时约 100s；温度 0 是确定性的，补救轮原样重放又白等 167s。同一页换采样参数（各跑 2～4 次）：
+  //   repeat_penalty 1.1        → 2.4s 出合法 JSON，但会把 JSON 里的 "\\frac" 写成 "\frac"，解析后公式变成「换页符+rac」，不能用
+  //   presence_penalty 1.5（温度仍 0）→ 3.5s 出合法 JSON、公式完好、结果确定；代价是会吃掉选项之间的空行、偶尔丢页脚
+  // 所以主轮保持原参数（空行对网页渲染有用），只有撞上限时才当场用 presence_penalty 重试一次。
+  if (payload?.done_reason === "length") {
+    console.warn(`[Ollama循环] 第 ${opts.page ?? "?"} 页输出写满 ${OLLAMA_NUM_PREDICT} token（多半是重复输出），换 presence_penalty 重试一次`);
+    payload = await chat({ presence_penalty: 1.5 });
+    used = usage.recordOllama(payload, model, { page: opts.page });
+  }
+  // 兜底：能力表没标 thinking、却还是把回答写进了思考字段（见上面的实测），说出真实原因
+  if (!String(payload?.message?.content || "").trim() && payload?.message?.thinking) {
+    throw new Error(`Ollama 模型 ${model} 把回答写进了「思考」字段、正文为空。请换成 Instruct 版模型。`);
+  }
+  // 输出到上限被截断时 JSON 是半截的，解析报错会误导人去查模型——先把真实原因说出来
+  if (payload?.done_reason === "length") {
+    throw new Error(`Ollama 输出达到上限（${OLLAMA_NUM_PREDICT} token）被截断：模型在重复输出，换采样参数重试也没停下来（也可能这一页内容确实太多，可调大 MOYE_OLLAMA_NUM_PREDICT）。`);
+  }
+  return normalizeAiResult(extractJson(String(payload?.message?.content || "")), "ollama", payload?.model || model, used);
+}
+
+/** 纯文本调用（打标签 / 回顾叙事）。 */
+async function callOllamaText(settings, prompt, { model = null, maxTokens = 200, timeoutMs = 30000 } = {}) {
+  const name = model || settings.ollamaModel;
+  if (!name) throw new Error("Ollama 未选择模型。");
+  let payload;
+  try {
+    payload = await postWithRetries(`${ollamaRoot(settings)}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model: name,
+        stream: false,
+        format: "json",
+        options: { temperature: 0.3, num_ctx: 8192, num_predict: Math.max(maxTokens, 512) },
+        ...((await ollamaModelCapabilities(settings, name)).includes("thinking") ? { think: false } : {}),
+        messages: [{ role: "user", content: prompt }],
+      }),
+    // 本机模型第一次调用要先把几 GB 权重读进内存，给冷启动留时间
+    }, 1, Math.max(timeoutMs, 120000), Date.now() + Math.max(timeoutMs, 120000));
+  } catch (error) {
+    if (/fetch failed|ECONNREFUSED/i.test(String(error?.message))) throw ollamaUnreachable(settings, error);
+    throw error;
+  }
+  usage.recordOllama(payload, name);
+  return String(payload?.message?.content || "");
+}
+
+/** 本机已下载的模型，标出哪些能看图。 */
+async function listOllamaModels(settings) {
+  let response;
+  try {
+    response = await fetchWithTimeout(`${ollamaRoot(settings)}/api/tags`, {}, 10000);
+  } catch (error) {
+    throw ollamaUnreachable(settings, error);
+  }
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(`Ollama 模型列表读取失败（${response.status}）。`);
+  const models = [];
+  for (const entry of payload.models || []) {
+    const id = String(entry.model || entry.name || "");
+    if (!id) continue;
+    const capabilities = await ollamaModelCapabilities(settings, id).catch(() => []);
+    models.push({ id, sizeBytes: Number(entry.size) || 0, vision: capabilities.includes("vision"), thinking: capabilities.includes("thinking") });
+  }
+  return models;
 }
 
 // 多渠道时各家的并发权重——决定页面按什么比例分给谁，以及总并发上限。
@@ -764,7 +994,12 @@ async function callOpenAiCompatible(config, imageBase64, mimeType, draft, testOn
 // 64 路曾经在「打一炮就停」的压测里 64/64 全过，但那是突发；持续几十分钟的
 // 真实批次里，64 路摊到 5 家就是每家 13 路，实测直接崩——某份 74 页文档
 // 主轮 74 页全失败。宁可 40 路全部跑通，也不要 64 路一半在超时。
-const DIRECT_PROVIDER_WEIGHTS = { openrouter: 8 * OPENROUTER_PROVIDERS.length, kimi: 8, qwen: 8 };
+const DIRECT_PROVIDER_WEIGHTS = {
+  openrouter: 8 * OPENROUTER_PROVIDERS.length, kimi: 8, qwen: 8,
+  // 本机 Ollama 默认一次只算一路（OLLAMA_NUM_PARALLEL），多发只会在它那边排队、吃掉超时。
+  // 用户若给 Ollama 调大了并行数，这里跟着调 MOYE_OLLAMA_CONCURRENCY。
+  ollama: Number(process.env.MOYE_OLLAMA_CONCURRENCY) || 1,
+};
 
 function geminiWeight(settings) {
   const projects = Math.max(1, Number(settings.geminiProjects) || 1);
@@ -780,7 +1015,8 @@ function channelWeight(provider, settings) {
  * 必须有 Key；此外若设了 channels 白名单，则只用白名单里的（空 = 全用）。
  */
 function configuredChannels(settings) {
-  const keys = { gemini: settings.geminiKey, kimi: settings.kimiKey, qwen: settings.qwenKey, openrouter: settings.openrouterKey };
+  // Ollama 没有 Key，「配好了」= 选了模型
+  const keys = { gemini: settings.geminiKey, kimi: settings.kimiKey, qwen: settings.qwenKey, openrouter: settings.openrouterKey, ollama: settings.ollamaModel };
   const allow = Array.isArray(settings.channels) && settings.channels.length ? settings.channels : null;
   return Object.entries(keys)
     .filter(([provider, key]) => Boolean(key) && (!allow || allow.includes(provider)))
@@ -822,12 +1058,19 @@ function directProviderConfig(provider, settings) {
 async function callProvider(provider, settings, input, testOnly) {
   // 补救轮只给一次机会、超时更短——那些页刚刚才卡死过，重复三轮只是重复绝望
   const perTry = providerTimeout(provider);
+  // 本机 Ollama 的补救轮不能用 25s：它正常一页就要几十秒，25s 等于必败。
+  // 云端补救短超时的理由（对面「收下不回」）在本机不成立，本机慢就是慢。
+  const rescueMs = provider === "ollama" ? perTry : RESCUE_TIMEOUT_MS;
   const opts = input.rescue
-    ? { attempts: RESCUE_ATTEMPTS, timeoutMs: RESCUE_TIMEOUT_MS, budgetMs: RESCUE_TIMEOUT_MS + 2000 }
+    ? { attempts: RESCUE_ATTEMPTS, timeoutMs: rescueMs, budgetMs: rescueMs + 2000 }
     // 按渠道给超时；总预算给足两轮，够它在同一家重试或换一家，但不至于无限拖
     : { timeoutMs: perTry, budgetMs: Math.max(PAGE_TIME_BUDGET_MS, perTry * 2) };
+  opts.page = input.page;   // 记账用：这笔花在第几页
   if (provider === "gemini") {
     return callGemini(settings, input.imageBase64 || "", input.mimeType || "image/jpeg", input.draft || "", testOnly, opts);
+  }
+  if (provider === "ollama") {
+    return callOllama(settings, input.imageBase64 || "", input.draft || "", testOnly, opts);
   }
   // OpenRouter 走换家逻辑；测试连接除外（那时要的是「这个 Key 通不通」）
   if (provider === "openrouter" && !testOnly) {
@@ -854,6 +1097,12 @@ async function callConfiguredModel(settings, input, testOnly = false) {
 }
 
 async function listConfiguredModels(settings) {
+  if (settings.provider === "ollama") {
+    // 只列能看图的：纯文本模型选了也跑不了精校
+    // 只列能看图、且不是思考版的（思考版在精校里用不了，见 callOllama）
+    const models = (await listOllamaModels(settings)).filter((model) => model.vision && !model.thinking);
+    return { provider: "ollama", models: models.map((model) => ({ id: model.id, label: `${model.id} · ${(model.sizeBytes / 1e9).toFixed(1)} GB` })) };
+  }
   if (settings.provider === "gemini") {
     if (!settings.geminiKey) throw new Error("请先在设置中填写 Gemini API Key。");
   settings = { ...settings, __key: settings.__key || nextGeminiKey(settings) };  // 指定 key 优先，否则轮询
@@ -913,57 +1162,75 @@ async function listConfiguredModels(settings) {
  * 这是明确的取舍，不是应该"修复"掉的疏漏。没配置任何 AI Key 时这个功能
  * 本来就调不动，直接跳过（返回 null），不算失败。
  */
-const TAG_PROMPT = (title, content) => `根据这份 PDF 转换出的文档内容，给它打 2-4 个简短的主题/类型标签（如：教材、试卷、论文、合同、小说、财报、计算机科学、数学、历史）。
+const CARD_PROMPT = (title, content) => `根据这份文档转换出的内容，生成用于列表卡片展示的元数据。
 
-标题：${title}
+原文件名（已去后缀）：${title}
 内容开头：
 ${content}
 
 严格输出 JSON，不要输出其他任何内容：
-{"tags": ["标签1","标签2"]}`;
+{
+  "title": "不超过18个字的标题，说清这份文档是什么，别照抄文件名",
+  "one_line": "一句话简介，不超过40字，让人不点开就知道大致内容",
+  "tags": ["2-4个简短的主题/类型标签，如：教材、试卷、论文、合同、小说、财报、计算机科学、数学、历史"],
+  "filename_meaningful": true或false
+}
+
+filename_meaningful 的判断标准：上面的原文件名本身是不是一个能说明内容的、人写的标题。
+像"A.2.10_MS_Circular_motion_exercise""高一物理必修一讲义"这种是 true；
+像"Screenshot 2026-09-08 at 7.21.49 PM""Note Sep 7""IMG_0001""scan_0012""文档""下载""a1b2c3d4"
+这种截图默认名、日期、序号、设备默认名、随机串是 false。
+title / one_line / tags 用与内容相同的语言输出（内容是英文就用英文，是中文就用中文）。`;
 
 /** 纯文本模型调用（打标签用），不带图像，走当前设置里选定的那一家 provider。 */
-async function callTextModel(settings, prompt) {
-  const deadline = Date.now() + 30000;
-  if (settings.provider === "gemini") {
+async function callTextModel(settings, prompt, { provider = settings.provider, model = null, maxTokens = 200, timeoutMs = 30000 } = {}) {
+  const deadline = Date.now() + timeoutMs;
+  if (provider === "gemini") {
     if (!settings.geminiKey) throw new Error("Gemini 未配置 Key。");
     const key = nextGeminiKey(settings) || settings.geminiKey;
-    const url = `${settings.geminiBaseUrl.replace(/\/$/, "")}/models/${encodeURIComponent(settings.geminiModel)}:generateContent`;
+    const url = `${settings.geminiBaseUrl.replace(/\/$/, "")}/models/${encodeURIComponent(model || settings.geminiModel)}:generateContent`;
     const payload = await postWithRetries(url, {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": key },
       body: JSON.stringify({
         contents: [{ role: "user", parts: [{ text: prompt }] }],
-        generationConfig: { temperature: 0.3, responseMimeType: "application/json" },
+        generationConfig: { temperature: 0.3, responseMimeType: "application/json", maxOutputTokens: Math.max(maxTokens, 1024) },
       }),
-    }, 2, 20000, deadline);
+    }, 2, Math.min(20000, timeoutMs), deadline);
+    usage.recordGemini(payload, model || settings.geminiModel);
     return payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
   }
-  const config = directProviderConfig(settings.provider, settings);
-  if (!config?.key) throw new Error(`${config?.label ?? settings.provider} 未配置 Key。`);
+  if (provider === "ollama") return callOllamaText(settings, prompt, { model, maxTokens, timeoutMs });
+  const config = directProviderConfig(provider, settings);
+  if (!config?.key) throw new Error(`${config?.label ?? provider} 未配置 Key。`);
   const payload = await postWithRetries(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Authorization: `Bearer ${config.key}` },
     body: JSON.stringify({
-      model: config.model,
+      model: model || config.model,
       // kimi-k2.6 直连锁死温度：关推理时必须是 0.6，不关推理必须是 1（实测两条路各自
       // 唯一允许值不同）。这里漏加过 thinking 字段，导致温度传 0.6 却没关推理，
       // 135 份补标签全部 400——修的时候两个字段必须配对着改，见 callOpenAiCompatible。
-      temperature: settings.provider === "kimi" ? 0.6 : 0.3,
+      temperature: provider === "kimi" ? 0.6 : 0.3,
       messages: [{ role: "user", content: prompt }],
-      ...(settings.provider !== "qwen" ? { response_format: { type: "json_object" } } : {}),
-      ...(settings.provider === "kimi" ? { max_completion_tokens: 200 } : { max_tokens: 200 }),
-      ...(settings.provider === "kimi" && config.model.startsWith("kimi-k2.6") ? { thinking: { type: "disabled" } } : {}),
+      ...(provider !== "qwen" ? { response_format: { type: "json_object" } } : {}),
+      ...(provider === "kimi" ? { max_completion_tokens: maxTokens } : { max_tokens: maxTokens }),
+      ...(provider === "kimi" && (model || config.model).startsWith("kimi-k2.6") ? { thinking: { type: "disabled" } } : {}),
+      ...(provider === "openrouter" ? { usage: { include: true } } : {}),
     }),
-  }, 2, 20000, deadline);
+  }, 2, Math.min(20000, timeoutMs), deadline);
+  usage.recordOpenAi(payload, provider, model || config.model);
   const content = payload?.choices?.[0]?.message?.content || "";
   return Array.isArray(content) ? content.map((part) => (typeof part === "string" ? part : part?.text || "")).join("") : content;
 }
 
-/** 给一份已完成的任务生成标签；没配 Key、内容太短、模型失败都返回 null（调用方决定要不要重试）。 */
-async function generateTags(job) {
+/**
+ * 给一份已完成的任务生成卡片元数据：标签 + AI 标题 + 一句话 + 原文件名是否有意义。
+ * 没配 Key、内容太短、模型失败都返回 null（调用方决定要不要重试）。
+ */
+async function generateCardMeta(job) {
   const settings = await loadSettings();
-  const keys = { gemini: settings.geminiKey, kimi: settings.kimiKey, qwen: settings.qwenKey, openrouter: settings.openrouterKey };
+  const keys = { gemini: settings.geminiKey, kimi: settings.kimiKey, qwen: settings.qwenKey, openrouter: settings.openrouterKey, ollama: settings.ollamaModel };
   if (!keys[settings.provider]) return null;
   const result = await jobStore.readResult(job.id);
   const content = String(result?.markdown ?? "")
@@ -972,20 +1239,66 @@ async function generateTags(job) {
     .trim()
     .slice(0, 3000);
   if (content.length < 20) return null;
-  const raw = await callTextModel(settings, TAG_PROMPT(job.filename.replace(/\.pdf$/i, ""), content));
+  const raw = await usage.scope({ ref: job.id, purpose: "card" }, () =>
+    callTextModel(settings, CARD_PROMPT(stripSourceExtension(job.filename), content), { maxTokens: 400 }));
   const parsed = extractJson(raw);
   const tags = Array.isArray(parsed?.tags)
     ? parsed.tags.map((t) => String(t).trim().slice(0, 10)).filter(Boolean).slice(0, 4)
     : [];
-  return tags.length ? tags : null;
+  if (!tags.length) return null;
+  return {
+    tags,
+    title: String(parsed?.title ?? "").trim().slice(0, 30) || null,
+    oneLine: String(parsed?.one_line ?? "").trim().slice(0, 60) || null,
+    filenameMeaningful: typeof parsed?.filename_meaningful === "boolean" ? parsed.filename_meaningful : null,
+  };
 }
 
 // ===== 服务端编排：存储 + 管线 + 队列 =====
 // Surya 与 AI 调用以依赖注入方式交给管线（同进程直接调用，不再自己请求自己）。
 const jobStore = new JobStore(resolve(root, "data"));
+
+// 回顾叙事用的模型。原来配了 OpenRouter 就走 Claude Opus 4.6，一次刷新 4 个时段、
+// 每次转换完还会重算，结果它一家吃掉了 usage.db 里 99% 的花销（58 次 ≈ $5.9）。
+// 这活儿是把一份清单缩成一段话、文风还被 prompt 管死，换成 flash-lite 后单次几分钱、
+// 三秒出结果，输出看不出差别。想用回大模型：REFLECT_OPENROUTER_MODEL=anthropic/claude-opus-4.6。
+const REFLECT_GEMINI_MODEL = process.env.REFLECT_MODEL || "gemini-3.5-flash-lite";
+const REFLECT_OPENROUTER_MODEL = (process.env.REFLECT_OPENROUTER_MODEL || "").trim();
+// 中英合在一个请求里出，比单语言那会儿要宽的输出预算
+const REFLECT_MAX_TOKENS = 3000;
+async function generateReflectText(prompt) {
+  return usage.scope({ purpose: "reflect", ref: null }, () => generateReflectTextInner(prompt));
+}
+async function generateReflectTextInner(prompt) {
+  const settings = await loadSettings();
+  if (REFLECT_OPENROUTER_MODEL && settings.openrouterKey) {
+    try {
+      return await callTextModel(settings, prompt, { provider: "openrouter", model: REFLECT_OPENROUTER_MODEL, maxTokens: REFLECT_MAX_TOKENS, timeoutMs: 120000 });
+    } catch (error) {
+      console.warn(`[回顾] OpenRouter/${REFLECT_OPENROUTER_MODEL} 失败，改用 Gemini：${String(error?.message ?? error).slice(0, 120)}`);
+    }
+  }
+  if (settings.geminiKey) {
+    try {
+      return await callTextModel(settings, prompt, { provider: "gemini", model: REFLECT_GEMINI_MODEL, maxTokens: REFLECT_MAX_TOKENS, timeoutMs: 120000 });
+    } catch (error) {
+      console.warn(`[回顾] Gemini/${REFLECT_GEMINI_MODEL} 失败，改用当前服务商：${String(error?.message ?? error).slice(0, 120)}`);
+    }
+  }
+  return callTextModel(settings, prompt, { maxTokens: REFLECT_MAX_TOKENS, timeoutMs: 120000 });
+}
+const reflect = createReflect({
+  rows: () => jobStore.reflectRows(),
+  generate: generateReflectText,
+  dataDir: resolve(root, "data"),
+});
 const events = new EventHub();
 
 async function runSuryaOnPdf(pdfPath) {
+  // 没装 Surya 时以前报的是一句 spawn ENOENT，用户根本不知道缺什么
+  if (!existsSync(surya)) {
+    throw new Error("高精度（本地）模式需要 Surya，这台电脑还没装。打开「设置 → 环境」一键安装，或改用快速 / AI 精校模式。");
+  }
   const work = await mkdtemp(jobRoot);
   const output = join(work, "surya");
   try {
@@ -1013,31 +1326,114 @@ const converter = createConverter({
   runSurya: runSuryaOnPdf,
   refinePage: async (input) => callConfiguredModel(await loadSettings(), input, false),
   loadSettings: async () => publicSettings(await loadSettings()),
-  renderer: createRenderer({ python: resolve(root, "../.venv-marker/bin/python") }),
+  renderer: createRenderer({ python: venvPython }),
 });
 
-// PPT/PPTX 提交时先经 LibreOffice 转成 PDF，转完直接顶替 source.pdf 走上面这套
-// 转换管线，不单独写一份 PPT 处理逻辑。soffice 路径可用 MOYE_SOFFICE 覆盖，
-// 默认吃 PATH（brew 装的话会链到 /opt/homebrew/bin/soffice）。
+// PPT/PPTX/Word（doc/docx）提交时先经 LibreOffice 转成 PDF，转完直接顶替 source.pdf
+// 走上面这套转换管线，不单独写一份 Office 处理逻辑。soffice 路径可用 MOYE_SOFFICE 覆盖，
+// 默认吃 PATH（brew 装的话会链到 /opt/homebrew/bin/soffice）；官网 .dmg 装的只在 LibreOffice.app 里，
+// findSoffice 会去那里找。都找不到就留 "soffice"，装完（brew 会链进 PATH）不用重启也能用上。
 const officeConverter = createOfficeConverter({
-  soffice: process.env.MOYE_SOFFICE || "soffice",
+  soffice: process.env.MOYE_SOFFICE || findSoffice() || "soffice",
   timeoutMs: Number(process.env.MOYE_OFFICE_TIMEOUT_MS) || 120000,
 });
+
+// 图片（png/jpg/webp/bmp/tiff/gif/heic）同样先转成 PDF 再走上面这套管线。
+// 用 Surya venv 里的 Pillow，HEIC 走 macOS 自带 sips——理由见 server/image2pdf.mjs 顶部。
+const imageConverter = createImageConverter({
+  python: venvPython,
+  timeoutMs: Number(process.env.MOYE_IMAGE_TIMEOUT_MS) || 120000,
+});
+
+// 「很多图片 → 一份 PDF」是成品那条路（server/images2pdf.mjs），跟上面那个共用 venv
+// 但不共用参数：那边为识别压到 4000px，这边一个像素都不缩。
+const imageBook = createImageBookBuilder({
+  python: venvPython,
+  timeoutMs: Number(process.env.MOYE_IMAGEBOOK_TIMEOUT_MS) || 300000,
+});
+// 分片上传的暂存区：一次合成的图片先逐张流式落到这里，合成完（无论成败）立刻删。
+const imageBookRoot = resolve(root, "tmp/images2pdf");
+
+/** 会话 id 直接当目录名用，必须先挡住 ../ 之类的东西。 */
+function imageBookSession(value) {
+  const id = cleanString(value);
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) throw new Error("合成会话 id 不合法。");
+  return id;
+}
+
+/** 扫掉没走到 build 就被放弃的暂存目录（页面中途关了、上传到一半断了）。 */
+async function sweepImageBookSessions(maxAgeMs = 2 * 60 * 60 * 1000) {
+  const entries = await readdir(imageBookRoot).catch(() => []);
+  for (const entry of entries) {
+    const dir = join(imageBookRoot, entry);
+    const info = await stat(dir).catch(() => null);
+    if (info && Date.now() - info.mtimeMs > maxAgeMs) await rm(dir, { recursive: true, force: true });
+  }
+}
+
+// 「设置 → 环境」：组件检测 + 页面里一键补装（安装逻辑在 install.sh，这里只负责调起和汇报进度）
+const setup = createSetup({
+  root,
+  venv,
+  logFile: resolve(root, "logs/setup.log"),
+  ollamaBase: () => ollamaRoot(currentSettingsSnapshot),
+  listOllamaModels: () => listOllamaModels(currentSettingsSnapshot),
+  onInstalled: async (component, task) => {
+    if (component === "browser") forgetChromePath();
+    if (component === "ollama-model") {
+      ollamaCapabilities.clear();
+      // 刚下好模型：还没选过 Ollama 模型、或选的那个根本用不了（思考版 / 不能看图）就换成它；
+      // 一个 AI 都没配过就直接把 Ollama 设成当前服务。已经在用云端的不动 provider——换不换是用户的决定。
+      // （2026-09-24：先拉了官方思考版 qwen3-vl:8b 写进设置，再下好魔搭 Instruct 版，设置里还是思考版，一用就报错）
+      const settings = await loadSettings();
+      const patch = {};
+      const currentUsable = settings.ollamaModel
+        && await ollamaModelCapabilities(settings, settings.ollamaModel)
+          .then((caps) => caps.includes("vision") && !caps.includes("thinking"))
+          .catch(() => false);
+      if (!currentUsable) patch.ollamaModel = task.model;
+      if (!publicSettings(settings).aiConfigured) Object.assign(patch, { provider: "ollama", ollamaModel: task.model });
+      if (Object.keys(patch).length) {
+        currentSettingsSnapshot = await saveSettings(patch);
+        console.log(`[环境] 已把 Ollama 模型 ${task.model} 写进设置${patch.provider ? "，并设为当前 AI 服务" : ""}`);
+      }
+    }
+  },
+});
+// setup 的回调是同步取地址的，用最近一次读到的设置；每次 /api/setup 前刷新
+let currentSettingsSnapshot = defaultSettings;
 
 const jobQueue = new JobQueue({
   store: jobStore,
   // 本机跑 Surya 很吃资源，默认串行（MOYE_CONCURRENCY 只调本机识别）。
   // AI 模式不受它影响：那边限的是文档并发，见 queue.mjs 的 MOYE_AI_JOB_CONCURRENCY。
   concurrency: Number(process.env.MOYE_CONCURRENCY) || 1,
-  run: async (job, onProgress) => {
+  // 整份任务包在 usage.scope 里：底下每一次模型调用都记到这个 job.id 名下。
+  // 跑完把费用摘要抄进 jobs 表（明细在 usage.db），Library 列表和结果页直接读。
+  run: async (job, onProgress) => usage.scope({ ref: job.id, purpose: "refine" }, async () => {
+    const result = await runJob(job, onProgress);
+    jobStore.setCost(job.id, usage.costFor(job.id));
+    return result;
+  }),
+});
+
+async function runJob(job, onProgress) {
     const pdfPath = jobStore.sourcePath(job.id);
-    const title = job.filename.replace(/\.pdf$/i, "");
+    const title = stripSourceExtension(job.filename);
     // 「重跑精校」的任务带着上次的初稿，直接复用，不重跑 Surya
     let previous = null;
     try {
       previous = JSON.parse(await readFile(join(jobStore.dir(job.id), "previous.json"), "utf8"));
     } catch {
       previous = null;
+    }
+    // 重跑范围（refine.json，由 /refine 路由写入）：只重跑回退页 / 全部重跑。
+    // 单独放一个文件而不塞进 previous.json：失败时 previous 会原样当结果存回去，不能混进选项。
+    let refineOptions = {};
+    try {
+      refineOptions = JSON.parse(await readFile(join(jobStore.dir(job.id), "refine.json"), "utf8"));
+    } catch {
+      refineOptions = {};
     }
     // 逐页存档：服务重启后从上次的页续跑，而不是整份重来
     const checkpoint = jobStore.checkpoint(job.id);
@@ -1047,16 +1443,21 @@ const jobQueue = new JobQueue({
       // 交回去（等同"这次没有变化"），但把真实原因记进 error 字段，不是静默吞掉，
       // 前端会在结果页显示"重新精校失败，已保留原结果"。
       try {
-        return await converter.refineExisting(pdfPath, title, previous, onProgress, checkpoint);
+        return await converter.refineExisting(pdfPath, title, previous, onProgress, checkpoint, {
+          pageNoun: isImageFile(job.filename) ? "图" : "页",
+          only: refineOptions.only === "fallback" ? "fallback" : "all",
+        });
       } catch (error) {
         console.warn(`[重新精校失败] ${job.filename}：${String(error?.message ?? error).slice(0, 200)}，已回退保留原结果`);
         jobStore.update(job.id, { error: `重新精校失败，已保留原结果：${String(error?.message ?? error).slice(0, 200)}` });
         return previous;
       }
     }
-    return converter.convertPdf(pdfPath, title, job.mode, onProgress, checkpoint);
-  },
-});
+    return converter.convertPdf(pdfPath, title, job.mode, onProgress, checkpoint, {
+      // 图片任务在这里已经是 PDF 了，但正文里再写「PDF 第 1 页」会让人莫名其妙
+      pageNoun: isImageFile(job.filename) ? "图" : "页",
+    });
+}
 
 jobQueue.on("job", (job) => events.broadcast("job", job));
 
@@ -1065,13 +1466,15 @@ jobQueue.on("job", (job) => events.broadcast("job", job));
 // 但"重新精校"现在是原地重跑同一个 id，同一份文档会再走一次 done——已经打过
 // 标签的不用重打，省一次没必要的调用（内容大概率还是那些主题）。
 jobQueue.on("job", (job) => {
-  if (job.status !== "done" || job.tags) return;
+  if (job.status !== "done") return;
+  reflect.touch();                       // 回顾：10 分钟防抖后后台重算，打开面板时已经是新的
+  if (job.tags && job.ai_title) return;
   // 自动打标签是可关的（设置里）；"补标签"按钮是用户主动点的，不受这个开关影响
   void loadSettings()
-    .then((settings) => (settings.autoTag === false ? null : generateTags(job)))
-    .then((tags) => {
-      if (!tags) return;
-      jobStore.setTags(job.id, tags);
+    .then((settings) => (settings.autoTag === false ? null : generateCardMeta(job)))
+    .then((card) => {
+      if (!card) return;
+      jobStore.setCardMeta(job.id, card);
       events.broadcast("job", jobStore.get(job.id));
     })
     .catch((error) => {
@@ -1083,16 +1486,17 @@ jobQueue.on("job", (job) => {
 // 模块级状态即可——同一时间只需要一份进度，不需要为每次调用建任务表。
 const tagBackfillState = { running: false, done: 0, total: 0, failed: 0 };
 async function runTagBackfill() {
-  const pending = jobStore.list({ limit: 5000 }).filter((job) => job.status === "done" && !job.tags);
+  // 没标签的、或有标签但还没有 AI 标题的（标题是后加的字段）都要补
+  const pending = jobStore.list({ limit: 5000 }).filter((job) => job.status === "done" && (!job.tags || !job.ai_title));
   tagBackfillState.running = true;
   tagBackfillState.done = 0;
   tagBackfillState.total = pending.length;
   tagBackfillState.failed = 0;
   for (const job of pending) {
     try {
-      const tags = await generateTags(job);
-      if (tags) {
-        jobStore.setTags(job.id, tags);
+      const card = await generateCardMeta(job);
+      if (card) {
+        jobStore.setCardMeta(job.id, card);
         events.broadcast("job", jobStore.get(job.id));
       } else {
         tagBackfillState.failed += 1;
@@ -1105,6 +1509,52 @@ async function runTagBackfill() {
     await sleep(300);   // 别把这一批打太快，跟正常转换任务抢配额
   }
   tagBackfillState.running = false;
+  reflect.touch();                       // 补完标题/标签，回顾的原料变了
+}
+
+/** 「测试连接」：Gemini 逐把测 key；其它家测一次，OpenRouter 顺带报余额。 */
+async function handleSettingsTest(settings, response) {
+  // Gemini：逐把测所有 key。只测主 key 的话，后面几把坏了要等真跑批量才发现。
+  if (settings.provider === "gemini") {
+    const pool = geminiKeyPool(settings);
+    const keys = await Promise.all(
+      pool.map(async (key, index) => {
+        try {
+          await callConfiguredModel({ ...settings, __key: key }, {}, true);
+          return { index: index + 1, tail: key.slice(-4), ok: true };
+        } catch (error) {
+          return { index: index + 1, tail: key.slice(-4), ok: false,
+                   reason: String(error?.message ?? error).slice(0, 160) };
+        }
+      })
+    );
+    const bad = keys.filter((k) => !k.ok);
+    sendJson(response, 200, {
+      ok: bad.length === 0,
+      keys,
+      reason: bad.length
+        ? `${keys.length} 把 Key 中 ${bad.length} 把不可用：${bad.map((k) => `#${k.index}(…${k.tail})`).join("、")}`
+        : `${keys.length} 把 Key 全部可用。`,
+    });
+    return;
+  }
+  const result = await callConfiguredModel(settings, {}, true);
+  // OpenRouter 能顺手报余额：GET /key 回 usage（已用美元）和 limit（上限，null = 无上限）。
+  // 查不到就不带这一段，连接本身通了就算成功。
+  if (settings.provider === "openrouter" && result?.ok) {
+    try {
+      const keyResponse = await fetchWithTimeout(`${settings.openrouterBaseUrl.replace(/\/$/, "")}/key`, {
+        headers: { Authorization: `Bearer ${settings.openrouterKey}` },
+      }, 15000);
+      const data = (await keyResponse.json())?.data;
+      if (keyResponse.ok && data && Number.isFinite(data.usage)) {
+        result.balance = { usage: data.usage, limit: Number.isFinite(data.limit) ? data.limit : null };
+      }
+    } catch (error) {
+      console.warn(`[测试连接] OpenRouter 余额查询失败：${String(error?.message ?? error).slice(0, 120)}`);
+    }
+  }
+  sendJson(response, 200, result);
 }
 
 const server = createServer(async (request, response) => {
@@ -1128,7 +1578,7 @@ const server = createServer(async (request, response) => {
       const settings = await loadSettings();
       const jobs = jobStore.list({ limit: 200 }).filter((j) => j.status === "running");
       sendJson(response, 200, {
-        gates: gateStats(),
+        gates: { ...gateStats(), pdf: pdfGateStats() },
         pacer: pacer.stats(),
         queue: jobQueue.status(),
         channels: configuredChannels(settings).map((c) => ({ provider: c.provider, weight: c.weight })),
@@ -1148,6 +1598,24 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    if (request.method === "GET" && request.url === "/api/setup") {
+      const settings = await loadSettings();
+      currentSettingsSnapshot = settings;
+      const pub = publicSettings(settings);
+      sendJson(response, 200, await setup.status({
+        bundledBrowser: await bundledHeadlessShell(),
+        ai: { ok: pub.aiConfigured, provider: settings.provider, ollamaModel: settings.ollamaModel },
+      }));
+      return;
+    }
+
+    if (request.method === "POST" && request.url === "/api/setup/install") {
+      const body = await readJson(request, 16 * 1024);
+      currentSettingsSnapshot = await loadSettings();
+      sendJson(response, 200, setup.install(cleanString(body.component), { model: cleanString(body.model) }));
+      return;
+    }
+
     if (request.method === "GET" && request.url === "/api/settings") {
       sendJson(response, 200, publicSettings(await loadSettings()));
       return;
@@ -1163,34 +1631,21 @@ const server = createServer(async (request, response) => {
       const supplied = await readJson(request, 128 * 1024);
       const stored = await loadSettings();
       const settings = normalizeSettings(supplied, stored);
-      // Gemini：逐把测所有 key。只测主 key 的话，后面几把坏了要等真跑批量才发现。
-      if (settings.provider === "gemini") {
-        const pool = geminiKeyPool(settings);
-        const keys = await Promise.all(
-          pool.map(async (key, index) => {
-            try {
-              await callConfiguredModel({ ...settings, __key: key }, {}, true);
-              return { index: index + 1, tail: key.slice(-4), ok: true };
-            } catch (error) {
-              return { index: index + 1, tail: key.slice(-4), ok: false,
-                       reason: String(error?.message ?? error).slice(0, 160) };
-            }
-          })
-        );
-        const bad = keys.filter((k) => !k.ok);
-        sendJson(response, 200, {
-          ok: bad.length === 0,
-          keys,
-          reason: bad.length
-            ? `${keys.length} 把 Key 中 ${bad.length} 把不可用：${bad.map((k) => `#${k.index}(…${k.tail})`).join("、")}`
-            : `${keys.length} 把 Key 全部可用。`,
-        });
-        return;
-      }
-      const result = await callConfiguredModel(settings, {}, true);
-      sendJson(response, 200, result);
+      await usage.scope({ purpose: "test", ref: null }, () => handleSettingsTest(settings, response));
       return;
     }
+
+    if (request.method === "GET" && request.url === "/api/usage") {
+      sendJson(response, 200, usage.summary());
+      return;
+    }
+
+    // 按模式的每页秒数中位数：首页模式说明里的「约 X 秒/页」和进度页的预计剩余时间都用它
+    if (request.method === "GET" && request.url === "/api/speed") {
+      sendJson(response, 200, jobStore.speedTable());
+      return;
+    }
+
 
     if (request.method === "POST" && request.url === "/api/models") {
       const supplied = await readJson(request, 128 * 1024);
@@ -1246,18 +1701,24 @@ const server = createServer(async (request, response) => {
       const batchLabel = batchId ? decodeHeader(request.headers["x-batch-label"]) : null;
       const id = randomUUID();
       const job = jobStore.create({ id, filename, fileSize: 0, mode, batchId, batchLabel });
-      if (isOfficeFile(filename)) {
-        // PPT/PPTX：先整份收进内存转给 soffice，转出来的 PDF 才落盘成 source.pdf。
-        // 不能像 PDF 那样边收边写——soffice 要一个完整文件才能转换。
+      // PPT/PPTX/Word 和图片都不是 PDF，得先转一道：整份收进内存交给转换器，
+      // 转出来的 PDF 才落盘成 source.pdf。不能像 PDF 那样边收边写——
+      // soffice 和 Pillow 都要一个完整文件才能转换。
+      const preConvert = isOfficeFile(filename)
+        ? { converter: officeConverter, label: "Office 文档" }
+        : isImageFile(filename)
+          ? { converter: imageConverter, label: "图片" }
+          : null;
+      if (preConvert) {
         try {
           const chunks = [];
           for await (const chunk of request) chunks.push(chunk);
-          const pdfBuffer = await officeConverter.convertToPdf(Buffer.concat(chunks), filename);
+          const pdfBuffer = await preConvert.converter.convertToPdf(Buffer.concat(chunks), filename);
           await writeFile(jobStore.sourcePath(id), pdfBuffer);
         } catch (error) {
-          const message = error instanceof Error ? error.message : "PPT 转 PDF 失败。";
-          jobStore.update(id, { status: "failed", error: `PPT 转 PDF 失败：${message}` });
-          throw new Error(`PPT 转 PDF 失败：${message}`);
+          const message = error instanceof Error ? error.message : `${preConvert.label}转 PDF 失败。`;
+          jobStore.update(id, { status: "failed", error: `${preConvert.label}转 PDF 失败：${message}` });
+          throw new Error(`${preConvert.label}转 PDF 失败：${message}`);
         }
       } else {
         await pipeline(request, createWriteStream(jobStore.sourcePath(id)));
@@ -1292,6 +1753,14 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    // ---- 回顾：这段时间在弄什么（叙事提前算好，缓存过期先给旧的） ----
+    if (request.method === "GET" && request.url?.startsWith("/api/reflect")) {
+      const query = new URL(request.url, "http://127.0.0.1").searchParams;
+      const payload = await reflect.build(query.get("range") || "1m", query.get("lang") || "zh", query.get("refresh") === "1");
+      sendJson(response, 200, payload);
+      return;
+    }
+
     // ---- 个人数据统计面板：总量 / 每日时间线 / 标签占比 ----
     if (request.method === "GET" && request.url === "/api/stats") {
       const totals = jobStore.statsTotals();
@@ -1310,10 +1779,18 @@ const server = createServer(async (request, response) => {
         .sort((a, b) => b[1] - a[1])
         .slice(0, 8)
         .map(([tag, count]) => ({ tag, count }));
+      // 按模式的份数/页数（资料库栏目的分段条）
+      const byMode = {};
+      for (const row of jobStore.reflectRows()) {
+        const m = byMode[row.mode] || (byMode[row.mode] = { count: 0, pages: 0 });
+        m.count += 1;
+        m.pages += Number(row.page_count) || 0;
+      }
       sendJson(response, 200, {
         totals: { transcripts: totals.transcripts, pages: totals.pages, chars: totals.chars },
         timeline: jobStore.statsTimeline(),
         topTags,
+        byMode,
       });
       return;
     }
@@ -1398,6 +1875,78 @@ const server = createServer(async (request, response) => {
       return;
     }
 
+    // Markdown → PDF（server/md2pdf.mjs，Chrome 无头打印）。两个入口：
+    //   GET  /api/library/<id>/document.pdf  把 Library 里这份的 document.md 打成 PDF 下载
+    //   POST /api/md2pdf {markdown, title}   任意 Markdown 文本 → PDF（首页拖入 .md 走这里）
+    // 不落盘、不建任务：几秒就完，没必要进队列；出错直接把 Chrome 的原因回给页面。
+    const docPdfMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/document\.pdf$/);
+    if (request.method === "GET" && docPdfMatch) {
+      const job = jobStore.get(docPdfMatch[1]);
+      if (!job) return sendJson(response, 404, { error: "记录不存在。" });
+      if (job.status !== "done") return sendJson(response, 400, { error: "这份任务还没完成，暂时没有可导出的 Markdown。" });
+      const markdown = await readFile(join(jobStore.dir(job.id), "document.md"), "utf8").catch(() => null);
+      if (markdown === null) return sendJson(response, 404, { error: "没有找到这份文档的 Markdown。" });
+      const pdf = await markdownToPdf(markdown, { title: stripSourceExtension(job.filename) });
+      sendPdf(response, pdf, `${stripSourceExtension(job.filename)}.pdf`);
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/md2pdf") {
+      const body = await readJson(request);
+      const markdown = typeof body?.markdown === "string" ? body.markdown : "";
+      if (!markdown.trim()) return sendJson(response, 400, { error: "缺少 Markdown 内容。" });
+      // title 是拖进来的 .md 文件名；没有就只用正文第一个标题起文件名，不印到 PDF 里
+      const title = cleanString(body?.title).replace(/\.(md|markdown)$/i, "") || null;
+      const pdf = await markdownToPdf(markdown, { title });
+      sendPdf(response, pdf, `${title || markdownTitle(markdown)}.pdf`);
+      return;
+    }
+
+    // 很多图片 → 一份 PDF（server/images2pdf.mjs）。跟 md2pdf 同一类旁路：不进队列、不进 Library、不识别。
+    // 分两步上传是为了不把几十张照片一次性堆进内存（/api/jobs 那条路要整份进内存是因为
+    // Pillow/soffice 需要完整文件，这里每张各自落盘就够）：
+    //   POST /api/images2pdf/part   头 x-session / x-index / x-filename，body 是原始字节，边收边写
+    //   POST /api/images2pdf/build  {session, title} → 按 x-index 排序合成，回 PDF，然后删掉暂存
+    if (request.method === "POST" && request.url === "/api/images2pdf/part") {
+      const session = imageBookSession(request.headers["x-session"]);
+      const index = Math.min(Math.max(Number(request.headers["x-index"]) || 0, 0), 9999);
+      const name = decodeHeader(request.headers["x-filename"], "image");
+      if (!isImageFile(name)) throw new Error(`${name} 不是支持的图片格式。`);
+      const dir = join(imageBookRoot, session);
+      await mkdir(dir, { recursive: true });
+      if ((await readdir(dir)).length >= 500) throw new Error("一次最多合成 500 张图片。");
+      // 文件名 = 4 位页序 + "-" + encodeURIComponent(原名)：排序和报错都只靠它，
+      // 不额外维护一份清单（清单和目录一旦不同步，排查起来最烦）
+      const part = join(dir, `${String(index).padStart(4, "0")}-${encodeURIComponent(name).replace(/\//g, "%2F")}`);
+      await pipeline(request, createWriteStream(part));
+      sendJson(response, 200, { ok: true });
+      return;
+    }
+    if (request.method === "POST" && request.url === "/api/images2pdf/build") {
+      const body = await readJson(request);
+      const session = imageBookSession(body?.session);
+      const dir = join(imageBookRoot, session);
+      const entries = await readdir(dir).catch(() => []);
+      if (!entries.length) return sendJson(response, 400, { error: "没有收到任何图片。" });
+      const files = entries
+        .map((entry) => ({ ...decodePartName(entry), path: join(dir, entry) }))
+        .sort((a, b) => a.index - b.index);
+      const title = cleanString(body?.title) || stripSourceExtension(files[0].name) || "图片";
+      try {
+        const { pdf, pages, skipped } = await imageBook.buildPdf(files);
+        sendPdf(response, pdf, `${title}.pdf`, {
+          // 跳过的图片必须回到页面上（规矩四：任何失败路径都要留下原因）。
+          // PDF 响应体里塞不下 JSON，就走一个头；latin-1 限制所以整体编码过。
+          "X-Moye-Pages": String(pages),
+          "X-Moye-Skipped": encodeURIComponent(JSON.stringify(skipped)),
+          "Access-Control-Expose-Headers": "X-Moye-Pages, X-Moye-Skipped",
+        });
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+        void sweepImageBookSessions();
+      }
+      return;
+    }
+
     const pdfMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/pdf$/);
     if (request.method === "GET" && pdfMatch) {
       const job = jobStore.get(pdfMatch[1]);
@@ -1429,9 +1978,23 @@ const server = createServer(async (request, response) => {
       if (job.status !== "done") return sendJson(response, 400, { error: "这份任务还没完成，暂时不能重新精校。" });
       const previous = await jobStore.readResult(job.id);
       if (!previous) return sendJson(response, 404, { error: "没有可复用的初稿。" });
+      // body 可选：{ only: "fallback" } 表示只重跑上次回退的页（见 convert.mjs 的 refineExisting）
+      const body = await readJson(request);
+      const only = body?.only === "fallback" ? "fallback" : "all";
+      if (only === "fallback" && !(previous.pages ?? []).some(isFallbackPage)) {
+        return sendJson(response, 400, { error: "没有回退的页面需要重跑。" });
+      }
       await jobStore.backupResult(job.id);   // 留一份 .prev 备份，万一这次结果更差还能手动捞回来
       await writeFile(join(jobStore.dir(job.id), "previous.json"), JSON.stringify(previous), "utf8");
-      jobStore.update(job.id, { status: "queued", detail: "重新精校排队中，正在复用当前结果作为初稿", error: null, page: 0 });
+      await writeFile(join(jobStore.dir(job.id), "refine.json"), JSON.stringify({ only }), "utf8");
+      jobStore.update(job.id, {
+        status: "queued",
+        detail: only === "fallback"
+          ? `重新精校排队中，只重跑 ${previous.pages.filter(isFallbackPage).length} 页回退页，其余保留`
+          : "重新精校排队中，正在复用当前结果作为初稿",
+        error: null,
+        page: 0,
+      });
       jobQueue.enqueue(job.id);
       sendJson(response, 202, { job: jobStore.get(job.id) });
       return;
@@ -1446,10 +2009,16 @@ const server = createServer(async (request, response) => {
 });
 
 server.listen(port, "127.0.0.1", async () => {
+  reflect.startScheduler();              // 回顾提前算好：启动 90s 后首跑，之后每 6 小时
   console.log(`墨页服务已就绪 http://127.0.0.1:${port}`);
   // 重启恢复：上次没跑完的任务，源文件还在就重新排队（对齐 Verbatim 的做法）
   const recovered = await jobStore.recover((job) => jobQueue.enqueue(job.id));
   if (recovered.requeued || recovered.failed) {
     console.log(`重启恢复：重新排队 ${recovered.requeued} 个，标记失败 ${recovered.failed} 个`);
   }
+  // 老记录补算回退页数（只在列刚加上的那次启动真正干活）
+  jobStore.backfillFallbackCounts().then((n) => { if (n) console.log(`补算回退页数：${n} 份`); }).catch((error) => console.error("[补算回退页数失败]", error));
+  jobStore.backfillDurations().then((n) => { if (n) console.log(`补算转换耗时：${n} 份`); }).catch((error) => console.error("[补算转换耗时失败]", error));
+  // 图片合成 PDF 的暂存区：上次没走完的会话清一清（正常路径在 build 的 finally 里已经删了）
+  sweepImageBookSessions().catch((error) => console.error("[清理图片暂存失败]", error));
 });

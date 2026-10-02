@@ -65,13 +65,17 @@ export class JobQueue extends EventEmitter {
     this._pump();
   }
 
-  /** 协作式取消：跑到下一个安全点就停，已完成的产物保留。 */
+  /**
+   * 协作式取消：跑到下一个安全点就停（convert.mjs 每领一页之前看一眼 token），
+   * 已经在途的那几页跑完为止。
+   */
   cancel(jobId) {
     const idx = this.pending.indexOf(jobId);
     if (idx !== -1) {
       this.pending.splice(idx, 1);
-      this.store.update(jobId, { status: "cancelled", detail: "已取消" });
-      this._emitJob(jobId);
+      this._settleCancelled(jobId)
+        .catch((error) => console.error(`[队列] 取消 ${jobId} 时收尾失败：${String(error?.message ?? error).slice(0, 200)}`))
+        .finally(() => this._emitJob(jobId));
       return true;
     }
     const token = this.active.get(jobId);
@@ -121,16 +125,34 @@ export class JobQueue extends EventEmitter {
         continue;
       }
       running[mode] = (running[mode] ?? 0) + 1;
-      this._start(jobId);
+      // _start 自己兜住了所有错误；这里再接一层，防的是收尾时写库也失败——
+      // 没人接的 Promise rejection 会让整个服务进程退出，在跑的任务全部白跑
+      this._start(jobId).catch((error) => console.error(`[队列] 任务 ${jobId} 收尾失败：${String(error?.message ?? error).slice(0, 200)}`));
     }
     this.pending = skipped.concat(this.pending);
+  }
+
+  /**
+   * 取消之后记录落到哪：
+   * - 重新精校被取消（磁盘上还有上一次的 result.json）→ 退回「完成」、结果原样不动。
+   *   以前标成 cancelled，Library 只列 done，一份好好的文档就这么「消失」了。
+   * - 新转换被取消 → cancelled。
+   * 这一轮的逐页存档一律作废：取消 = 这次什么都没变，下次重跑也不该续上半截。
+   */
+  async _settleCancelled(jobId) {
+    await this.store.checkpoint?.(jobId).clear().catch((error) =>
+      console.warn(`[取消] 清理 ${jobId} 的逐页存档失败：${String(error?.message ?? error).slice(0, 160)}`));
+    if (await this.store.hasResult?.(jobId)) {
+      const pages = this.store.get(jobId)?.page_count ?? 0;
+      this.store.update(jobId, { status: "done", detail: "已取消重新精校，保留原结果", error: null, page: pages, total: pages });
+    } else {
+      this.store.update(jobId, { status: "cancelled", detail: "已取消" });
+    }
   }
 
   async _start(jobId) {
     const token = { cancelled: false };
     this.active.set(jobId, token);
-    this.store.update(jobId, { status: "running", detail: "开始处理", error: null });
-    this._emitJob(jobId);
 
     // 进度回调做节流：逐页回调很密集，没必要每次都写库 + 广播
     let lastWrite = 0;
@@ -152,15 +174,18 @@ export class JobQueue extends EventEmitter {
     };
 
     try {
+      this.store.update(jobId, { status: "running", detail: "开始处理", error: null });
+      this._emitJob(jobId);
       const job = this.store.get(jobId);
       const result = await this.run(job, onProgress, token);
       if (token.cancelled) {
-        this.store.update(jobId, { status: "cancelled", detail: "已取消" });
+        await this._settleCancelled(jobId);
       } else {
         await this.store.saveResult(jobId, result);
         // 结果已完整落盘，逐页存档没用了——留着会占磁盘，
         // 而且这份任务若被「重新精校」复用，旧页会盖掉新结果。
-        await this.store.checkpoint?.(jobId).clear().catch(() => undefined);
+        await this.store.checkpoint?.(jobId).clear().catch((error) =>
+          console.warn(`[队列] 清理 ${jobId} 的逐页存档失败，下次重新精校可能读到旧页：${String(error?.message ?? error).slice(0, 160)}`));
         this.store.update(jobId, {
           status: "done",
           detail: "完成",
@@ -169,10 +194,11 @@ export class JobQueue extends EventEmitter {
         });
       }
     } catch (error) {
-      this.store.update(jobId, {
-        status: token.cancelled ? "cancelled" : "failed",
-        error: String(error?.message ?? error).slice(0, 500),
-      });
+      if (token.cancelled) {
+        await this._settleCancelled(jobId);
+      } else {
+        this.store.update(jobId, { status: "failed", error: String(error?.message ?? error).slice(0, 500) });
+      }
     } finally {
       this.active.delete(jobId);
       this._emitJob(jobId);

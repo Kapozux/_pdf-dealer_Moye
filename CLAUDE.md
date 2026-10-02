@@ -101,6 +101,7 @@ grep '\[AI失败\]\|\[换供应商\]\|\[换模型\]\|\[模型熔断\]\|\[补救\
 
 - **浏览器只是观察者**，转换全在服务端。关页面任务照跑。
 - `server/queue.mjs` 按模式限流：fast 4 / balanced 1 / math 1 / ai 48
+- **取消是真的**：队列给每个任务一个 token，convert.mjs 每领一页之前看一眼，取消后只把在途的几页跑完（`JobCancelled`）。重新精校被取消时记录退回 done、旧结果原样保留（`_settleCancelled`），不会从 Library 消失
 - `server/convert.mjs` 的 `aiGate` 是**全局**闸，限制「此刻打向模型的请求总数」。
   job 级并发只是喂料口，真正的天花板是 aiGate。
 - 三层兜底：**换供应商** → **换模型** → **回退 PDF 文字层**

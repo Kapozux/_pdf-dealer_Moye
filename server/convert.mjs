@@ -316,13 +316,39 @@ const renderGate = {
  * 对应 Verbatim harness 的 fanout —— 页面级 AI 调用是纯网络等待，
  * 一页一页串行等于把一份 86 页的文档排成 86 段串行网络往返。
  */
-async function fanout(items, fn, concurrency) {
+/**
+ * 用户点了「取消」：队列给的 token 被置上，管线在下一个安全点（领下一页之前）停下。
+ * 已经在途的那几页跑完为止（打出去的模型请求收不回来），但不会再把整份文档跑完、白花钱。
+ */
+export class JobCancelled extends Error {
+  constructor() {
+    super("已取消");
+    this.name = "JobCancelled";
+  }
+}
+
+/**
+ * 并发跑 items。signal.cancelled 置上后不再领新的；某一份抛错后其余 worker 也不再领新的——
+ * 以前 Promise.all 已经 reject、任务已经标失败，剩下的 worker 还在继续调模型、占着 aiGate。
+ * @param {{ cancelled: boolean } | null} [signal]
+ */
+async function fanout(items, fn, concurrency, signal = null) {
   const results = new Array(items.length);
   let cursor = 0;
+  let stopped = false;
   const workers = Array.from({ length: Math.max(1, Math.min(concurrency, items.length)) }, async () => {
-    while (cursor < items.length) {
+    while (cursor < items.length && !stopped) {
+      if (signal?.cancelled) {
+        stopped = true;
+        throw new JobCancelled();
+      }
       const index = cursor++;
-      results[index] = await fn(items[index], index);
+      try {
+        results[index] = await fn(items[index], index);
+      } catch (error) {
+        stopped = true;
+        throw error;
+      }
     }
   });
   await Promise.all(workers);
@@ -520,7 +546,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
    *   「只重跑回退页」用它把上次成功的 AI 页直接带过来，不再渲染、不再调模型；
    *   与逐页存档走同一条路径，存档（续跑）优先级更高——同一页两边都有时以存档为准。
    */
-  async function refineWithAi(pdfPath, drafts, onProgress, checkpoint = null, keep = new Map()) {
+  async function refineWithAi(pdfPath, drafts, onProgress, checkpoint = null, keep = new Map(), signal = null) {
     const settings = await loadSettings();
     if (!settings.aiConfigured) {
       throw new Error("AI 精校尚未配置。请点击右上角“设置”，填写当前服务的 API Key。");
@@ -594,6 +620,15 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
       onProgress(finished, drafts.length, `${targets.length} 页待识别，按 ${RENDER_CHUNK} 页一组滚动生成图像`);
     }
 
+    // 逐页存档写失败（磁盘满、任务目录被删）不能静默吞掉：那样「重启能续跑」会悄悄失效，
+    // 重启后整份重跑、再付一次钱。一份文档只记一条，别刷屏
+    let checkpointWarned = false;
+    const saveCheckpoint = (page, result) => checkpoint?.save(page, result).catch((error) => {
+      if (checkpointWarned) return;
+      checkpointWarned = true;
+      console.warn(`[存档失败] 第 ${page} 页起逐页存档写不进去，这份文档重启后可能要重跑：${String(error?.message ?? error).slice(0, 160)}`);
+    });
+
     const concurrency = await pageConcurrency();
     const output = await fanout(drafts, async (draft) => {
       // 存档命中：这一页上次已经跑完了，直接用，省掉一次模型调用
@@ -611,11 +646,11 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
         releaseImage(draft.page);   // 成败都释放，否则一页异常就让整组图像常驻
       }
       // 每页一落盘：下次重启从这里续，而不是整份重来
-      if (checkpoint) await checkpoint.save(draft.page, result).catch(() => undefined);
+      await saveCheckpoint(draft.page, result);
       finished += 1;
       onProgress(finished, drafts.length, `已完成 ${finished}/${drafts.length} 页`);
       return result;
-    }, concurrency);
+    }, concurrency, signal);
 
     // 补救轮：把「AI 调用本身失败」的页低压力重跑一遍。
     //
@@ -625,6 +660,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
     // 等主轮跑完、压力归零之后再用低并发补几页，几乎不影响总时长，却能把这批救回来。
     const casualtyIndexes = output.map((page, index) => (page.aiFailed ? index : -1)).filter((i) => i >= 0);
     if (casualtyIndexes.length) {
+      if (signal?.cancelled) throw new JobCancelled();
       console.warn(`[补救] ${casualtyIndexes.length}/${drafts.length} 页主轮失败，开始重试`);
       // 补救轮并发。这里曾经写死上限 4，理由是「等压力归零再低并发补几页」——
       // 那是按「同时只有一份文档在补救」设想的。实测 15 份大文档并行时有 7 份同时
@@ -644,14 +680,15 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
       const rescued = await fanout(
         casualtyIndexes,
         (index) => refineOne(drafts[index], async (page) => rescueImages[String(page)], true),
-        rescueConcurrency
+        rescueConcurrency,
+        signal
       );
       // JSONL 是追加写，同一页后写的那行会在 load() 时覆盖先写的——
       // 所以补救成功的结果必须再存一次，否则续跑会读回主轮那个失败版本。
       for (const [i, index] of casualtyIndexes.entries()) {
         if (rescued[i] && !rescued[i].aiFailed) {
           output[index] = rescued[i];
-          if (checkpoint) await checkpoint.save(drafts[index].page, rescued[i]).catch(() => undefined);
+          await saveCheckpoint(drafts[index].page, rescued[i]);
         }
       }
     }
@@ -660,7 +697,8 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
   }
 
   /** 一份 PDF → ConversionResult。onProgress(page, total, detail) */
-  async function convertPdf(pdfPath, title, mode, onProgress = () => {}, checkpoint = null, { pageNoun = "页" } = {}) {
+  /** @param {{ pageNoun?: string, signal?: { cancelled: boolean } | null }} [options] signal 是队列给的取消 token */
+  async function convertPdf(pdfPath, title, mode, onProgress = () => {}, checkpoint = null, { pageNoun = "页", signal = null } = {}) {
     const started = performance.now();
     let pages;
     let total;
@@ -679,7 +717,8 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
         onProgress(page, count, `读取文字层作为提示 ${page}/${count} 页，随后交给视觉模型`)
       );
       total = hints.total;
-      pages = await refineWithAi(pdfPath, hints.pages, onProgress, checkpoint);
+      if (signal?.cancelled) throw new JobCancelled();   // 读文字层那一两分钟里点了取消：别再开始调模型
+      pages = await refineWithAi(pdfPath, hints.pages, onProgress, checkpoint, new Map(), signal);
     } else {
       total = await pdfPageCount(pdfPath);
       pages = await convertWithSurya(pdfPath, total, onProgress);
@@ -696,7 +735,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
    *   加它是因为一份 912 页的书有 409 页因上游超时回退，而「重新精校」会把 503 页
    *   已经好了的也再过一遍模型——多花一倍的钱和时间，还可能把好页跑坏。
    */
-  async function refineExisting(pdfPath, title, previous, onProgress = () => {}, checkpoint = null, { pageNoun = "页", only = "all" } = {}) {
+  async function refineExisting(pdfPath, title, previous, onProgress = () => {}, checkpoint = null, { pageNoun = "页", only = "all", signal = null } = {}) {
     const started = performance.now();
     const pageCount = await pdfPageCount(pdfPath);
     if (pageCount !== previous.pageCount) {
@@ -708,7 +747,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
       if (keep.size === previous.pages.length) throw new Error("没有回退的页面需要重跑。");
     }
     const drafts = previous.pages.map(toDraft);
-    const pages = await refineWithAi(pdfPath, drafts, onProgress, checkpoint, keep);
+    const pages = await refineWithAi(pdfPath, drafts, onProgress, checkpoint, keep, signal);
     return assembleResult(title, "ai", pageCount, pages, started, pageNoun);
   }
 

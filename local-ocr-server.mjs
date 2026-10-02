@@ -73,7 +73,6 @@ function sendJson(response, status, payload) {
 }
 
 function sendPdf(response, buffer, filename, extraHeaders = {}) {
-  cors(response);
   response.writeHead(200, {
     "Content-Type": "application/pdf",
     "Content-Length": buffer.length,
@@ -1304,14 +1303,15 @@ const jobQueue = new JobQueue({
   concurrency: Number(process.env.MOYE_CONCURRENCY) || 1,
   // 整份任务包在 usage.scope 里：底下每一次模型调用都记到这个 job.id 名下。
   // 跑完把费用摘要抄进 jobs 表（明细在 usage.db），Library 列表和结果页直接读。
-  run: async (job, onProgress) => usage.scope({ ref: job.id, purpose: "refine" }, async () => {
-    const result = await runJob(job, onProgress);
+  run: async (job, onProgress, signal) => usage.scope({ ref: job.id, purpose: "refine" }, async () => {
+    const result = await runJob(job, onProgress, signal);
     jobStore.setCost(job.id, usage.costFor(job.id));
     return result;
   }),
 });
 
-async function runJob(job, onProgress) {
+/** @param {{ cancelled: boolean }} signal 队列给的取消 token：管线每领一页之前看一眼 */
+async function runJob(job, onProgress, signal) {
     const pdfPath = jobStore.sourcePath(job.id);
     const title = stripSourceExtension(job.filename);
     // 「重跑精校」的任务带着上次的初稿，直接复用，不重跑 Surya
@@ -1340,8 +1340,11 @@ async function runJob(job, onProgress) {
         return await converter.refineExisting(pdfPath, title, previous, onProgress, checkpoint, {
           pageNoun: isImageFile(job.filename) ? "图" : "页",
           only: refineOptions.only === "fallback" ? "fallback" : "all",
+          signal,
         });
       } catch (error) {
+        // 用户取消不是「精校失败」：交给队列收尾（旧结果原样保留、记录退回完成），不写失败原因
+        if (signal?.cancelled) throw error;
         console.warn(`[重新精校失败] ${job.filename}：${String(error?.message ?? error).slice(0, 200)}，已回退保留原结果`);
         jobStore.update(job.id, { error: `重新精校失败，已保留原结果：${String(error?.message ?? error).slice(0, 200)}` });
         return previous;
@@ -1350,6 +1353,7 @@ async function runJob(job, onProgress) {
     return converter.convertPdf(pdfPath, title, job.mode, onProgress, checkpoint, {
       // 图片任务在这里已经是 PDF 了，但正文里再写「PDF 第 1 页」会让人莫名其妙
       pageNoun: isImageFile(job.filename) ? "图" : "页",
+      signal,
     });
 }
 
@@ -1590,7 +1594,9 @@ const server = createServer(async (request, response) => {
     }
 
     // ---- 任务：提交 / 查询 / 取消 / SSE ----
-    if (request.method === "POST" && request.url?.startsWith("/api/jobs")) {
+    // 精确匹配：以前是 startsWith("/api/jobs")，排在取消路由前面，「取消」被当成一次提交——
+    // 原任务照跑，库里多一条 0 字节的 document.pdf 失败记录
+    if (request.method === "POST" && request.url === "/api/jobs") {
       // HTTP header 只能带 latin-1，中文文件名必须由前端 encodeURIComponent 后再解回来，
       // 否则「测试文档.pdf」会变成一堆乱码存进 Library。
       const rawName = cleanString(request.headers["x-filename"], "document.pdf");
@@ -1708,7 +1714,10 @@ const server = createServer(async (request, response) => {
         sendJson(response, 200, { ok: true, alreadyRunning: true, ...tagBackfillState });
         return;
       }
-      void runTagBackfill();
+      runTagBackfill().catch((error) => {
+        tagBackfillState.running = false;
+        console.warn(`[补标签] 中途出错，已停止：${String(error?.message ?? error).slice(0, 160)}`);
+      });
       sendJson(response, 202, { ok: true, ...tagBackfillState });
       return;
     }
@@ -1849,7 +1858,7 @@ const server = createServer(async (request, response) => {
         });
       } finally {
         await rm(dir, { recursive: true, force: true });
-        void sweepImageBookSessions();
+        sweepImageBookSessions().catch((error) => console.warn(`[图片合成] 清理过期暂存失败：${String(error?.message ?? error).slice(0, 160)}`));
       }
       return;
     }
@@ -1878,12 +1887,23 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && pdfMatch) {
       const job = jobStore.get(pdfMatch[1]);
       if (!job) return sendJson(response, 404, { error: "记录不存在。" });
-      cors(response);
+      // 预转换失败的任务从来没有 source.pdf。以前直接 pipe，读流的 ENOENT 没人接，
+      // 成了未捕获异常、整个服务退出——在跑的任务全部中断
+      const sourcePath = jobStore.sourcePath(job.id);
+      const source = await stat(sourcePath).catch((error) => {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      });
+      if (!source) return sendJson(response, 404, { error: "原文件不在了。" });
       response.writeHead(200, {
         "Content-Type": "application/pdf",
+        "Content-Length": source.size,
         "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(job.filename)}`,
       });
-      createReadStream(jobStore.sourcePath(job.id)).pipe(response);
+      await pipeline(createReadStream(sourcePath), response).catch((error) => {
+        // 页面中途关掉、iframe 换了地址都会走到这里，属正常；记一笔，别让它成为未捕获异常
+        console.warn(`[原 PDF] ${job.id} 传输中断：${String(error?.message ?? error).slice(0, 120)}`);
+      });
       return;
     }
 

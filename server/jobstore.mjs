@@ -13,7 +13,7 @@
 
 import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
-import { appendFile, copyFile, readFile, rename, writeFile, rm } from "node:fs/promises";
+import { access, appendFile, copyFile, readFile, rename, writeFile, rm } from "node:fs/promises";
 import { countFallback } from "../lib/page-result.mjs";
 
 /**
@@ -36,6 +36,9 @@ export class JobStore {
     this.jobsDir = join(dataDir, "jobs");
     mkdirSync(this.jobsDir, { recursive: true });
     this.db = new DatabaseSync(join(dataDir, "moye.db"));
+    // 撞锁时等最多 5 秒再报错：服务跑着的时候用 sqlite3 命令行查库（CLAUDE.md 让人这么查）
+    // 会短暂持锁，没有这一句写库会立刻抛 SQLITE_BUSY
+    this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS jobs (
         id           TEXT PRIMARY KEY,
@@ -377,6 +380,17 @@ export class JobStore {
         await rm(path, { force: true });
       },
     };
+  }
+
+  /** 磁盘上有没有已完成的结果（重新精校被取消时据此退回「完成」）。 */
+  async hasResult(id) {
+    try {
+      await access(join(this.dir(id), "result.json"));
+      return true;
+    } catch (error) {
+      if (error?.code === "ENOENT") return false;
+      throw error;
+    }
   }
 
   async readResult(id) {

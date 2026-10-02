@@ -7,7 +7,7 @@ import { fallbackCause, isFallback, outcome, parseAiReason } from "../lib/page-r
 import { explainError, summarizeCauses, type ErrorKind } from "../lib/explain-error.mjs";
 import { newRow, rowsFromSaved, rowsToPayload, type KeyRow } from "../lib/key-pool.mjs";
 import {
-  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPageImageUrl, libraryPdfUrl, listJobs,
+  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPageImageUrl, libraryPdfUrl, listJobs, searchLibrary, type SearchResult,
   exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
   type Batch, type Job, type Reflect, type ReflectRange, type SpeedTable, type Stats, type TagBackfillState, type Usage, type UsageRow,
 } from "../lib/api";
@@ -555,6 +555,71 @@ function MoreMenu({ label, children }: { label: string; children: (close: () => 
   );
 }
 
+/**
+ * 顶栏「进行中」：一个任务时点了直接去它那儿；多个时弹出列表（名字 · 进度 · 用时 · 取消），
+ * 以前只会跳到第一个，其余的得回首页找（Verbatim 顶栏的同款弹层）。点外面 / Esc 关。
+ */
+function ActiveJobsMenu({ jobs, now, onOpen, onCancel }: { jobs: Job[]; now: number; onOpen: (job: Job) => void; onCancel: (job: Job) => void }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => { if (!ref.current?.contains(event.target as Node)) setOpen(false); };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  return (
+    <div className="more-menu running-menu" ref={ref}>
+      <button className="library-nav running-nav" type="button" aria-haspopup={jobs.length > 1 ? "menu" : undefined} aria-expanded={jobs.length > 1 ? open : undefined} title={t("查看进度")}
+        onClick={() => (jobs.length > 1 ? setOpen((value) => !value) : onOpen(jobs[0]))}>
+        <i />{t("进行中")} <b>{jobs.length}</b>
+      </button>
+      {open && (
+        <div className="more-menu-list running-list" role="menu">
+          {jobs.map((job) => (
+            <div key={job.id} className="running-item">
+              <button type="button" role="menuitem" onClick={() => { setOpen(false); onOpen(job); }}>
+                <span>{job.filename}</span>
+                <small>{job.status === "queued" ? t("排队中") : job.total ? `${job.page}/${job.total} ${t("页")}` : t("处理中")} · ⏱ {formatElapsed(now - new Date(job.created_at).getTime())}</small>
+              </button>
+              <button type="button" className="running-cancel" onClick={() => onCancel(job)} aria-label={t("取消「{name}」", { name: job.filename })}>{t("取消")}</button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** 待转区里一个文件的身份（同一个文件拖两次算一个）。 */
+const stagedKey = (f: File) => `${f.name}:${f.size}:${f.lastModified}`;
+
+/**
+ * 待转区里这个文件是不是已经转过：PDF 按「文件名 + 大小」认（Library 存的就是原文件大小）；
+ * Office / 图片存的是转出来的 PDF 的大小，对不上，只能按文件名提示「可能转过」。
+ */
+function findConverted(f: File, library: Job[]): { job: Job; exact: boolean } | null {
+  const done = library.filter((job) => job.status === "done" && job.filename === f.name);
+  const exact = isPdfFile(f) ? done.find((job) => job.file_size === f.size) : undefined;
+  if (exact) return { job: exact, exact: true };
+  return done[0] ? { job: done[0], exact: false } : null;
+}
+
+/** 最近 AI 精校的实际花费，每页多少钱（中位数）。没有计过价的（直连 Kimi / Qwen）不算；样本不到 3 份不给数。 */
+function aiCostPerPage(library: Job[]): number | null {
+  const samples = library
+    .filter((job) => job.mode === "ai" && job.status === "done" && (job.cost_usd ?? 0) > 0 && job.page_count > 0)
+    .slice(0, 50)
+    .map((job) => (job.cost_usd as number) / job.page_count)
+    .sort((a, b) => a - b);
+  return samples.length >= 3 ? samples[Math.floor(samples.length / 2)] : null;
+}
+
 function methodLabel(page: PageResult) {
   const result = outcome(page);
   if (result === "ai" || result === "noText") {
@@ -647,6 +712,10 @@ export default function Home() {
   const [libraryLoading, setLibraryLoading] = useState(true);
   const [libraryError, setLibraryError] = useState("");
   const [query, setQuery] = useState("");
+  // 正文全文搜索的结果（id → 命中），和文件名 / 标签过滤合在一起用；quality 是「有回退页 / 建议复核」筛选
+  const [textHits, setTextHits] = useState<Map<string, SearchResult>>(new Map());
+  const [qualityFilter, setQualityFilter] = useState<"all" | "fallback" | "review">("all");
+  const latestSearch = useRef("");
   // 自由合并下载：跟批次无关，随便勾几份就能拼成一份 .md
   const [selectedLibraryIds, setSelectedLibraryIds] = useState<Set<string>>(new Set());
   const [mergingLibrary, setMergingLibrary] = useState(false);
@@ -835,6 +904,45 @@ export default function Home() {
   }
 
   const stagedHasImage = useMemo(() => staged.some(isImageFile), [staged]);
+  // 待转区预检：每份几页（PDF 在浏览器里读，80MB 以内；图片一张一页；Office 转完才知道）
+  const [stagedPages, setStagedPages] = useState<Record<string, number | null>>({});
+  // 每个文件只读一次页数：已经开始读的记在这里（不放进 state，免得读完一份就触发重跑、把读到一半的那份丢掉重来）
+  const pageCountStarted = useRef(new Set<string>());
+  useEffect(() => {
+    const pending = staged.filter((f) => !pageCountStarted.current.has(stagedKey(f)));
+    if (!pending.length) return;
+    for (const f of pending) pageCountStarted.current.add(stagedKey(f));
+    void (async () => {
+      // pdf-lib 按需加载：没有 PDF 的时候不下载它
+      const pdfLib = pending.some(isPdfFile) ? await import("pdf-lib") : null;
+      for (const f of pending) {
+        let pages: number | null = null;
+        if (isImageFile(f)) pages = 1;
+        else if (pdfLib && isPdfFile(f) && f.size <= 80 * 1024 * 1024) {
+          try {
+            pages = (await pdfLib.PDFDocument.load(await f.arrayBuffer(), { ignoreEncryption: true, updateMetadata: false })).getPageCount();
+          } catch (caught) {
+            // 读不出页数只影响预估，不影响转换：照常可以开始，页数显示「转换后才知道」
+            console.warn(`[预检] 读不出 ${f.name} 的页数：`, caught);
+          }
+        }
+        setStagedPages((prev) => ({ ...prev, [stagedKey(f)]: pages }));
+      }
+    })();
+  }, [staged]);
+  const stagedEstimate = useMemo(() => {
+    const counts = staged.map((f) => stagedPages[stagedKey(f)]);
+    const pages = counts.reduce<number>((sum, n) => sum + (typeof n === "number" ? n : 0), 0);
+    const unknown = counts.filter((n) => typeof n !== "number").length;
+    const secPerPage = speed[mode]?.secPerPage ?? null;
+    const costPerPage = mode === "ai" ? aiCostPerPage(library) : null;
+    return {
+      pages,
+      unknown,
+      seconds: secPerPage !== null && pages ? pages * secPerPage : null,
+      cost: costPerPage !== null && pages ? pages * costPerPage : null,
+    };
+  }, [staged, stagedPages, speed, mode, library]);
   // 「这页本来就没有文字」（照片、空白页）单独数：它在服务端也是 review（要出现在逐页质量里），
   // 但混进「建议检查」会把真正要看的页淹掉——笔记类文档几乎每张插图都会命中
   const noTextPages = useMemo(() => result?.pages.filter((page) => outcome(page) === "noText") ?? [], [result]);
@@ -894,13 +1002,36 @@ export default function Home() {
   const percent = progress.total ? Math.round((progress.page / progress.total) * 100) : 0;
   const filteredLibrary = useMemo(() => {
     const normalized = query.trim().toLocaleLowerCase();
-    if (!normalized) return library;
-    // 文件名和 AI 打的标签都搜：标签本来只在统计面板里露过面，这才有入口
-    return library.filter((item) =>
+    const byQuality = qualityFilter === "fallback"
+      ? library.filter((item) => (item.fallback_count ?? 0) > 0)
+      : qualityFilter === "review"
+        ? library.filter((item) => item.review_count > 0 && !(item.fallback_count ?? 0))
+        : library;
+    if (!normalized) return byQuality;
+    // 文件名、AI 打的标签、正文（服务端全文搜索）都搜；正文命中的按命中次数排在前面
+    const nameOrTag = (item: Job) =>
       item.filename.toLocaleLowerCase().includes(normalized)
-      || parseTags(item.tags).some((tag) => tag.toLocaleLowerCase().includes(normalized))
-    );
-  }, [library, query]);
+      || parseTags(item.tags).some((tag) => tag.toLocaleLowerCase().includes(normalized));
+    return byQuality
+      .filter((item) => nameOrTag(item) || textHits.has(item.id))
+      .sort((a, b) => (textHits.get(b.id)?.count ?? 0) - (textHits.get(a.id)?.count ?? 0));
+  }, [library, query, textHits, qualityFilter]);
+  // 打字停 250ms 再搜正文；只认最后一次的结果（慢的旧请求回来不覆盖新的）
+  useEffect(() => {
+    const term = query.trim();
+    latestSearch.current = term;
+    if (screen !== "library" || term.length < 2) return;
+    const timer = setTimeout(() => {
+      void searchLibrary(term)
+        .then((results) => { if (latestSearch.current === term) setTextHits(new Map(results.map((r) => [r.id, r]))); })
+        .catch((caught) => console.warn("[搜索] 全文搜索失败，只按文件名和标签过滤：", caught));
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [query, screen]);
+  const qualityCounts = useMemo(() => ({
+    fallback: library.filter((item) => (item.fallback_count ?? 0) > 0).length,
+    review: library.filter((item) => item.review_count > 0 && !(item.fallback_count ?? 0)).length,
+  }), [library]);
   /**
    * 按合集分组显示：一次批量转换是一组（可整包下 zip），单独转的不分组。
    * 分组基于筛选后的结果，搜索时合集里只留匹配的那几份，空组不显示。
@@ -1687,6 +1818,16 @@ export default function Home() {
             )}
           </span>
         </button>
+        {textHits.get(record.id) && (
+          <div className="library-hits">
+            <span>{t("正文命中 {n} 处", { n: textHits.get(record.id)!.count })}</span>
+            {textHits.get(record.id)!.hits.slice(0, 2).map((hit, index) => (
+              <button key={`${hit.page}:${index}`} type="button" onClick={() => { setCameFrom("library"); navigate({ name: "doc", id: record.id, page: hit.page }); }}>
+                <b>{t("第 {n} 页", { n: hit.page })}</b> {hit.before}<mark>{hit.match}</mark>{hit.after}
+              </button>
+            ))}
+          </div>
+        )}
         <div className="library-card-footer">
           <span>{record.page_count} {t("页")}</span>
           <span>{formatSize(record.file_size)}</span>
@@ -1805,9 +1946,9 @@ export default function Home() {
         <div className="top-actions">
           {activeJobs.length > 0 && (
             // 进行中的任务在哪个界面都看得见，不只是首页
-            <button className="library-nav running-nav" type="button" title={t("查看进度")} onClick={() => { const j = activeJobs[0]; navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id }); }}>
-              <i />{t("进行中")} <b>{activeJobs.length}</b>
-            </button>
+            <ActiveJobsMenu jobs={activeJobs} now={now}
+              onOpen={(j) => navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id })}
+              onCancel={(j) => void cancelJob(j.id)} />
           )}
           <button className={`library-nav ${screen === "library" ? "active" : ""}`} type="button" onClick={showLibrary} disabled={batchRunning}>Library <b>{library.length}</b></button>
           <button className="lang-toggle" type="button" onClick={toggleLang} aria-label="Switch language" title={lang === "en" ? "切换到中文 / Switch to Chinese" : "Switch to English"}>{lang === "en" ? "中文" : "EN"}</button>
@@ -1834,7 +1975,14 @@ export default function Home() {
             <button className="primary-button" type="button" onClick={reset}>{t("＋ 新转换")}</button>
           </header>
           <div className="library-toolbar">
-            <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => setQuery(event.target.value)} placeholder={t("搜索文件名或标签…")} aria-label={t("搜索资料库")} /></label>
+            <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => { setQuery(event.target.value); if (event.target.value.trim().length < 2) setTextHits(new Map()); }} placeholder={t("搜索文件名、标签或正文…")} aria-label={t("搜索资料库")} /></label>
+            {(qualityCounts.fallback > 0 || qualityCounts.review > 0) && (
+              // 只放两个、带数字、为 0 的不出现（Verbatim 每个引擎一颗筛选，手机上折成 5 行——不学）
+              <div className="quality-filters" role="group" aria-label={t("按质量筛选")}>
+                {qualityCounts.fallback > 0 && <button type="button" className={qualityFilter === "fallback" ? "active" : ""} aria-pressed={qualityFilter === "fallback"} onClick={() => setQualityFilter((f) => (f === "fallback" ? "all" : "fallback"))}>{t("有回退页 {n}", { n: qualityCounts.fallback })}</button>}
+                {qualityCounts.review > 0 && <button type="button" className={qualityFilter === "review" ? "active" : ""} aria-pressed={qualityFilter === "review"} onClick={() => setQualityFilter((f) => (f === "review" ? "all" : "review"))}>{t("建议复核 {n}", { n: qualityCounts.review })}</button>}
+              </div>
+            )}
             <div><strong>{library.length}</strong> {t("份文件 ·")} <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> {t("页")}</div>
             {library.length > 0 && (
               // 直接用 <a download>：整包由服务端生成并流式下载，不经过 JS 内存
@@ -1985,13 +2133,22 @@ export default function Home() {
                   <button type="button" onClick={() => setStaged([])}>{t("清空")}</button>
                 </div>
                 <ul className="staged-list">
-                  {staged.map((f) => (
-                    <li key={`${f.name}:${f.size}:${f.lastModified}`}>
+                  {staged.map((f) => {
+                    const converted = findConverted(f, library);
+                    const pages = stagedPages[stagedKey(f)];
+                    return (
+                    <li key={stagedKey(f)}>
                       <span>{f.name}</span>
-                      <span className="staged-size">{formatSize(f.size)}</span>
+                      {converted && (
+                        <button type="button" className="staged-dup" onClick={() => navigate({ name: "doc", id: converted.job.id })} title={t("{date} 转过", { date: converted.job.created_at.slice(0, 10) })}>
+                          {converted.exact ? t("已在资料库 · 打开") : t("资料库里有同名文件 · 打开")}
+                        </button>
+                      )}
+                      <span className="staged-size">{typeof pages === "number" ? `${t("{n} 页", { n: pages })} · ` : ""}{formatSize(f.size)}</span>
                       <button type="button" aria-label={t("移除 {name}", { name: f.name })} onClick={() => setStaged((prev) => prev.filter((x) => x !== f))}>{t("移除")}</button>
                     </li>
-                  ))}
+                    );
+                  })}
                 </ul>
                 <button
                   className="primary-button staged-start"
@@ -2000,6 +2157,16 @@ export default function Home() {
                 >
                   {t("开始转换 · {mode}", { mode: t(modeNames[mode]) })}
                 </button>
+                {stagedEstimate.pages > 0 && (
+                  // 开始之前就知道来不来得及、要花多少：用时按这台机器最近的实际速度，花费按最近 AI 精校的实际账单
+                  <p className="staged-estimate">
+                    {stagedEstimate.unknown
+                      ? t("至少 {n} 页（{k} 份转换后才知道页数）", { n: stagedEstimate.pages, k: stagedEstimate.unknown })
+                      : t("共 {n} 页", { n: stagedEstimate.pages })}
+                    {stagedEstimate.seconds !== null && <> · {t("约 {time}", { time: formatElapsed(stagedEstimate.seconds * 1000) })}</>}
+                    {stagedEstimate.cost !== null && <> · {t("约 {cost}", { cost: fmtUsd(stagedEstimate.cost) })}</>}
+                  </p>
+                )}
                 {stagedHasImage && (
                   // 图片还有另一种去处：不识别，直接按文件名顺序拼成一份 PDF。
                   // 放在「开始转换」下面而不是换掉它——拖图片进来最常见的还是要识别。

@@ -277,6 +277,18 @@ export function libraryPageImageUrl(id: string, page: number): string {
   return `${SERVICE_BASE}/api/library/${id}/page/${page}.jpg`;
 }
 
+/** 全文搜索里的一处命中：第几页，命中词前后各一小段（已去掉 Markdown 记号）。 */
+export type SearchHit = { page: number; before: string; match: string; after: string };
+export type SearchResult = { id: string; count: number; hits: SearchHit[] };
+
+/** 资料库全文搜索（正文逐页找，中文两个字也行），按命中次数排。 */
+export async function searchLibrary(query: string): Promise<SearchResult[]> {
+  const response = await fetch(`${SERVICE_BASE}/api/search?q=${encodeURIComponent(query)}`);
+  const payload = await response.json() as { results?: SearchResult[]; error?: string };
+  if (!response.ok) throw new Error(payload.error || "搜索失败。");
+  return payload.results ?? [];
+}
+
 export function libraryPdfUrl(id: string): string {
   return `${SERVICE_BASE}/api/library/${id}/pdf`;
 }

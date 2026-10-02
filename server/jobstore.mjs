@@ -15,6 +15,7 @@ import { DatabaseSync } from "node:sqlite";
 import { mkdirSync } from "node:fs";
 import { access, appendFile, copyFile, readFile, rename, writeFile, rm } from "node:fs/promises";
 import { countFallback } from "../lib/page-result.mjs";
+import { previewOf } from "./search.mjs";
 
 /**
  * 先写临时文件再 rename 覆盖。rename 在同一文件系统上是原子的：要么是完整的新文件，
@@ -208,11 +209,7 @@ export class JobStore {
     }
     // 摘要写进库：Library 列表只查 SQLite，不用逐份读 result.json
     const pages = Array.isArray(result?.pages) ? result.pages : [];
-    const preview = String(result?.markdown ?? "")
-      .replace(/[#*`$|<>\\]/g, "")
-      .replace(/\s+/g, " ")
-      .trim()
-      .slice(0, 240);
+    const preview = previewOf(result?.markdown);
     // 统计面板要用：字数按每页已经算好的 charCount 求和，不用重新扫一遍全文
     const charCount = pages.reduce((sum, p) => sum + (Number(p?.charCount) || 0), 0);
     this.db
@@ -431,6 +428,27 @@ export class JobStore {
    * fallback_count 列是后加的，老记录是 NULL。逐份读 result.json 算一次写回去，
    * 之后就只走 SQL。读不到 result.json 的记为 0，别每次启动都再试一遍。
    */
+  /**
+   * 预览以前直接取 Markdown 开头，每张卡都是「标题 由墨页转换，共 N 页……」。
+   * 启动时把这种老预览按 previewOf 的规则从 document.md 重算一遍（只动这一列）。
+   */
+  async backfillPreviews() {
+    // 老预览是「标题 由墨页转换，共 N 页……」：标题在前，所以按「包含」找，不是按开头
+    const rows = this.db.prepare("SELECT id FROM jobs WHERE status = 'done' AND (preview IS NULL OR preview LIKE '%由墨页转换，共%' OR preview LIKE '%](%')").all();
+    const write = this.db.prepare("UPDATE jobs SET preview = ? WHERE id = ?");
+    let updated = 0;
+    for (const { id } of rows) {
+      const markdown = await readFile(join(this.dir(id), "document.md"), "utf8").catch((error) => {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      });
+      if (markdown === null) continue;
+      write.run(previewOf(markdown), id);
+      updated += 1;
+    }
+    return updated;
+  }
+
   async backfillFallbackCounts() {
     const rows = this.db.prepare("SELECT id FROM jobs WHERE status = 'done' AND fallback_count IS NULL").all();
     const write = this.db.prepare("UPDATE jobs SET fallback_count = ? WHERE id = ?");

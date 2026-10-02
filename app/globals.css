@@ -248,6 +248,25 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 .more-menu-list button { padding:10px 12px; border:0; border-radius:7px; background:transparent; color:var(--ink); font-size:13px; text-align:left; cursor:pointer; }
 .more-menu-list button:hover, .more-menu-list button:focus-visible { background:var(--green-soft); }
 .more-menu-list button:disabled { opacity:.45; cursor:default; }
+/* 资料库：质量筛选 + 正文命中 */
+.quality-filters { display:flex; gap:6px; flex-wrap:wrap; }
+.quality-filters button { padding:6px 11px; border:1px solid var(--line); border-radius:999px; background:transparent; color:inherit; font-size:12px; cursor:pointer; }
+.quality-filters button.active { border-color:#b5523b; color:#9b3d2a; background:#f6ece3; }
+.library-hits { display:flex; flex-direction:column; gap:4px; padding:0 16px 12px; font-size:12px; }
+.library-hits>span { opacity:.55; }
+.library-hits button { padding:6px 8px; border:0; border-radius:7px; background:rgba(23,35,29,.04); color:inherit; font-size:12px; line-height:1.55; text-align:left; cursor:pointer; overflow-wrap:anywhere; }
+.library-hits button:hover, .library-hits button:focus-visible { background:var(--green-soft); }
+.library-hits mark { padding:0 1px; border-radius:3px; background:#f3d68a; color:inherit; }
+/* 待转区预检 */
+.staged-dup { flex:none; padding:2px 8px; border:1px solid rgba(166,99,63,.3); border-radius:999px; background:#f6ece3; color:#874b31; font-size:12px; cursor:pointer; white-space:nowrap; }
+.staged-estimate { margin:6px 0 0; font-size:12px; opacity:.7; text-align:center; font-variant-numeric:tabular-nums; }
+/* 顶栏「进行中」弹层 */
+.running-list { min-width:300px; max-width:min(420px, calc(100vw - 32px)); }
+.running-item { display:flex; align-items:center; gap:6px; }
+.running-item>button:first-child { flex:1; min-width:0; display:flex; flex-direction:column; gap:2px; }
+.running-item>button:first-child span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:13px; }
+.running-item small { font-size:12px; opacity:.6; }
+.running-item .running-cancel { flex:none; font-size:12px; color:#9b513e; }
 /* 「第 N 页」链接 → 逐页核对 */
 .page-link { padding:0; border:0; background:none; color:inherit; font:inherit; cursor:pointer; text-decoration:underline; text-decoration-color:rgba(23,35,29,.25); text-underline-offset:3px; }
 .page-link:hover, .page-link:focus-visible { text-decoration-color:currentColor; }

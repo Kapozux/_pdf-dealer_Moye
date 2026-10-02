@@ -18,6 +18,7 @@ import { maskedKey, splitKeys } from "./lib/key-pool.mjs";
 import { foreignRequestReason, LOCAL_ORIGIN } from "./server/request-guard.mjs";
 import { fetchWithTimeout } from "./server/fetch-timeout.mjs";
 import { failoverChain } from "./server/openrouter-failover.mjs";
+import { createSearchIndex } from "./server/search.mjs";
 import { ALL_PROVIDERS, createSettingsStore, defaultSettings, normalizeSettings, providerConfigured } from "./server/settings.mjs";
 import { createRenderer } from "./server/render.mjs";
 import { createOfficeConverter, isOfficeFile } from "./server/office2pdf.mjs";
@@ -1413,6 +1414,12 @@ async function handleSettingsTest(settings, response) {
   sendJson(response, 200, result);
 }
 
+// 资料库全文搜索：第一次搜索时把已完成文档的逐页文字载入内存（全库约 9MB），之后按 updated_at 增量同步
+const searchIndex = createSearchIndex({
+  listDone: () => jobStore.list({ limit: 100000 }).filter((job) => job.status === "done"),
+  loadPages: async (id) => (await jobStore.readResult(id))?.pages ?? [],
+});
+
 // 外来请求每种原因只记一条日志：被某个网页反复探测时不刷屏，但第一次一定看得到
 const loggedForeign = new Set();
 
@@ -1637,6 +1644,13 @@ const server = createServer(async (request, response) => {
     }
 
     // ---- Library：列表 / 结果 / 原始 PDF / 删除 ----
+    // GET /api/search?q=鲁迅 → [{ id, count, hits: [{ page, before, match, after }] }]，按命中次数排
+    if (request.method === "GET" && request.url?.startsWith("/api/search?")) {
+      const query = new URL(request.url, "http://127.0.0.1").searchParams.get("q") ?? "";
+      sendJson(response, 200, { query, results: await searchIndex.search(query.slice(0, 200)) });
+      return;
+    }
+
     if (request.method === "GET" && request.url === "/api/library") {
       const jobs = jobStore.list({ limit: 500 }).filter((job) => job.status === "done");
       sendJson(response, 200, { items: jobs });
@@ -1943,6 +1957,7 @@ server.listen(port, "127.0.0.1", async () => {
     console.log(`重启恢复：重新排队 ${recovered.requeued} 个，标记失败 ${recovered.failed} 个`);
   }
   // 老记录补算回退页数（只在列刚加上的那次启动真正干活）
+  jobStore.backfillPreviews().then((n) => { if (n) console.log(`补算卡片预览：${n} 份`); }).catch((error) => console.error("[补算卡片预览失败]", error));
   jobStore.backfillFallbackCounts().then((n) => { if (n) console.log(`补算回退页数：${n} 份`); }).catch((error) => console.error("[补算回退页数失败]", error));
   jobStore.backfillDurations().then((n) => { if (n) console.log(`补算转换耗时：${n} 份`); }).catch((error) => console.error("[补算转换耗时失败]", error));
   // 图片合成 PDF 的暂存区：上次没走完的会话清一清（正常路径在 build 的 finally 里已经删了）

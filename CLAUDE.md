@@ -1,6 +1,7 @@
 # 墨页 · 给 AI 助手的工作约束
 
 这份文件是给 Claude / AI 助手看的。**动手前先读完**。
+改界面之前再读 `docs/UI_DESIGN.md`（一个区域一个主按钮、字号 ≥12px、颜色走变量、报错说人话、改完按清单截图核对）。
 
 本项目是本机运行的 PDF→Markdown 工具，用户是它的日常使用者，
 经常**正在用它处理真实作业**。任何操作都可能打断真实工作。
@@ -159,6 +160,7 @@ server/settings.mjs    settings.local.json 的 load / save（部分保存：没�
 server/request-guard.mjs  8765 只接本机请求：Host 必须是 127.0.0.1/localhost/[::1]:8765（防 DNS rebinding），带 Origin 的必须是本机页面（任意端口，Moye 3000、Verbatim 5001）；不带 Origin 的本机程序（curl、install.sh、Verbatim 的 sources.py）照常放行。加它是因为任意网页都能对本机发不预检的 POST——改 AI 服务地址就能让之后每次转换把 Key 发出去。新加调用方时用 127.0.0.1:8765
 lib/explain-error.mjs  报错 → 类别（额度 / Key / 限流 / 超时 / 连不上 / 模型 / 拦截 / 输出坏 / 没过校验 / 空文件）+ 重跑有没有用。规则按库里真实报错定（2026-10-02 全库 1184 页回退页全部归得了类）；Gemini 额度用完回的是 429，所以「额度」排在「限流」前。文案在 page.tsx 的 errorCopy（走 i18n）；报错原文从 reasons 里读回用 page-result.mjs 的 parseAiReason / fallbackCause
 lib/safe-url.mjs       Markdown 里链接 / 图片地址的白名单（javascript: 之类只留文字，外链图片不自动加载）；页面的 renderMarkdown 用 safeLinkRenderers。md2pdf.mjs 那份渲染还没接上
+scripts/screenshot.mjs 给跑着的页面截图（三个宽度 × 浅色 / 深色，改 UI 后对照用）：用 data/browser/ 自带的无头浏览器 + 临时 profile，走 DevTools 协议（页面上一直开着 SSE，`--screenshot` 那种等网络空闲的方式永远等不到头）
                        结果页「逐页核对」：左原图（GET /api/library/<id>/page/<n>.jpg，服务端用 pypdfium2 现渲染一页、最近 40 页缓存在内存）、右这一页的结果；地址 #/doc/<id>/p/<n> 可直接分享到某一页，同一份文档里前进后退不重新拉结果
 lib/api.ts             浏览器→8765 的任务类 API 客户端（提交/查询/SSE 订阅/Library/导出）
 lib/pdf-to-markdown.ts 只剩前后端共用的类型定义；真正实现已搬到 server/convert.mjs

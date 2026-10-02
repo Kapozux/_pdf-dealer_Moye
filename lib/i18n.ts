@@ -286,6 +286,7 @@ export const en: Record<string, string> = {
   "展开看原始报错": "Expand to see the raw error",
   "其他": "Other",
   "原始报错": "Raw error",
+  "图片": "Image",
   "这页结果为空": "this page came out empty",
   "{n} 页 AI 没成功": "{n} pages failed in AI",
   "其中 {n} 页在结果里是空的：扫描页没有文字层可回退": "{n} of them are empty in the result: scanned pages have no text layer to fall back to",

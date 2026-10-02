@@ -13,6 +13,7 @@ import {
 } from "../lib/api";
 import { t, tServer, getActiveLang, setActiveLang, readStoredLang, storeLang, type Lang } from "../lib/i18n";
 import { marked } from "marked";
+import { safeLinkRenderers } from "../lib/safe-url.mjs";
 import katex from "katex";
 import "katex/dist/katex.min.css";
 
@@ -142,7 +143,8 @@ const escapeHtml = (s: string) =>
  * Markdown → HTML（含 LaTeX）。输出是带公式的 Markdown，只给源码看等于让人肉眼读 $…$
  * 判断公式对不对；渲染出来才叫"可验证"。
  * 公式先换成占位符再交给 marked：否则 LaTeX 里的 _ * \ 会被当成 Markdown 语法吃掉。
- * 原文里的裸 HTML 一律转义——内容来自 PDF 和模型，不可信。
+ * 原文里的裸 HTML 一律转义——内容来自 PDF 和模型，不可信。链接和图片同理：
+ * 地址过白名单（lib/safe-url.mjs），javascript: 之类只留文字，外链图片不自动加载。
  */
 function renderMarkdown(source: string): string {
   const formulas: string[] = [];
@@ -155,6 +157,7 @@ function renderMarkdown(source: string): string {
     .replace(/(^|[^\\$])\$((?:\\.|[^$\n])+?)\$/g, (_, lead: string, latex: string) => `${lead}${stash(latex, false)}`);
   const renderer = new marked.Renderer();
   renderer.html = ({ text }) => escapeHtml(text);
+  Object.assign(renderer, safeLinkRenderers(t("图片")));
   const html = marked.parse(withPlaceholders, { renderer, gfm: true, async: false }) as string;
   return html.replace(/\uE000(\d+)\uE001/g, (_, index: string) => formulas[Number(index)] ?? "");
 }

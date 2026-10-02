@@ -1928,7 +1928,8 @@ const server = createServer(async (request, response) => {
     sendJson(response, 404, { error: "Not found" });
   } catch (error) {
     const message = error instanceof Error ? error.message : "服务处理失败。";
-    const status = /API Key|缺少|有效的 JSON|过大|未知的转换模式/.test(message) ? 400 : 500;
+    // 4xx = 请求本身有问题（缺字段、空文件、超大），5xx = 服务这边出了错
+    const status = /API Key|缺少|有效的 JSON|过大|未知的转换模式|是空的|超过 \d+MB/.test(message) ? 400 : 500;
     sendJson(response, status, { error: message });
   }
 });

@@ -53,7 +53,7 @@ mode reads a text layer, which an image does not have** — use Balanced or AI r
 One command on a fresh Mac — no Homebrew, no sudo, no Python or Node needed beforehand:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xyzxinlu-max/moye-pdf-to-markdown/main/install.sh | zsh
+curl -fsSL https://raw.githubusercontent.com/Kapozux/_pdf-dealer_Moye/main/install.sh | zsh
 ```
 
 Or, from a clone, double-click `一键安装.command` (first time: right-click → Open) or run `./install.sh`.

@@ -2,7 +2,7 @@
 # 墨页 · 一键安装
 #
 #   在仓库里：   ./install.sh            （或双击「一键安装.command」）
-#   全新机器：   curl -fsSL https://raw.githubusercontent.com/xyzxinlu-max/moye-pdf-to-markdown/main/install.sh | zsh
+#   全新机器：   curl -fsSL https://raw.githubusercontent.com/Kapozux/_pdf-dealer_Moye/main/install.sh | zsh
 #
 # 设计原则：
 #   - 不需要 Homebrew、不需要 sudo。Node 和 Python 都装进项目自己的目录（.runtime/、.venv/），
@@ -22,7 +22,7 @@
 set -euo pipefail
 
 # MOYE_REPO_TARBALL 可以指到别的包（fork、某个 tag，或测试用的本地 file:// 包）
-REPO_TARBALL="${MOYE_REPO_TARBALL:-https://codeload.github.com/xyzxinlu-max/moye-pdf-to-markdown/tar.gz/refs/heads/main}"
+REPO_TARBALL="${MOYE_REPO_TARBALL:-https://codeload.github.com/Kapozux/_pdf-dealer_Moye/tar.gz/refs/heads/main}"
 NODE_MIN="22.13.0"
 OLLAMA_URL="${MOYE_OLLAMA_URL:-http://127.0.0.1:11434}"
 

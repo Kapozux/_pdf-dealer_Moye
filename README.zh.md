@@ -9,7 +9,7 @@
 全新的 Mac 上一条命令（不需要 Homebrew、不需要管理员密码、不需要事先装 Python 或 Node）：
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xyzxinlu-max/moye-pdf-to-markdown/main/install.sh | zsh
+curl -fsSL https://raw.githubusercontent.com/Kapozux/_pdf-dealer_Moye/main/install.sh | zsh
 ```
 
 已经下载了项目的话，双击 `一键安装.command`（第一次要右键 → 打开），或在终端运行 `./install.sh`。

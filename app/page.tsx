@@ -3010,7 +3010,7 @@ export default function Home() {
                     <div className="about-rows">
                       <div className="about-row"><span>{t("版本")}</span><code>0.1.0</code></div>
                       <div className="about-row"><span>{t("数据目录")}<small>{t("文档、原始文件和逐页记录都在这里，删掉即清空。")}</small></span><code>data/</code></div>
-                      <div className="about-row"><a href="https://github.com/xyzxinlu-max/moye-pdf-to-markdown" target="_blank" rel="noopener noreferrer">{t("源码在 GitHub ↗")}</a><a href="https://github.com/xyzxinlu-max/moye-pdf-to-markdown#readme" target="_blank" rel="noopener noreferrer">{t("使用说明 ↗")}</a></div>
+                      <div className="about-row"><a href="https://github.com/Kapozux/_pdf-dealer_Moye" target="_blank" rel="noopener noreferrer">{t("源码在 GitHub ↗")}</a><a href="https://github.com/Kapozux/_pdf-dealer_Moye#readme" target="_blank" rel="noopener noreferrer">{t("使用说明 ↗")}</a></div>
                     </div>
                   </div>
                 </section>

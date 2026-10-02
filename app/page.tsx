@@ -620,6 +620,11 @@ function aiCostPerPage(library: Job[]): number | null {
   return samples.length >= 3 ? samples[Math.floor(samples.length / 2)] : null;
 }
 
+/** 外观：跟随系统 / 浅色 / 深色。存在 localStorage 的 moye_theme（layout.tsx 开页时就读它） */
+type Theme = "system" | "light" | "dark";
+const themeNames: Record<Theme, string> = { system: "跟随系统", light: "浅色", dark: "深色" };
+const themeIcons: Record<Theme, string> = { system: "◐", light: "☀", dark: "☾" };
+
 function methodLabel(page: PageResult) {
   const result = outcome(page);
   if (result === "ai" || result === "noText") {
@@ -786,6 +791,29 @@ export default function Home() {
   // 界面语言。SSR 和首屏都用中文，挂载后按本机存的偏好切换（避免水合不一致）；
   // 每次渲染开头把当前语言写进 i18n 模块，之后所有 t() 都按它查表。
   const [lang, setLang] = useState<Lang>("zh");
+  const [theme, setTheme] = useState<Theme>("system");
+  // 开页时 layout.tsx 已经按记住的外观设好 data-theme，这里只把按钮的状态对上
+  useEffect(() => {
+    try {
+      const stored = window.localStorage.getItem("moye_theme");
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      if (stored === "light" || stored === "dark") setTheme(stored);
+    } catch {
+      /* 隐私模式读不了 localStorage：就跟随系统 */
+    }
+  }, []);
+  function cycleTheme() {
+    const next: Theme = theme === "system" ? "light" : theme === "light" ? "dark" : "system";
+    setTheme(next);
+    if (next === "system") delete document.documentElement.dataset.theme;
+    else document.documentElement.dataset.theme = next;
+    try {
+      if (next === "system") window.localStorage.removeItem("moye_theme");
+      else window.localStorage.setItem("moye_theme", next);
+    } catch {
+      /* 存不住只影响下次打开，这次已经切过去了 */
+    }
+  }
   setActiveLang(lang);
   useEffect(() => {
     // 放到下一拍：首屏必须和 SSR 一样是中文，水合完成后再切到本机偏好
@@ -1951,6 +1979,7 @@ export default function Home() {
               onCancel={(j) => void cancelJob(j.id)} />
           )}
           <button className={`library-nav ${screen === "library" ? "active" : ""}`} type="button" onClick={showLibrary} disabled={batchRunning}>Library <b>{library.length}</b></button>
+          <button className="lang-toggle theme-toggle" type="button" onClick={cycleTheme} aria-label={t("外观：{mode}", { mode: t(themeNames[theme]) })} title={t("外观：{mode}（点一下切换）", { mode: t(themeNames[theme]) })}>{themeIcons[theme]}</button>
           <button className="lang-toggle" type="button" onClick={toggleLang} aria-label="Switch language" title={lang === "en" ? "切换到中文 / Switch to Chinese" : "Switch to English"}>{lang === "en" ? "中文" : "EN"}</button>
           <button className="settings-button" type="button" onClick={openSettings}>{t("⚙ 设置")}</button>
           {status !== "idle" && !batchRunning && <button className="quiet-button" type="button" onClick={reset}>{t("＋ 新转换")}</button>}

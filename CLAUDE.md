@@ -155,6 +155,7 @@ lib/ai-settings.ts     AI 设置的类型 + 浏览器→8765 的设置类 API �
 lib/page-result.mjs    「一页最后算什么」的唯一定义：outcome()（ai / noText / fallback / local）、四种 AI 结果的构造、重跑用的 toDraft（白名单取字段）、页面度量。前后端共用，所以是 .mjs + JSDoc
 lib/key-pool.mjs       额外 Gemini Key 列表的页面↔服务端协议，两半写在一起：页面 rowsFromSaved / rowsToPayload，服务端 mergeExtraKeys。占位符带出处 `__KEEP__:<位置>:<末4位>`
 server/settings.mjs    settings.local.json 的 load / save（部分保存：没传的字段沿用；多处同时保存会排队）、normalizeSettings、providerConfigured（「这家能用了吗」的唯一判断）
+server/request-guard.mjs  8765 只接本机请求：Host 必须是 127.0.0.1/localhost/[::1]:8765（防 DNS rebinding），带 Origin 的必须是本机页面（任意端口，Moye 3000、Verbatim 5001）；不带 Origin 的本机程序（curl、install.sh、Verbatim 的 sources.py）照常放行。加它是因为任意网页都能对本机发不预检的 POST——改 AI 服务地址就能让之后每次转换把 Key 发出去。新加调用方时用 127.0.0.1:8765
 lib/explain-error.mjs  报错 → 类别（额度 / Key / 限流 / 超时 / 连不上 / 模型 / 拦截 / 输出坏 / 没过校验 / 空文件）+ 重跑有没有用。规则按库里真实报错定（2026-10-02 全库 1184 页回退页全部归得了类）；Gemini 额度用完回的是 429，所以「额度」排在「限流」前。文案在 page.tsx 的 errorCopy（走 i18n）；报错原文从 reasons 里读回用 page-result.mjs 的 parseAiReason / fallbackCause
 lib/safe-url.mjs       Markdown 里链接 / 图片地址的白名单（javascript: 之类只留文字，外链图片不自动加载）；页面的 renderMarkdown 用 safeLinkRenderers。md2pdf.mjs 那份渲染还没接上
                        结果页「逐页核对」：左原图（GET /api/library/<id>/page/<n>.jpg，服务端用 pypdfium2 现渲染一页、最近 40 页缓存在内存）、右这一页的结果；地址 #/doc/<id>/p/<n> 可直接分享到某一页，同一份文档里前进后退不重新拉结果

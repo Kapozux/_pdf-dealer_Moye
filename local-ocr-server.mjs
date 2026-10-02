@@ -15,6 +15,7 @@ import { JobQueue, EventHub } from "./server/queue.mjs";
 import { createConverter, gateStats } from "./server/convert.mjs";
 import { isFallback } from "./lib/page-result.mjs";
 import { maskedKey, splitKeys } from "./lib/key-pool.mjs";
+import { foreignRequestReason, LOCAL_ORIGIN } from "./server/request-guard.mjs";
 import { ALL_PROVIDERS, createSettingsStore, defaultSettings, normalizeSettings, providerConfigured } from "./server/settings.mjs";
 import { createRenderer } from "./server/render.mjs";
 import { createOfficeConverter, isOfficeFile } from "./server/office2pdf.mjs";
@@ -52,7 +53,6 @@ await mkdir(resolve(root, "tmp/pdfs"), { recursive: true });
 
 // 本机来源一律放行：写死 localhost:3000 时，用 127.0.0.1:3000 打开页面会被
 // 浏览器整个拦掉（Library 看起来就是空的），而两个地址都指向同一台机器。
-const LOCAL_ORIGIN = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])(:\d+)?$/;
 
 function cors(response, request) {
   const origin = request?.headers?.origin;
@@ -1451,7 +1451,20 @@ async function handleSettingsTest(settings, response) {
   sendJson(response, 200, result);
 }
 
+// 外来请求每种原因只记一条日志：被某个网页反复探测时不刷屏，但第一次一定看得到
+const loggedForeign = new Set();
+
 const server = createServer(async (request, response) => {
+  const foreign = foreignRequestReason(request.headers, port);
+  if (foreign) {
+    if (!loggedForeign.has(foreign) && loggedForeign.size < 100) {
+      loggedForeign.add(foreign);
+      console.warn(`[拒绝外来请求] ${request.method} ${String(request.url).slice(0, 80)}：${foreign}`);
+    }
+    response.writeHead(403, { "Content-Type": "application/json; charset=utf-8" });
+    response.end(JSON.stringify({ error: `墨页只接受本机的请求（${foreign}）。` }));
+    return;
+  }
   cors(response, request);
   if (request.method === "OPTIONS") {
     response.writeHead(204);

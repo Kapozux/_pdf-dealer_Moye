@@ -100,8 +100,6 @@ test("ships local extraction, a persistent library, bundled workers, Surya, AI r
   assert.match(ocrServer, /responseMimeType: "application\/json"/);
   assert.match(ocrServer, /settings\.local\.json/);
   assert.match(ocrServer, /\/api\/ai-refine/);
-  assert.match(ocrServer, /api\.moonshot\.ai\/v1/);
-  assert.match(ocrServer, /dashscope\.aliyuncs\.com\/compatible-mode\/v1/);
   assert.match(ocrServer, /callOpenAiCompatible/);
   assert.match(ocrServer, /listConfiguredModels/);
   assert.match(ocrServer, /enable_thinking: false/);

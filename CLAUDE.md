@@ -109,7 +109,7 @@ grep '\[AI失败\]\|\[换供应商\]\|\[换模型\]\|\[模型熔断\]\|\[补救\
 - **「重新精校」可以只重跑回退页**：结果页的「只重跑 N 页回退页」按钮 → `POST /api/library/<id>/refine` 带 `{only:"fallback"}`
   → 选项写在 `data/jobs/<id>/refine.json`（不塞进 previous.json，因为失败时 previous 会原样存回去）
   → `refineExisting` 把上次成功的 AI 页作为 `keep` 交给 `refineWithAi`，走的就是逐页存档那条「已完成页直接用」的路径。
-  「回退页」的唯一定义是 `isFallbackPage`（convert.mjs 导出，page.tsx 有一份镜像）：`aiAttempted && method !== "ai"`，noText 算成功不算回退。
+  「回退页」的唯一定义是 `lib/page-result.mjs` 的 `outcome()`（`isFallback` 由它派生；convert / jobstore / 精校路由 / page.tsx 都 import 这一份，没有镜像了）：`aiAttempted && method !== "ai"`，noText 算成功不算回退。
   加它是因为 912 页的书有 409 页因上游超时回退，整份重跑要把 503 页好的也再花一遍钱。
 - **「模型返回空白」不等于失败**：模型可以回 `noText: true` + `note`（例：a photo of a cat），
   表示这页/这张图本来就没有可提取的文字。这条路径在 `normalizeAiResult`（local-ocr-server.mjs）
@@ -134,7 +134,7 @@ grep '\[AI失败\]\|\[换供应商\]\|\[换模型\]\|\[模型熔断\]\|\[补救\
 ### 代码地图（谁管什么，改之前先找对文件）
 
 ```
-local-ocr-server.mjs   8765 服务入口：HTTP 路由、四家供应商调用、settings.local.json 读写
+local-ocr-server.mjs   8765 服务入口：HTTP 路由、五家供应商调用（settings.local.json 的读写已搬到 server/settings.mjs）
 server/queue.mjs       按模式（fast/balanced/math/ai）分车道限流 + 协作式取消 + SSE 广播
 server/convert.mjs     转换管线本体：文字层排版还原、Surya HTML→MD、AI 校验/回退、aiGate/renderGate 两个闸
 server/pacer.mjs       AI 模式的自适应节流器（AIMD，按渠道独立车道），local-ocr-server 用它派活
@@ -151,7 +151,10 @@ server/filenames.mjs   源文件名 → 标题的唯一一份扩展名正则（�
 server/zip.mjs         手写最小 ZIP 打包器，只为 Library 整包下载存在
 server/images2pdf.mjs  很多图片 → 一份成品 PDF（反方向的旁路，跟 md2pdf 同一类：不进队列、不进 Library、不识别）。**和上面的 image2pdf.mjs 是两条路，别改错**：那条是为了喂识别管线（resolution=144、长边压到 4000px），这条的 PDF 本身就是交付物，所以一个像素都不缩，JPEG/PNG 原字节用 pdf-lib 直接 embed——Pillow 存 PDF 会把每张重新编码成 JPEG，成品会比原图糊一档；只有 webp/heic/tiff/bmp/gif、多帧、带 EXIF 旋转的才过一道 Pillow 转 JPEG(q95)/PNG，HEIC 照旧先走 sips。页面尺寸不影响存进去的像素（PDF 里是矢量坐标），按「图片自身比例、长边 = A4 长边 842pt」排版，每页被填满无白边，比原图小的不放大。上传分两步（`POST /api/images2pdf/part` 逐张流式落到 `tmp/images2pdf/<session>/`，`POST /api/images2pdf/build` 按页序合成后回 PDF 并删暂存，另有 2 小时的残留扫除），是为了不把几十张照片一次性堆进内存；坏图逐张跳过、原因走 `X-Moye-Skipped` 响应头回到页面（规矩四：不静默吞错误）
 server/md2pdf.mjs      Markdown → PDF（反方向）：marked + KaTeX 渲染成 HTML，再用**自带的** chrome-headless-shell 无头打印（DevTools 协议 Page.printToPDF；`npm run browser:install` 下到 `data/browser/`，独立程序 + 独立 profile，和用户的 Chrome 无关——2026-09-14 直接调 /Applications 里的 Chrome 时把用户正开着的 Chrome 关掉过一次，原因没查清，**测试时也绝不要再启动用户的 Chrome**）。没装自带浏览器才兜底用系统 Chrome，日志 `[PDF]` 会提醒。入口两个：结果页「下载 PDF」（GET /api/library/<id>/document.pdf）和首页拖入 .md（POST /api/md2pdf）。不进队列不进 Library。**不要传 --user-data-dir**：全新 profile 实测要等 60～113s，不传 2s。**不要用 `--print-to-pdf` 命令行开关**：它退出时有竞态，大 PDF 没写完就 SIGTRAP 崩（912 页的书 3/3 必崩），现在走 `--remote-debugging-pipe` + `Page.printToPDF` 流式取回。单次打印超过约 150 页 Chrome 渲染进程也会偶发崩，所以大文档按标题切段（`splitMarkdownForPrint`，默认 300KB 一段）分别打印、失败重试、再用 pdf-lib 合并，日志标签 `[PDF重试]`。版面逐条对照 obsidian.asar 里的 app.css 抄的（用户要「和 Obsidian 导出 PDF 一样」；2026-09-14 核对过：导出字体是 **Arial**、正文纯黑、Letter + 1cm 边距 + 32px 内边距、文件名印成第一个 h1、标题上下只有 1rem、链接带下划线、自绘圆点和勾选框、提示框带 lucide 图标——细节见 PRINT_CSS 的注释），语法也按 Obsidian：单换行即换行、`> [!note]` 提示框、`==高亮==`、`[[双链]]`、去掉 YAML 属性区——只在 PDF 这条路，页面「渲染」tab 不受影响
-lib/ai-settings.ts     AI 设置的类型 + 浏览器→8765 的设置类 API 客户端
+lib/ai-settings.ts     AI 设置的类型 + 浏览器→8765 的设置类 API 客户端（局部保存用 patchAiSettings，只发改动的字段）
+lib/page-result.mjs    「一页最后算什么」的唯一定义：outcome()（ai / noText / fallback / local）、四种 AI 结果的构造、重跑用的 toDraft（白名单取字段）、页面度量。前后端共用，所以是 .mjs + JSDoc
+lib/key-pool.mjs       额外 Gemini Key 列表的页面↔服务端协议，两半写在一起：页面 rowsFromSaved / rowsToPayload，服务端 mergeExtraKeys。占位符带出处 `__KEEP__:<位置>:<末4位>`
+server/settings.mjs    settings.local.json 的 load / save（部分保存：没传的字段沿用；多处同时保存会排队）、normalizeSettings、providerConfigured（「这家能用了吗」的唯一判断）
 lib/api.ts             浏览器→8765 的任务类 API 客户端（提交/查询/SSE 订阅/Library/导出）
 lib/pdf-to-markdown.ts 只剩前后端共用的类型定义；真正实现已搬到 server/convert.mjs
 app/page.tsx           前端几乎全部逻辑（2000+ 行单文件）：拖拽/批量、进度订阅、Library、结果四个 tab、统一面板（左侧栏目：回顾 / 资料库 / 用量 / AI 精校设置 / 环境 / 关于，`openPanel(pane)` 打开；原来的设置弹窗和左下角统计浮层都并进来了）
@@ -170,9 +173,10 @@ worker/index.ts        3000 服务的 vinext/Cloudflare 适配层，顺带处理
 
 用户另有一个独立项目 `~/Documents/CODEelse/getAudio`，启动方式（`launchctl` 常驻 + 自己的 `启动服务.command`）是同一套约定的来源（本文件顶部"参考 GetAudio"说的就是这个），但两者服务完全独立，互不依赖、互不共享端口。`logs/` 目录里的 `getaudio.err.log`/`getaudio.out.log` 是历史遗留的普通文件（不是软链接，2026-08-17 的，比本项目自己的 launchd 服务还早一天），跟当前两个服务无关，可以忽略。
 
-### 测试是字符串断言网，不是行为测试
+### 两套测试：行为测试在长，字符串断言网在缩
 
-`tests/rendered-html.test.mjs` 主要靠 `assert.match` 抓文件里的关键字符串（函数名、UI 文案、依赖名）存在与否，用来防止"某个功能被顺手删掉"。改 UI 文案、重命名导出函数、换掉某个 provider 的固定字符串，都可能让它不相关地挂掉——挂了先看是真的少了功能，还是只是字符串对不上了。
+- `npm run test:unit`（`tests/behaviour/`）：经模块接口测行为，**不用 build、不碰服务**，一秒内跑完。改页结果 / 设置 / Key 合并相关的代码，先跑它。
+- `tests/rendered-html.test.mjs`：主要靠 `assert.match` 抓文件里的关键字符串（函数名、UI 文案、依赖名）存在与否，用来防止"某个功能被顺手删掉"。改 UI 文案、重命名导出函数、把代码搬到别的文件，都可能让它不相关地挂掉——挂了先看是真的少了功能，还是只是字符串对不上了。某条断言的行为有了行为测试，就删掉那条断言（替换，不叠加）。
 
 ### 几处脚手架遗留（vinext/OpenAI sites 模板带出来的，非本项目功能）
 
@@ -188,7 +192,7 @@ worker/index.ts        3000 服务的 vinext/Cloudflare 适配层，顺带处理
 
 - 密钥只存 `settings.local.json`（`0600`，已 gitignore）。**永远不要打印明文、不要提交、不要外传。**
 - 服务端只回传**打码**版本给页面。
-- 改密钥相关逻辑时注意：页面拿不到明文，回传时用 `__KEEP__` 占位表示「保持原样」。
+- 改密钥相关逻辑时注意：页面拿不到明文，回传时用占位符表示「保持原样」（协议在 `lib/key-pool.mjs`，带出处，不按位置配；行为测试在 `tests/behaviour/settings.test.mjs`）。
   > 曾经因为「页面看不到已存的 key」导致用户以为没存上、重新添加、
   > 把旧 key 静默覆盖。改这块务必保证**看得见 + 不会误覆盖**。
 
@@ -212,7 +216,8 @@ worker/index.ts        3000 服务的 vinext/Cloudflare 适配层，顺带处理
 ```bash
 npm run dev        # 开发（注意别和后台的 3000 端口服务打架）
 npm run build      # 构建（之后必须重启网页服务）
-npm test           # build + 渲染测试
+npm run test:unit  # 行为测试：不 build、不碰服务，改完先跑这个
+npm test           # build + 渲染测试（会换掉 dist/，之后必须重启网页服务）
 npm run lint
 
 launchctl kickstart -k gui/$(id -u)/com.kapozux.moye-ocr   # 重启识别服务

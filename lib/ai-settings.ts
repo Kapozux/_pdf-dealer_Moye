@@ -22,8 +22,8 @@ export type AiSettings = {
   geminiKeyMasked: string;
   geminiKey?: string;
   /**
-   * 额外的 Gemini key。保存时传数组：`"__KEEP__"` 表示这一把保持原样
-   * （页面拿不到明文），其余为新填入的明文。空数组 = 清空全部。
+   * 额外的 Gemini key。保存时传数组，由 lib/key-pool.mjs 的 rowsToPayload 生成：
+   * 已存没动的传带出处的占位符（页面拿不到明文），新填的传明文。空数组 = 清空全部。
    */
   geminiKeysExtra: string | string[];
   /** 服务端回传的打码列表，让页面能显示「已存了哪几把」 */
@@ -122,6 +122,19 @@ export async function saveAiSettings(settings: AiSettings) {
     body: JSON.stringify(settings),
   });
   return parseResponse<AiSettings>(response);
+}
+
+/**
+ * 只改几个字段（首页切精校范围、「环境」里把某个 Ollama 模型设为当前服务）。
+ * 只发这几个字段，没发的服务端沿用已存的值——不再拿页面手里可能过时的整份设置去覆盖。
+ */
+export async function patchAiSettings(patch: Partial<AiSettings>) {
+  return saveAiSettings(patch as AiSettings);
+}
+
+/** 已存设置 → 设置面板的草稿。明文 Key 一律为空：页面拿不到明文，留空 = 保留原值。 */
+export function draftFromSaved(saved: AiSettings): AiSettings {
+  return { ...saved, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" };
 }
 
 export async function testAiSettings(settings: AiSettings) {

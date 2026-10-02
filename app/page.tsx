@@ -1,9 +1,10 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { aiStaysLocal, defaultAiSettings, fetchAiModels, fetchSetup, getAiSettings, installComponent, saveAiSettings, testAiSettings, type AiModelOption, type AiProvider, type AiSettings, type ModelSource, type SetupComponent, type SetupStatus } from "../lib/ai-settings";
+import { aiStaysLocal, defaultAiSettings, draftFromSaved, fetchAiModels, fetchSetup, getAiSettings, installComponent, patchAiSettings, saveAiSettings, testAiSettings, type AiModelOption, type AiProvider, type AiSettings, type ModelSource, type SetupComponent, type SetupStatus } from "../lib/ai-settings";
 import { type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
 import { isFallback, outcome } from "../lib/page-result.mjs";
+import { newRow, rowsFromSaved, rowsToPayload, type KeyRow } from "../lib/key-pool.mjs";
 import {
   cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPdfUrl, listJobs,
   exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
@@ -583,12 +584,12 @@ export default function Home() {
    * 并行密钥列表。每项要么是「已存在的」（只有打码文本，明文在服务端），
    * 要么是「新填的」（有明文）。以前这里只存明文字符串，而服务端从不回传
    * 明文，所以列表永远是空的——用户以为没存上，重新添加就把旧的覆盖了。
+   * 行与保存请求之间的协议见 lib/key-pool.mjs。
    */
-  type KeyRow = { masked: string | null; value: string };
   const [extraKeys, setExtraKeys] = useState<KeyRow[]>([]);
   const updateExtraKey = (index: number, next: string) =>
     setExtraKeys((keys) => keys.map((k, i) => (i === index ? { ...k, value: next } : k)));
-  const addExtraKey = () => setExtraKeys((keys) => [...keys, { masked: null, value: "" }]);
+  const addExtraKey = () => setExtraKeys((keys) => [...keys, newRow()]);
   const removeExtraKey = (index: number) => setExtraKeys((keys) => keys.filter((_, i) => i !== index));
   // 服务端正在跑/排队的任务：任务不在浏览器里跑，所以重开页面必须能看到它们
   const [activeJobs, setActiveJobs] = useState<Job[]>([]);
@@ -702,7 +703,7 @@ export default function Home() {
     void refreshLibrary();
     void getAiSettings().then((loaded) => {
       setSettings(loaded);
-      setSettingsDraft({ ...loaded, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
+      setSettingsDraft(draftFromSaved(loaded));
     }).catch(() => undefined);
     void fetchSpeed().then(setSpeed).catch(() => undefined);
     void fetchSetup().then(setSetupData).catch(() => undefined);
@@ -1026,8 +1027,8 @@ export default function Home() {
   /** 打开统一面板到某一栏；设置栏要先把草稿从已存设置复位。 */
   function openPanel(pane: PanelPane) {
     if (pane === "settings") {
-      setSettingsDraft({ ...settings, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
-      setExtraKeys((settings.geminiKeysExtraMasked ?? []).map((masked) => ({ masked, value: "" })));
+      setSettingsDraft(draftFromSaved(settings));
+      setExtraKeys(rowsFromSaved(settings.geminiKeysExtraMasked));
       setSettingsStatus("");
     }
     setPanelPane(pane);
@@ -1132,7 +1133,7 @@ export default function Home() {
     return () => clearInterval(timer);
   }, [backfillState?.running]);
 
-  // 已存的 key 以打码行呈现，明文留在服务端；保存时用 __KEEP__ 占位（见 openPanel）
+  // 已存的 key 以打码行呈现，明文留在服务端；保存时用带出处的占位符（见 lib/key-pool.mjs）
   function openSettings() {
     openPanel("settings");
   }
@@ -1154,13 +1155,13 @@ export default function Home() {
     try {
       const saved = await saveAiSettings({
         ...settingsDraft,
-        // 已存在且未改动的传占位符（服务端沿用原值），新填的传明文，空行丢弃
-        geminiKeysExtra: extraKeys
-          .map((k) => (k.value.trim() ? k.value.trim() : k.masked ? "__KEEP__" : ""))
-          .filter(Boolean),
+        geminiKeysExtra: rowsToPayload(extraKeys),
       });
       setSettings(saved);
-      setSettingsDraft({ ...saved, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" });
+      setSettingsDraft(draftFromSaved(saved));
+      // 行要按服务端新的列表重置：行里记的是「当初在已存列表里的位置」，
+      // 不重置的话同一次打开面板里再保存一次，位置就对不上了
+      setExtraKeys(rowsFromSaved(saved.geminiKeysExtraMasked));
       setSettingsStatus(t("已保存到本机。密钥不会出现在网页数据或 Library 中。"));
     } catch (caught) {
       setSettingsStatus(caught instanceof Error ? caught.message : t("设置保存失败。"));
@@ -1787,7 +1788,7 @@ export default function Home() {
                 {([["all", t("全部页面 · 质量最佳")], ["review", t("只精校公式、选项与可疑页 · 更省")]] as const).map(([value, label]) => (
                   <label key={value} className={settings.aiScope === value ? "on" : ""}>
                     <input type="radio" name="scope-inline" checked={settings.aiScope === value} onChange={() => {
-                      void saveAiSettings({ ...settings, aiScope: value, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" }).then(setSettings).catch(() => undefined);
+                      void patchAiSettings({ aiScope: value }).then(setSettings).catch((caught) => console.warn("[设置] 精校范围保存失败", caught));
                     }} />
                     {label}
                   </label>
@@ -2522,7 +2523,7 @@ export default function Home() {
                                           <code>{model.id}</code>
                                           {model.thinking ? <em className="warn" title={t("会思考的版本：Ollama 关不掉它的思考，输出会坏掉。请下载 Instruct 版。")}>{t("思考版 · 不能用")}</em> : inUse ? <em>{t("正在使用")}</em> : (
                                             <button type="button" onClick={() => {
-                                              void saveAiSettings({ ...settings, provider: "ollama", ollamaModel: model.id, geminiKey: "", kimiKey: "", qwenKey: "", openrouterKey: "" })
+                                              void patchAiSettings({ provider: "ollama", ollamaModel: model.id })
                                                 .then(setSettings).catch((caught) => setSetupError(caught instanceof Error ? caught.message : t("设置保存失败。")));
                                             }}>{t("设为 AI 精校服务")}</button>
                                           )}

@@ -3,7 +3,7 @@
 import { createServer } from "node:http";
 import { spawn } from "node:child_process";
 import { createReadStream, createWriteStream, existsSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 import { pipeline } from "node:stream/promises";
 import { fileURLToPath } from "node:url";
@@ -14,6 +14,8 @@ import { JobStore } from "./server/jobstore.mjs";
 import { JobQueue, EventHub } from "./server/queue.mjs";
 import { createConverter, gateStats } from "./server/convert.mjs";
 import { isFallback } from "./lib/page-result.mjs";
+import { maskedKey, splitKeys } from "./lib/key-pool.mjs";
+import { ALL_PROVIDERS, createSettingsStore, defaultSettings, normalizeSettings, providerConfigured } from "./server/settings.mjs";
 import { createRenderer } from "./server/render.mjs";
 import { createOfficeConverter, isOfficeFile } from "./server/office2pdf.mjs";
 import { createImageConverter, isImageFile } from "./server/image2pdf.mjs";
@@ -42,45 +44,9 @@ const usage = createUsage(resolve(root, "data"));
 const port = Number(process.env.MOYE_PORT) || 8765;
 const maxJsonBytes = 24 * 1024 * 1024;
 
-const defaultSettings = {
-  provider: "gemini",
-  geminiKey: "",
-  geminiModel: "gemini-2.5-flash",
-  geminiFallbackModel: "gemini-flash-latest",
-  geminiBaseUrl: "https://generativelanguage.googleapis.com/v1beta",
-  kimiKey: "",
-  kimiModel: "kimi-k2.6",
-  kimiBaseUrl: "https://api.moonshot.ai/v1",
-  qwenKey: "",
-  qwenModel: "qwen3.7-plus",
-  qwenBaseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-  openrouterKey: "",
-  // 默认走 Kimi 而不是 gemini-2.5-flash：后者跟直连 Gemini 抢的是同一个 Google
-  // 配额池，用 OpenRouter 绕一圈不会更快。实测 64 并发下（关推理、同一份数学 PDF）：
-  //   kimi-k2.6      1.9 页/s  $0.0028/页  LaTeX 71 ← 公式最全
-  //   glm-5v-turbo   1.8 页/s  $0.0055/页  LaTeX 64 ← 同速但贵一倍，淘汰
-  //   qwen3.7-flash  4.2 页/s  $0.00013/页 LaTeX 36 ← 快且极便宜，但公式会掉
-  // 数学/理科 PDF 用 kimi，纯文字文档换 qwen3.7-flash 可以快一倍、便宜 20 倍。
-  openrouterModel: "moonshotai/kimi-k2.6",
-  openrouterBaseUrl: "https://openrouter.ai/api/v1",
-  // 本机 Ollama：不要 Key、图片不出这台机器。模型为空 = 没配置（用户得先下一个视觉模型）。
-  // 地址是 Ollama 的根地址（走它的原生 /api/chat，不走 /v1 兼容层，理由见 callOllama）。
-  ollamaModel: "",
-  ollamaBaseUrl: "http://127.0.0.1:11434",
-  aiScope: "all",
-  // 转换完成后自动打标签（会把文档开头约 3000 字发给模型，本地模式也一样）。
-  // 用户可关：顶栏的隐私标签按这个值说话，关了才能诚实地写"文件不上传"。
-  autoTag: true,
-  // 关掉时：一份文档只走 provider 选的那一家。开了：所有配了 Key 的渠道
-  // 同时用，按各自并发上限加权轮询分配页面——独立的上游（Gemini 服务器
-  // 和 OpenRouter/Kimi/Qwen）互不占用配额，同时开是纯加法，没有下限。
-  multiChannel: false,
-  // multiChannel 打开时，参与分流的渠道白名单。空数组 = 所有配了 Key 的都用。
-  // 有了它才能选「Gemini + Qwen 但不要 OpenRouter」这种组合。
-  channels: [],
-};
-
-const ALL_PROVIDERS = ["gemini", "kimi", "qwen", "openrouter", "ollama"];
+const settingsStore = createSettingsStore(settingsPath);
+const loadSettings = () => settingsStore.load();
+const saveSettings = (patch) => settingsStore.save(patch);
 
 await mkdir(resolve(root, "tmp/pdfs"), { recursive: true });
 
@@ -146,97 +112,10 @@ function decodeHeader(value, fallback = "") {
   }
 }
 
-/** 页面回传这个占位符时，表示「这一把 key 保持原样」——页面本来就拿不到明文。 */
-const KEEP_KEY = "__KEEP__";
-
-const splitKeys = (value) =>
-  String(value || "").split(/[\n,]+/).map((k) => k.trim()).filter(Boolean);
-
-/**
- * 合并额外 key。
- * - 传数组：按位置逐项处理，KEEP_KEY 表示沿用原值；空数组 = 用户确实想清空。
- * - 传字符串：老格式，整串替换（保留向后兼容）。
- * - 没传：保持原样。
- */
-function mergeExtraKeys(input, previousValue) {
-  const previousKeys = splitKeys(previousValue);
-  if (Array.isArray(input)) {
-    return input
-      .map((entry, index) => (entry === KEEP_KEY ? previousKeys[index] : String(entry || "").trim()))
-      .filter(Boolean)
-      .join("\n");
-  }
-  if (typeof input === "string" && input.trim()) return splitKeys(input).join("\n");
-  return previousKeys.join("\n");
-}
-
-function normalizeSettings(input, previous = defaultSettings) {
-  const provider = ALL_PROVIDERS.includes(input.provider) ? input.provider : (previous.provider || "gemini");
-  // 没传就沿用：只带几个字段的 partial 请求（一键安装写 Ollama 模型）不该把「只精校可疑页」冲回「全部」
-  const aiScope = input.aiScope === "review" || input.aiScope === "all" ? input.aiScope : (previous.aiScope === "review" ? "review" : "all");
-  return {
-    provider,
-    geminiKey: cleanString(input.geminiKey) || previous.geminiKey || "",
-    // 多个 Gemini key（不同 Google 账号 = 各自独立配额）。
-    //
-    // 这里曾经是 `cleanString(input) || previous`，配上「页面永远看不到已存的
-    // key」，就成了一条静默丢数据的路：用户打开设置看到空列表 → 以为没存上 →
-    // 补一把新的 → 保存时新值非空，直接把旧的整串覆盖掉，旧 key 无声消失。
-    // 现在页面拿到的是打码列表，回传时用 KEEP_KEY 占位表示「这一把别动」。
-    geminiKeysExtra: mergeExtraKeys(input.geminiKeysExtra, previous.geminiKeysExtra),
-    // 这些 key 分属几个**独立 Google 项目**（同项目的 key 共用配额，加了不提速）
-    geminiProjects: Math.max(1, Number(input.geminiProjects) || Number(previous.geminiProjects) || 1),
-    // 模型/BaseURL 曾经跟 Key 不一样：传不全就退回硬编码默认值，而不是「上次保存的值」。
-    // 实测踩过一次——一个只带 {provider} 的请求（比如"测试连接"传了不完整的草稿）
-    // 会把用户已经存好的自定义 Base URL（比如 Kimi 的 .cn 地域）悄悄换回默认的 .ai，
-    // 认证接着莫名其妙失败。跟上面 Key 字段一样退回 previous，才不会被partial 请求冲掉。
-    geminiModel: cleanString(input.geminiModel) || previous.geminiModel || defaultSettings.geminiModel,
-    geminiFallbackModel: cleanString(input.geminiFallbackModel) || previous.geminiFallbackModel || defaultSettings.geminiFallbackModel,
-    geminiBaseUrl: cleanString(input.geminiBaseUrl) || previous.geminiBaseUrl || defaultSettings.geminiBaseUrl,
-    kimiKey: cleanString(input.kimiKey) || previous.kimiKey || "",
-    kimiModel: cleanString(input.kimiModel) || previous.kimiModel || defaultSettings.kimiModel,
-    kimiBaseUrl: cleanString(input.kimiBaseUrl) || previous.kimiBaseUrl || defaultSettings.kimiBaseUrl,
-    qwenKey: cleanString(input.qwenKey) || previous.qwenKey || "",
-    qwenModel: cleanString(input.qwenModel) || previous.qwenModel || defaultSettings.qwenModel,
-    qwenBaseUrl: cleanString(input.qwenBaseUrl) || previous.qwenBaseUrl || defaultSettings.qwenBaseUrl,
-    openrouterKey: cleanString(input.openrouterKey) || previous.openrouterKey || "",
-    openrouterModel: cleanString(input.openrouterModel) || previous.openrouterModel || defaultSettings.openrouterModel,
-    openrouterBaseUrl: cleanString(input.openrouterBaseUrl) || previous.openrouterBaseUrl || defaultSettings.openrouterBaseUrl,
-    // 模型名跟 Key 一样「没传就沿用」：partial 请求不能把已选的模型冲掉
-    ollamaModel: cleanString(input.ollamaModel) || previous.ollamaModel || "",
-    ollamaBaseUrl: cleanString(input.ollamaBaseUrl) || previous.ollamaBaseUrl || defaultSettings.ollamaBaseUrl,
-    aiScope,
-    autoTag: input.autoTag === undefined ? previous.autoTag !== false : Boolean(input.autoTag),
-    multiChannel: Boolean(input.multiChannel ?? previous.multiChannel ?? defaultSettings.multiChannel),
-    channels: (Array.isArray(input.channels) ? input.channels : previous.channels ?? [])
-      .filter((p) => ALL_PROVIDERS.includes(p)),
-  };
-}
-
-async function loadSettings() {
-  try {
-    const stored = JSON.parse(await readFile(settingsPath, "utf8"));
-    return normalizeSettings(stored, defaultSettings);
-  } catch (error) {
-    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") return { ...defaultSettings };
-    throw error;
-  }
-}
-
-async function saveSettings(input) {
-  const previous = await loadSettings();
-  const settings = normalizeSettings(input, previous);
-  const temporary = `${settingsPath}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(settings, null, 2)}\n`, { mode: 0o600 });
-  await rename(temporary, settingsPath);
-  return settings;
-}
 
 /** 所有可用的 Gemini key：主 key + 额外 key（各自是独立项目、独立配额）。 */
 function geminiKeyPool(settings) {
-  return [settings.geminiKey, ...String(settings.geminiKeysExtra || "").split(/[\n,]+/)]
-    .map((k) => (k || "").trim())
-    .filter(Boolean);
+  return [settings.geminiKey, ...splitKeys(settings.geminiKeysExtra)].map((k) => (k || "").trim()).filter(Boolean);
 }
 
 let geminiKeyCursor = 0;
@@ -266,21 +145,10 @@ function nextGeminiKey(settings) {
   return pool[geminiKeyCursor++ % pool.length];
 }
 
-function maskedKey(value) {
-  if (!value) return "";
-  return `••••••••${value.slice(-4)}`;
-}
-
 function publicSettings(settings) {
   const activeConfigured = settings.multiChannel
     ? configuredChannels(settings).length > 0
-    : Boolean({
-        gemini: settings.geminiKey,
-        kimi: settings.kimiKey,
-        qwen: settings.qwenKey,
-        openrouter: settings.openrouterKey,
-        ollama: settings.ollamaModel,
-      }[settings.provider]);
+    : providerConfigured(settings, settings.provider);
   return {
     provider: settings.provider,
     multiChannel: settings.multiChannel,
@@ -1016,12 +884,10 @@ function channelWeight(provider, settings) {
  * 必须有 Key；此外若设了 channels 白名单，则只用白名单里的（空 = 全用）。
  */
 function configuredChannels(settings) {
-  // Ollama 没有 Key，「配好了」= 选了模型
-  const keys = { gemini: settings.geminiKey, kimi: settings.kimiKey, qwen: settings.qwenKey, openrouter: settings.openrouterKey, ollama: settings.ollamaModel };
   const allow = Array.isArray(settings.channels) && settings.channels.length ? settings.channels : null;
-  return Object.entries(keys)
-    .filter(([provider, key]) => Boolean(key) && (!allow || allow.includes(provider)))
-    .map(([provider]) => ({ provider, weight: channelWeight(provider, settings) }));
+  return ALL_PROVIDERS
+    .filter((provider) => providerConfigured(settings, provider) && (!allow || allow.includes(provider)))
+    .map((provider) => ({ provider, weight: channelWeight(provider, settings) }));
 }
 
 /**
@@ -1231,8 +1097,7 @@ async function callTextModel(settings, prompt, { provider = settings.provider, m
  */
 async function generateCardMeta(job) {
   const settings = await loadSettings();
-  const keys = { gemini: settings.geminiKey, kimi: settings.kimiKey, qwen: settings.qwenKey, openrouter: settings.openrouterKey, ollama: settings.ollamaModel };
-  if (!keys[settings.provider]) return null;
+  if (!providerConfigured(settings, settings.provider)) return null;
   const result = await jobStore.readResult(job.id);
   const content = String(result?.markdown ?? "")
     .replace(/[#*`$|<>\\]/g, "")

@@ -1180,6 +1180,34 @@ async function runSuryaOnPdf(pdfPath) {
   }
 }
 
+// 渲染器两处用：AI 精校的页面图像（converter 里）和逐页核对的原图（/api/library/<id>/page/<n>.jpg）
+const pageRenderer = createRenderer({ python: venvPython });
+
+/**
+ * 逐页核对要看的原图：按需渲染一页，最近 40 页留在内存（一页约 300KB）。
+ * 存的是 Promise：预加载下一页和用户点下一页同时到，只起一次 Python。
+ */
+const pageImageCache = new Map();
+function pageImage(id, page) {
+  const key = `${id}:${page}`;
+  const cached = pageImageCache.get(key);
+  if (cached) {
+    pageImageCache.delete(key);   // 挪到最新，按最近使用淘汰
+    pageImageCache.set(key, cached);
+    return cached;
+  }
+  const rendering = pageRenderer.renderPages(jobStore.sourcePath(id), [page], { quality: 82 }).then((images) => {
+    const jpeg = Buffer.from(images[String(page)] ?? "", "base64");
+    if (!jpeg.length) throw new Error(`第 ${page} 页渲染结果为空。`);
+    return jpeg;
+  });
+  // 失败的不留在缓存里，下次还能重试；错误本身照样抛给这次的请求
+  rendering.catch(() => pageImageCache.delete(key));
+  pageImageCache.set(key, rendering);
+  if (pageImageCache.size > 40) pageImageCache.delete(pageImageCache.keys().next().value);
+  return rendering;
+}
+
 const converter = createConverter({
   aiPageConcurrency: async () => {
     const st = await loadSettings();
@@ -1192,7 +1220,7 @@ const converter = createConverter({
   runSurya: runSuryaOnPdf,
   refinePage: async (input) => callConfiguredModel(await loadSettings(), input, false),
   loadSettings: async () => publicSettings(await loadSettings()),
-  renderer: createRenderer({ python: venvPython }),
+  renderer: pageRenderer,
 });
 
 // PPT/PPTX/Word（doc/docx）提交时先经 LibreOffice 转成 PDF，转完直接顶替 source.pdf
@@ -1810,6 +1838,26 @@ const server = createServer(async (request, response) => {
         await rm(dir, { recursive: true, force: true });
         void sweepImageBookSessions();
       }
+      return;
+    }
+
+    // 逐页核对的原图。图片不需要 CORS（<img> 直接加载），id 和页码都按正则卡死
+    const pageImageMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/page\/(\d+)\.jpg$/);
+    if (request.method === "GET" && pageImageMatch) {
+      const job = jobStore.get(pageImageMatch[1]);
+      const page = Number(pageImageMatch[2]);
+      if (!job) return sendJson(response, 404, { error: "记录不存在。" });
+      if (page < 1 || (job.page_count && page > job.page_count)) return sendJson(response, 404, { error: "没有这一页。" });
+      // 预转换失败的任务从来没有 source.pdf：先查，别让渲染进程去报一个看不懂的错
+      const source = await stat(jobStore.sourcePath(job.id)).catch((error) => {
+        if (error?.code === "ENOENT") return null;
+        throw error;
+      });
+      if (!source) return sendJson(response, 404, { error: "原文件不在了。" });
+      if (!source.size) return sendJson(response, 404, { error: "原文件是空的（0 字节）。" });
+      const jpeg = await pageImage(job.id, page);
+      response.writeHead(200, { "Content-Type": "image/jpeg", "Content-Length": jpeg.length, "Cache-Control": "private, max-age=86400" });
+      response.end(jpeg);
       return;
     }
 

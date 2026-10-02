@@ -155,6 +155,8 @@ lib/ai-settings.ts     AI 设置的类型 + 浏览器→8765 的设置类 API �
 lib/page-result.mjs    「一页最后算什么」的唯一定义：outcome()（ai / noText / fallback / local）、四种 AI 结果的构造、重跑用的 toDraft（白名单取字段）、页面度量。前后端共用，所以是 .mjs + JSDoc
 lib/key-pool.mjs       额外 Gemini Key 列表的页面↔服务端协议，两半写在一起：页面 rowsFromSaved / rowsToPayload，服务端 mergeExtraKeys。占位符带出处 `__KEEP__:<位置>:<末4位>`
 server/settings.mjs    settings.local.json 的 load / save（部分保存：没传的字段沿用；多处同时保存会排队）、normalizeSettings、providerConfigured（「这家能用了吗」的唯一判断）
+lib/explain-error.mjs  报错 → 类别（额度 / Key / 限流 / 超时 / 连不上 / 模型 / 拦截 / 输出坏 / 没过校验 / 空文件）+ 重跑有没有用。规则按库里真实报错定（2026-10-02 全库 1184 页回退页全部归得了类）；Gemini 额度用完回的是 429，所以「额度」排在「限流」前。文案在 page.tsx 的 errorCopy（走 i18n）；报错原文从 reasons 里读回用 page-result.mjs 的 parseAiReason / fallbackCause
+                       结果页「逐页核对」：左原图（GET /api/library/<id>/page/<n>.jpg，服务端用 pypdfium2 现渲染一页、最近 40 页缓存在内存）、右这一页的结果；地址 #/doc/<id>/p/<n> 可直接分享到某一页，同一份文档里前进后退不重新拉结果
 lib/api.ts             浏览器→8765 的任务类 API 客户端（提交/查询/SSE 订阅/Library/导出）
 lib/pdf-to-markdown.ts 只剩前后端共用的类型定义；真正实现已搬到 server/convert.mjs
 app/page.tsx           前端几乎全部逻辑（2000+ 行单文件）：拖拽/批量、进度订阅、Library、结果四个 tab、统一面板（左侧栏目：回顾 / 资料库 / 用量 / AI 精校设置 / 环境 / 关于，`openPanel(pane)` 打开；原来的设置弹窗和左下角统计浮层都并进来了）

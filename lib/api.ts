@@ -272,6 +272,11 @@ export async function imagesToPdf(
   return { blob, pages: Number(response.headers.get("X-Moye-Pages")) || 0, skipped };
 }
 
+/** 原文件第 n 页的图像：服务端现渲染（pypdfium2）并缓存，逐页核对用。比整份 PDF 的 iframe 轻，Safari / 手机也一样能看。 */
+export function libraryPageImageUrl(id: string, page: number): string {
+  return `${SERVICE_BASE}/api/library/${id}/page/${page}.jpg`;
+}
+
 export function libraryPdfUrl(id: string): string {
   return `${SERVICE_BASE}/api/library/${id}/pdf`;
 }

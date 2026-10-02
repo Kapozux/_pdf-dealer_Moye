@@ -226,6 +226,60 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 .library-notice { margin-top:14px; padding:11px 14px; border:1px solid rgba(166,99,63,.28); border-radius:9px; color:#874b31; background:#f3e7dc; font-size:11px; }
 /* 重新精校失败时的提示：服务端会保留旧结果（不是报错屏），这条是唯一告诉用户"其实没变"的地方 */
 .result-notice { margin-bottom:14px; padding:11px 16px; border:1px solid rgba(166,99,63,.28); border-radius:10px; color:#874b31; background:#f3e7dc; font-size:12px; }
+.result-notice p { margin:0 0 4px; }
+/* 报错说人话：一句类别 + 下一步，原始报错收进可展开的「原始报错」（不放悬停提示里，触屏也看得到、能复制） */
+.explained-error p, .quality-list article .explained-error p { margin:3px 0; font-size:12px; line-height:1.6; opacity:.86; }
+.explained-error details { margin:2px 0 6px; font-size:12px; }
+.explained-error summary, .error-raw summary { cursor:pointer; opacity:.6; width:fit-content; }
+.explained-error code, .error-raw code { display:block; margin-top:4px; padding:8px 10px; border-radius:6px; background:rgba(23,35,29,.05); white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; line-height:1.55; }
+.error-raw { margin-top:14px; text-align:left; font-size:12px; }
+.error-raw summary { margin:0 auto; }
+/* 回退汇总条：几页、为什么、哪些重跑也没用、下一步 */
+.fallback-notice { margin-bottom:14px; padding:14px 18px; border:1px solid rgba(166,99,63,.28); border-radius:12px; color:#5e3a26; background:#f6ece3; font-size:13px; line-height:1.6; }
+.fallback-notice p { margin:0 0 4px; }
+.fallback-notice .fallback-blocker { color:#9b3d2a; font-weight:650; }
+.fallback-actions { display:flex; flex-wrap:wrap; gap:8px; margin-top:10px; }
+.fallback-actions button { padding:8px 13px; }
+.busy-chip { font-size:12px; opacity:.65; white-space:nowrap; }
+/* 「⋯」菜单 */
+.more-menu { position:relative; }
+.more-menu>button { min-width:44px; font-size:15px; line-height:18px; }
+.more-menu-list { position:absolute; right:0; top:calc(100% + 6px); z-index:30; min-width:200px; display:flex; flex-direction:column; padding:6px; border:1px solid var(--line); border-radius:10px; background:#fbfaf6; box-shadow:0 12px 32px rgba(35,50,41,.14); }
+.more-menu-list button { padding:10px 12px; border:0; border-radius:7px; background:transparent; color:var(--ink); font-size:13px; text-align:left; cursor:pointer; }
+.more-menu-list button:hover, .more-menu-list button:focus-visible { background:var(--green-soft); }
+.more-menu-list button:disabled { opacity:.45; cursor:default; }
+/* 「第 N 页」链接 → 逐页核对 */
+.page-link { padding:0; border:0; background:none; color:inherit; font:inherit; cursor:pointer; text-decoration:underline; text-decoration-color:rgba(23,35,29,.25); text-underline-offset:3px; }
+.page-link:hover, .page-link:focus-visible { text-decoration-color:currentColor; }
+/* 逐页核对：左原图、右这一页的结果 */
+.page-check { height:100%; display:flex; flex-direction:column; }
+.page-check-bar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; padding:10px 16px; border-bottom:1px solid var(--line); }
+.page-check-nav { display:flex; align-items:center; gap:8px; }
+.page-check-nav strong { font-size:13px; font-variant-numeric:tabular-nums; }
+.page-check-nav .secondary-button { padding:6px 12px; font-size:15px; line-height:1; }
+.page-check-nav .secondary-button:disabled { opacity:.35; cursor:default; }
+.page-check-bar .quiet-button { margin-left:auto; font-size:13px; opacity:.8; }
+.page-pill { padding:4px 10px; border-radius:999px; font-size:12px; color:var(--green); background:var(--green-soft); }
+.page-pill.fallback { color:#8a4c2f; background:#f1dfd5; }
+.page-pill.noText, .page-pill.local { color:rgba(23,35,29,.7); background:rgba(23,35,29,.07); }
+.page-strip { display:flex; flex-wrap:wrap; gap:3px; max-height:58px; overflow:auto; padding:8px 16px; border-bottom:1px solid var(--line); }
+.page-dot { width:10px; height:10px; padding:0; border:0; border-radius:2px; background:rgba(31,91,65,.32); cursor:pointer; }
+.page-dot.warn { background:#d9a066; }
+.page-dot.bad { background:#b5523b; }
+.page-dot.notext { background:rgba(23,35,29,.16); }
+.page-dot.current { outline:2px solid var(--ink); outline-offset:1px; }
+.page-check-body { flex:1; min-height:0; display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); }
+.page-check-image { position:relative; margin:0; overflow:auto; padding:16px; background:#e9e6dd; display:flex; justify-content:center; align-items:flex-start; }
+.page-check-image img { position:relative; z-index:1; display:block; max-width:100%; height:auto; background:white; box-shadow:0 6px 20px rgba(35,50,41,.12); }
+.page-check-image p { margin:40px 0; font-size:13px; opacity:.6; }
+.page-check-loading { position:absolute; top:48px; left:0; right:0; z-index:0; text-align:center; font-size:13px; opacity:.5; }
+.page-check-text { min-width:0; overflow:auto; border-left:1px solid var(--line); }
+.page-check-reasons { padding:14px 22px 0; font-size:12px; }
+.page-check-reasons>p { margin:3px 0; opacity:.7; }
+.page-check-text .markdown-rendered { overflow:visible; padding:16px 22px 40px; }
+.page-check-empty { margin:24px 22px; font-size:13px; line-height:1.7; opacity:.65; }
+/* 手机上结果面板高度是固定的：原图和结果上下排、整块一起滚，原图按原比例显示（不再两栏分一个面板的高度） */
+@media (max-width:700px) { .page-check{overflow:auto}.page-check-body{display:block;flex:none}.page-check-image{overflow:visible;padding:10px}.page-check-text{border-left:0;border-top:1px solid var(--line);overflow:visible}.page-check-bar .quiet-button{margin-left:0}.result-actions .more-menu,.result-actions .more-menu>button{width:100%} }
 .library-grid { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:16px; margin-top:20px; }
 .library-card { position:relative; min-width:0; border:1px solid var(--line); border-radius:14px; background:rgba(255,255,255,.34); overflow:hidden; transition:.2s ease; }
 .library-card:hover { border-color:rgba(31,91,65,.35); transform:translateY(-2px); box-shadow:0 16px 36px rgba(35,50,41,.07); }

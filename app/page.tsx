@@ -1,12 +1,13 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { aiStaysLocal, defaultAiSettings, draftFromSaved, fetchAiModels, fetchSetup, getAiSettings, installComponent, patchAiSettings, saveAiSettings, testAiSettings, type AiModelOption, type AiProvider, type AiSettings, type ModelSource, type SetupComponent, type SetupStatus } from "../lib/ai-settings";
 import { type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
-import { isFallback, outcome } from "../lib/page-result.mjs";
+import { fallbackCause, isFallback, outcome, parseAiReason } from "../lib/page-result.mjs";
+import { explainError, summarizeCauses, type ErrorKind } from "../lib/explain-error.mjs";
 import { newRow, rowsFromSaved, rowsToPayload, type KeyRow } from "../lib/key-pool.mjs";
 import {
-  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPdfUrl, listJobs,
+  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPageImageUrl, libraryPdfUrl, listJobs,
   exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
   type Batch, type Job, type Reflect, type ReflectRange, type SpeedTable, type Stats, type TagBackfillState, type Usage, type UsageRow,
 } from "../lib/api";
@@ -44,7 +45,7 @@ function isPdfFile(f: File) {
 
 type Status = "idle" | "processing" | "batch" | "complete" | "error";
 type Screen = "converter" | "library";
-type ResultTab = "markdown" | "quality" | "compare" | "source";
+type ResultTab = "markdown" | "page" | "quality" | "compare" | "source";
 type BatchItemStatus = "queued" | "processing" | "complete" | "error";
 type BatchItem = {
   id: string;
@@ -74,14 +75,15 @@ type BatchItem = {
 type Route =
   | { name: "home" }
   | { name: "library" }
-  | { name: "doc"; id: string }
+  | { name: "doc"; id: string; page?: number }
   | { name: "batch"; id: string };
 
 function parseRoute(hash: string): Route {
   const path = hash.replace(/^#\/?/, "").replace(/\/+$/, "");
   if (path === "library") return { name: "library" };
-  const doc = path.match(/^doc\/([\w-]+)$/);
-  if (doc) return { name: "doc", id: doc[1] };
+  // #/doc/<id>/p/<n>：直接打开这份文档的「逐页核对」第 n 页
+  const doc = path.match(/^doc\/([\w-]+)(?:\/p\/(\d+))?$/);
+  if (doc) return doc[2] ? { name: "doc", id: doc[1], page: Number(doc[2]) } : { name: "doc", id: doc[1] };
   const batch = path.match(/^batch\/([\w-]+)$/);
   if (batch) return { name: "batch", id: batch[1] };
   return { name: "home" };
@@ -90,7 +92,7 @@ function parseRoute(hash: string): Route {
 function routeHash(route: Route): string {
   switch (route.name) {
     case "library": return "#/library";
-    case "doc": return `#/doc/${route.id}`;
+    case "doc": return `#/doc/${route.id}${route.page ? `/p/${route.page}` : ""}`;
     case "batch": return `#/batch/${route.id}`;
     default: return "";
   }
@@ -480,6 +482,76 @@ function fallbackLabel(page: PageResult) {
   return page.method === "text" ? t("AI 未通过 · 已回退 PDF 文字层") : t("AI 未通过 · 已回退本地初稿");
 }
 
+/**
+ * 报错类别 → 一句人话 + 下一步（中文即 i18n 的 key）。分类规则在 lib/explain-error.mjs，
+ * 那里按库里真实出现过的报错定；这里只管怎么说。short 用在汇总条里（「超时 385 · 连不上 20」）。
+ */
+const errorCopy: Record<ErrorKind, { short: string; title: string; action: string }> = {
+  credits: { short: "额度用完", title: "服务商额度用完了", action: "去服务商充值，或在设置里换一家；额度恢复前重跑也会失败" },
+  auth: { short: "Key 无效", title: "API Key 无效或没有权限", action: "去设置检查这家服务的 Key" },
+  rateLimit: { short: "被限流", title: "请求太密，被服务商限流", action: "过几分钟再重跑" },
+  timeout: { short: "超时", title: "服务商太慢，超时了", action: "高峰期常见，稍后重跑回退页一般能好" },
+  network: { short: "连不上", title: "连不上服务商", action: "检查网络或代理，恢复后重跑" },
+  model: { short: "模型不可用", title: "这个模型现在用不了", action: "去设置换一个模型" },
+  blocked: { short: "被拦截", title: "内容被服务商拦截", action: "换一家服务商，或这份改用本地高精度" },
+  badOutput: { short: "输出坏了", title: "模型这次的输出坏了", action: "多半是偶发的，重跑一般能好" },
+  rejected: { short: "没过校验", title: "模型结果没过程序校验", action: "重跑可能会好；经常出现就换个模型" },
+  emptyFile: { short: "空文件", title: "文件是空的（0 字节）", action: "重新选一次原文件" },
+  unknown: { short: "其他", title: "原因不明", action: "展开看原始报错" },
+};
+const fixedInSettings = (kind: ErrorKind) => kind === "credits" || kind === "auth" || kind === "model";
+
+/**
+ * 一条报错：类别一句话 + 下一步。原始报错收进可展开的「原始报错」——
+ * 不放在悬停提示里（Verbatim 那样触屏看不到、也复制不了）。
+ */
+function ExplainedError({ message, stage = "call", pageEmpty = false, onOpenSettings }: { message: string; stage?: "call" | "check"; pageEmpty?: boolean; onOpenSettings?: () => void }) {
+  const { kind, detail } = explainError(message, stage);
+  return (
+    <div className="explained-error">
+      <p>
+        <b>{t(errorCopy[kind].title)}</b>{pageEmpty && <> · {t("这页结果为空")}</>} · {t(errorCopy[kind].action)}
+        {onOpenSettings && fixedInSettings(kind) && <> <button type="button" className="inline-link" onClick={onOpenSettings}>{t("打开设置")}</button></>}
+      </p>
+      <details><summary>{t("原始报错")}</summary><code>{tServer(detail)}</code></details>
+    </div>
+  );
+}
+
+/** 逐页的原因：AI 失败 / 没过校验的那几行换成解释，其余（文字层过少、模型标记不确定……）照原样。 */
+function PageReasons({ page, onOpenSettings }: { page: PageResult; onOpenSettings: () => void }) {
+  if (!page.reasons.length) return <p>{t("程序校验通过")}</p>;
+  return <>{page.reasons.map((reason) => {
+    const cause = parseAiReason(reason);
+    return cause
+      ? <ExplainedError key={reason} message={cause.message} stage={cause.stage} pageEmpty={cause.pageEmpty} onOpenSettings={onOpenSettings} />
+      : <p key={reason}>{tServer(reason)}</p>;
+  })}</>;
+}
+
+/** 「⋯」菜单：次要操作收进来，一个区域只留一个主按钮（Verbatim 的 UI 规范）。点外面 / Esc 关。 */
+function MoreMenu({ label, children }: { label: string; children: (close: () => void) => ReactNode }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onPointer = (event: MouseEvent) => { if (!ref.current?.contains(event.target as Node)) setOpen(false); };
+    const onKey = (event: KeyboardEvent) => { if (event.key === "Escape") setOpen(false); };
+    document.addEventListener("mousedown", onPointer);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onPointer);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+  return (
+    <div className="more-menu" ref={ref}>
+      <button type="button" className="secondary-button" aria-haspopup="menu" aria-expanded={open} aria-label={label} title={label} onClick={() => setOpen((value) => !value)}>⋯</button>
+      {open && <div className="more-menu-list" role="menu">{children(() => setOpen(false))}</div>}
+    </div>
+  );
+}
+
 function methodLabel(page: PageResult) {
   const result = outcome(page);
   if (result === "ai" || result === "noText") {
@@ -552,6 +624,11 @@ export default function Home() {
   // 重新精校失败时服务端会保留旧结果（不是空白报错屏），但要让用户知道这次其实没有真的变化
   const [refineWarning, setRefineWarning] = useState("");
   const [tab, setTab] = useState<ResultTab>("markdown");
+  // 逐页核对：正在看第几页（0 = 这份文档还没进过核对，进来时跳到第一个要检查的页）
+  const [checkPage, setCheckPage] = useState(0);
+  const [imageFailedPage, setImageFailedPage] = useState(0);
+  // 从「第 N 页」链接进核对时记下原来的标签，浏览器后退时回到那里
+  const pageReturnTab = useRef<ResultTab>("quality");
   // Markdown 标签页：默认看渲染结果（公式、表格、标题都成形），要核对原文再切源码
   const [mdView, setMdView] = useState<"rendered" | "raw">("rendered");
   const [copied, setCopied] = useState(false);
@@ -772,6 +849,36 @@ export default function Home() {
   const fallbackPages = useMemo(() => result?.pages.filter(isFallback) ?? [], [result]);
   // 渲染一次缓存住：几百页的文档有上千个公式，切标签页不该每次重算
   const renderedMarkdown = useMemo(() => (result && mdView === "rendered" ? renderMarkdown(result.markdown) : ""), [result, mdView]);
+  // 回退页为什么回退：按类别汇总（超时 385 · 连不上 20 · 额度用完 4），以及哪些类别不先处理重跑也没用
+  const fallbackSummary = useMemo(() => summarizeCauses(fallbackPages.map(fallbackCause)), [fallbackPages]);
+  const checkTarget = useMemo(() => result?.pages.find((page) => page.page === checkPage) ?? null, [result, checkPage]);
+  const checkHtml = useMemo(() => (checkTarget?.markdown ? renderMarkdown(checkTarget.markdown) : ""), [checkTarget]);
+  // 「下一个要检查的页」：回退页和建议检查的页（不含没有文字的页），到底了从头再找
+  const nextProblemPage = useMemo(() => {
+    if (!reviewPages.length) return null;
+    const after = reviewPages.find((page) => page.page > checkPage) ?? reviewPages[0];
+    return after.page === checkPage ? null : after.page;
+  }, [reviewPages, checkPage]);
+  // 核对时预先要下一页原图：服务端现渲染一页要一秒左右，翻页时就不用等
+  useEffect(() => {
+    if (tab !== "page" || !activeJobId || !result || checkPage >= result.pageCount) return;
+    const prefetch = new Image();
+    prefetch.src = libraryPageImageUrl(activeJobId, checkPage + 1);
+  }, [tab, activeJobId, result, checkPage]);
+  // 核对时 ← → 翻页（焦点在输入框里时不抢）
+  const goToPageRef = useRef<(page: number) => void>(() => undefined);
+  useEffect(() => {
+    if (tab !== "page") return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.metaKey || event.ctrlKey || event.altKey || showSettings) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (/^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName) || target.isContentEditable)) return;
+      if (event.key === "ArrowLeft") goToPageRef.current(checkPage - 1);
+      if (event.key === "ArrowRight") goToPageRef.current(checkPage + 1);
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [tab, checkPage, showSettings]);
   const aiWasUsed = mode === "ai" || result?.pages.some((page) => page.method === "ai" || page.aiAttempted);
   // 哪些渠道已经有 Key（多渠道分流时实际参与的就是这几家）。
   // 用已保存的 settings 而不是 draft：draft 里的 Key 输入框是空的（留空=保留原值）。
@@ -890,7 +997,18 @@ export default function Home() {
   async function applyRoute(route: Route) {
     if (route.name === "home") { resetState(); return; }
     if (route.name === "library") { setScreen("library"); void refreshLibrary(); return; }
-    if (route.name === "doc") { await loadDoc(route.id); return; }
+    if (route.name === "doc") {
+      // 同一份文档已经开着（逐页核对里前进/后退）：不重新拉结果，几百页的书重拉一次要好几秒
+      const alreadyOpen = route.id === activeJobId && status === "complete" && result !== null && screen === "converter";
+      if (!alreadyOpen) await loadDoc(route.id);
+      if (route.page) {
+        setCheckPage(route.page);
+        setTab("page");
+      } else if (alreadyOpen && tab === "page") {
+        setTab(pageReturnTab.current);
+      }
+      return;
+    }
     await loadBatch(route.id);
   }
   // popstate 回调只注册一次，但要调用"最新"的 applyRoute（它闭包了最新 state）
@@ -903,6 +1021,39 @@ export default function Home() {
     return () => window.removeEventListener("popstate", onPop);
   }, []);
 
+  // ---------- 逐页核对 ----------
+  /** 第一个要检查的页：先找回退页，再找建议检查的页，都没有就第 1 页。 */
+  function firstProblemPage() {
+    return (fallbackPages[0] ?? reviewPages[0] ?? result?.pages[0])?.page ?? 1;
+  }
+  /** 切标签。进出「逐页核对」时顺手改地址栏（replace，不多出历史记录），地址能直接分享到那一页。 */
+  function selectTab(next: ResultTab) {
+    if (next === "page") {
+      const page = checkPage || firstProblemPage();
+      setCheckPage(page);
+      if (activeJobId) setRoute({ name: "doc", id: activeJobId, page }, true);
+    } else if (tab === "page" && activeJobId) {
+      setRoute({ name: "doc", id: activeJobId }, true);
+    }
+    setTab(next);
+  }
+  /** 从「第 N 页」链接进核对：记一条历史，浏览器后退能回到原来的列表。 */
+  function openPageCheck(page: number) {
+    if (tab !== "page") pageReturnTab.current = tab;
+    setCheckPage(page);
+    setTab("page");
+    if (activeJobId) setRoute({ name: "doc", id: activeJobId, page });
+  }
+  /** 核对里翻页：地址栏跟着变，但不多出历史记录。 */
+  function goToPage(page: number) {
+    if (!result) return;
+    const clamped = Math.min(Math.max(1, page), result.pageCount);
+    if (clamped === checkPage) return;
+    setCheckPage(clamped);
+    if (activeJobId) setRoute({ name: "doc", id: activeJobId, page: clamped }, true);
+  }
+  goToPageRef.current = goToPage;
+
   /**
    * 按任务 id 打开一份文档——Library 点开、批次里点"查看"、直接输入地址、刷新，全走这里。
    * 任务还在跑就先显示进度页，跑完自动切到结果；已完成就直接取结果。
@@ -912,6 +1063,7 @@ export default function Home() {
       const job = (await listJobs()).find((item) => item.id === id) ?? null;
       setScreen("converter");
       setActiveJobId(id);
+      setCheckPage(0);
       if (sourceUrl) URL.revokeObjectURL(sourceUrl);
       setSourceUrl(libraryPdfUrl(id));
       setError("");
@@ -1241,6 +1393,7 @@ export default function Home() {
       setActiveJob(finishedJob);
       setResult(converted);
       setActiveJobId(finished.id);
+      setCheckPage(0);
       if (!isPdfFile(selected)) {
         // 上面校验通过时不是 PDF 就是 PPT/Word/图片——服务端此刻已经把它转成 PDF 了，
         // 换成服务端那份，「源文件」标签页才有东西可看。
@@ -1610,6 +1763,7 @@ export default function Home() {
       setResult(refined);
       setActiveJobId(finished.id);
       setTab("compare");
+      setRoute({ name: "doc", id: finished.id }, true);
       setStatus("complete");
       // 精校失败时服务端会原样保留旧结果（status 仍是 done），但把原因记在 error 字段——
       // 不能因为"文档还在、没报错屏"就当作真的成功了，得让用户知道这次其实没变化
@@ -1942,7 +2096,9 @@ export default function Home() {
                         </span>
                       )}
                     </div>
-                    <p>{tServer(item.error || item.detail)}{item.status === "processing" && item.total ? ` · ${Math.floor(item.page)} / ${item.total} ${t("页")}` : ""}</p>
+                    {item.error
+                      ? <ExplainedError message={item.error} onOpenSettings={openSettings} />
+                      : <p>{tServer(item.detail)}{item.status === "processing" && item.total ? ` · ${Math.floor(item.page)} / ${item.total} ${t("页")}` : ""}</p>}
                     <div className="batch-item-track"><i style={{ width: `${itemPercent}%` }} /></div>
                   </div>
                   <div className="batch-item-status">
@@ -1984,15 +2140,22 @@ export default function Home() {
           <div className="progress-track"><i style={{ width: `${percent}%` }} /></div>
           <small>{mode === "ai" ? t("页面图像会发送给你在设置中选择的模型；识别失败的页面回退 PDF 文字层。") : t("转换在本机服务里进行，关掉页面也会继续。")}</small>
         </section>
-      ) : status === "error" ? (
-        <section className="error-card"><span>{t("转换未完成")}</span><h1>{
-          /PPT|Office 文档|图片转 PDF/.test(error) ? t("文档没能转成 PDF")
-            : /AI 精校/.test(error) ? t("AI 精校还没配置好")
-            : /页数/.test(error) ? t("PDF 和记录对不上")
-            : /不存在|找不到|已被/.test(error) ? t("找不到这条记录")
-            : t("这个文件暂时没能处理")
-        }</h1><p>{tServer(error)}</p><div className="error-actions">{error.includes("AI 精校") && <button className="secondary-button" type="button" onClick={openSettings}>{t("打开设置")}</button>}<button className="primary-button" type="button" onClick={reset}>{t("换一个文件")}</button></div></section>
-      ) : result ? (
+      ) : status === "error" ? (() => {
+        const explained = explainError(error);
+        const known = explained.kind !== "unknown";
+        return (
+          <section className="error-card"><span>{t("转换未完成")}</span><h1>{
+            /PPT|Office 文档|图片转 PDF/.test(error) ? t("文档没能转成 PDF")
+              : /AI 精校/.test(error) ? t("AI 精校还没配置好")
+              : /页数/.test(error) ? t("PDF 和记录对不上")
+              : /不存在|找不到|已被/.test(error) ? t("找不到这条记录")
+              : known ? t(errorCopy[explained.kind].title)
+              : t("这个文件暂时没能处理")
+          }</h1>{known
+            ? <><p>{t(errorCopy[explained.kind].action)}</p><details className="error-raw"><summary>{t("原始报错")}</summary><code>{tServer(error)}</code></details></>
+            : <p>{tServer(error)}</p>}<div className="error-actions">{(error.includes("AI 精校") || fixedInSettings(explained.kind)) && <button className="secondary-button" type="button" onClick={openSettings}>{t("打开设置")}</button>}<button className="primary-button" type="button" onClick={reset}>{t("换一个文件")}</button></div></section>
+        );
+      })() : result ? (
         <section className="result-workspace">
           <header className="result-header">
             <div><span className="success-kicker"><i />{t("转换完成 · 已存入 Library")}</span><h1>{activeFilename}</h1><p>{t("{pages} 页 · {mode} · {seconds} 秒", { pages: result.pageCount, mode: t(modeNames[result.mode]) || t("旧版转换"), seconds: (result.durationMs / 1000).toFixed(1) })}{pageTimeSummary ? ` · ${pageTimeSummary}` : ""}{(() => { const job = activeJob?.id === activeJobId ? activeJob : library.find((j) => j.id === activeJobId); const c = job ? costLabel(job) : null; return c ? ` · ${t("花费 {c}", { c })}` : ""; })()}</p></div>
@@ -2004,29 +2167,47 @@ export default function Home() {
               ) : (
                 <button type="button" className="secondary-button" onClick={reset}>{t("← 返回首页")}</button>
               )}
-              {!batchRunning && fallbackPages.length > 0 && <button type="button" className="secondary-button" onClick={() => void rerunAiRefinement("fallback")} title={t("只把上次 AI 失败或未通过校验的页再交给模型，其余页原样保留")}>{t("只重跑 {n} 页回退页", { n: fallbackPages.length })}</button>}
-              {!batchRunning && <button type="button" className="secondary-button" onClick={() => void rerunAiRefinement("all")}>{result.mode === "ai" ? t("重新 AI 精校") : t("用 AI 精校这份")}</button>}
+              {pdfBusy && <span className="busy-chip" role="status">{t("正在生成 PDF…")}</span>}
               <button type="button" className="secondary-button" onClick={copyMarkdown}>{copied ? t("已复制") : t("复制 Markdown")}</button>
-              <button type="button" className="secondary-button" disabled={pdfBusy} onClick={() => void downloadResultPdf()} title={t("把渲染后的 Markdown（含公式）打印成 PDF")}>{pdfBusy ? t("正在生成 PDF…") : t("下载 PDF")}</button>
               <button type="button" className="primary-button" onClick={() => download(result.markdown, docDownloadName(activeJob?.id === activeJobId ? activeJob : library.find((j) => j.id === activeJobId), result.title, "md"), "text/markdown;charset=utf-8")}>{t("下载 .md")}</button>
+              <MoreMenu label={t("更多操作")}>{(close) => (
+                <>
+                  <button type="button" role="menuitem" disabled={pdfBusy} onClick={() => { close(); void downloadResultPdf(); }} title={t("把渲染后的 Markdown（含公式）打印成 PDF")}>{t("下载 PDF")}</button>
+                  {!batchRunning && <button type="button" role="menuitem" onClick={() => { close(); void rerunAiRefinement("all"); }}>{result.mode === "ai" ? t("重新 AI 精校") : t("用 AI 精校这份")}</button>}
+                  <button type="button" role="menuitem" onClick={() => { close(); download(JSON.stringify(result, null, 2), `${result.title}-report.json`, "application/json"); }}>{t("导出完整报告")}</button>
+                </>
+              )}</MoreMenu>
             </div>
           </header>
           {refineWarning && (
             <div className="result-notice" role="status">
-              ⚠ {t("重新精校失败，已保留原结果：{reason}", { reason: tServer(refineWarning) })}
+              <p>⚠ {t("重新精校失败，已保留原结果。")}</p>
+              <ExplainedError message={refineWarning} onOpenSettings={openSettings} />
+            </div>
+          )}
+          {fallbackPages.length > 0 && (
+            <div className={`fallback-notice${fallbackSummary.blockers.length ? " blocked" : ""}`} role="status">
+              <p><b>{t("{n} 页 AI 没成功", { n: fallbackPages.length })}</b> · {fallbackSummary.byKind.map(({ kind, pages }) => `${t(errorCopy[kind].short)} ${pages}`).join(" · ")}</p>
+              {fallbackSummary.emptyPages > 0 && <p>{t("其中 {n} 页在结果里是空的：扫描页没有文字层可回退", { n: fallbackSummary.emptyPages })}</p>}
+              {fallbackSummary.blockers.length > 0 && <p className="fallback-blocker">{t("{kinds}：不先处理，重跑还会失败", { kinds: fallbackSummary.blockers.map(({ kind }) => t(errorCopy[kind].short)).join(" / ") })}</p>}
+              <div className="fallback-actions">
+                <button type="button" className="secondary-button" onClick={() => openPageCheck(fallbackPages[0].page)}>{t("逐页核对回退页")}</button>
+                {!batchRunning && <button type="button" className={fallbackSummary.blockers.length ? "secondary-button" : "primary-button"} onClick={() => void rerunAiRefinement("fallback")} title={t("只把上次 AI 失败或未通过校验的页再交给模型，其余页原样保留")}>{t("只重跑 {n} 页回退页", { n: fallbackPages.length })}</button>}
+                {fallbackSummary.blockers.length > 0 && <button type="button" className="primary-button" onClick={openSettings}>{t("打开设置")}</button>}
+              </div>
             </div>
           )}
           <div className="score-strip">
             <div><strong>{result.pageCount - reviewPages.length - noTextPages.length}</strong><span>{t("通过校验")}</span></div>
             <div className={reviewPages.length ? "needs-review" : ""}><strong>{reviewPages.length}</strong><span>{t("建议检查")}{noTextPages.length > 0 && <> · {t("另有 {n} 页无文字", { n: noTextPages.length })}</>}</span></div>
             <div><strong>{result.pages.reduce((sum, page) => sum + (page.formulaCount ?? 0), 0)}</strong><span>{t("LaTeX 公式")}</span></div>
-            <button type="button" onClick={() => download(JSON.stringify(result, null, 2), `${result.title}-report.json`, "application/json")}>{t("导出完整报告 ↗")}</button>
           </div>
           <div className="result-tabs" role="tablist">
-            <button className={tab === "markdown" ? "active" : ""} onClick={() => setTab("markdown")} role="tab">Markdown</button>
-            <button className={tab === "quality" ? "active" : ""} onClick={() => setTab("quality")} role="tab">{t("逐页质量")} <b>{reviewPages.length}</b></button>
-            <button className={tab === "compare" ? "active" : ""} onClick={() => setTab("compare")} role="tab">{t("AI 前后对照")} <b>{comparedPages.length}</b></button>
-            <button className={tab === "source" ? "active" : ""} onClick={() => setTab("source")} role="tab">{t("原始 PDF")}</button>
+            <button className={tab === "markdown" ? "active" : ""} onClick={() => selectTab("markdown")} role="tab">Markdown</button>
+            <button className={tab === "page" ? "active" : ""} onClick={() => selectTab("page")} role="tab">{t("逐页核对")}</button>
+            <button className={tab === "quality" ? "active" : ""} onClick={() => selectTab("quality")} role="tab">{t("逐页质量")} <b>{reviewPages.length}</b></button>
+            <button className={tab === "compare" ? "active" : ""} onClick={() => selectTab("compare")} role="tab">{t("AI 前后对照")} <b>{comparedPages.length}</b></button>
+            <button className={tab === "source" ? "active" : ""} onClick={() => selectTab("source")} role="tab">{t("原始 PDF")}</button>
           </div>
           <div className="result-panel">
             {tab === "markdown" && (
@@ -2041,12 +2222,54 @@ export default function Home() {
               </div>
             )}
             {tab === "quality" && <div className="quality-list">{result.pages.map((page) => (
-              <article key={page.page} className={outcome(page) === "noText" ? "notext-page" : page.status === "good" ? "good-page" : ""}><span>{t("第 {n} 页", { n: page.page })}</span><div><strong>{methodLabel(page)}</strong>{page.reasons.length ? page.reasons.map((reason) => <p key={reason}>{tServer(reason)}</p>) : <p>{t("程序校验通过")}</p>}<p>{t("{f} 个公式 · {o} 个选项标签", { f: page.formulaCount ?? 0, o: page.optionCount ?? 0 })}</p></div><small>{t("{n} 字符", { n: page.charCount })}{pageTimeLabel(page) && <><br />{pageTimeLabel(page)}</>}{page.usage && <><br />{t("{i}+{o} token", { i: page.usage.inputTokens, o: page.usage.outputTokens })}{page.usage.costUsd !== null ? ` · ${fmtUsd(page.usage.costUsd)}` : ` · ${t("未计价")}`}</>}</small></article>
+              <article key={page.page} className={outcome(page) === "noText" ? "notext-page" : page.status === "good" ? "good-page" : ""}><span><button type="button" className="page-link" onClick={() => openPageCheck(page.page)}>{t("第 {n} 页", { n: page.page })}</button></span><div><strong>{methodLabel(page)}</strong><PageReasons page={page} onOpenSettings={openSettings} /><p>{t("{f} 个公式 · {o} 个选项标签", { f: page.formulaCount ?? 0, o: page.optionCount ?? 0 })}</p></div><small>{t("{n} 字符", { n: page.charCount })}{pageTimeLabel(page) && <><br />{pageTimeLabel(page)}</>}{page.usage && <><br />{t("{i}+{o} token", { i: page.usage.inputTokens, o: page.usage.outputTokens })}{page.usage.costUsd !== null ? ` · ${fmtUsd(page.usage.costUsd)}` : ` · ${t("未计价")}`}</>}</small></article>
             ))}</div>}
             {tab === "compare" && (comparedPages.length ? <div className="compare-list">{comparedPages.map((page) => (
-              <article key={page.page}><header><strong>{t("第 {n} 页", { n: page.page })}</strong><span className={`method-badge ${outcome(page) === "noText" ? "notext" : page.method === "ai" ? "accepted" : "fallback"}`}>{outcome(page) === "noText" ? t("AI 判定无文字") : page.method === "ai" ? t("采用 {model}", { model: page.model ?? "" }) : fallbackLabel(page)}</span></header><div className="compare-columns"><section><h3>{t("最终 Markdown")}</h3>{outcome(page) === "noText" ? <p className="compare-empty">{page.note ? t("本页没有可提取的文字：{note}", { note: page.note }) : t("本页没有可提取的文字")}</p> : <pre>{page.markdown}</pre>}</section><section><h3>{result.mode === "ai" ? t("PDF 文字层（提示/回退）") : t("Surya 本地初稿")}</h3><pre>{page.rawMarkdown}</pre></section></div></article>
+              <article key={page.page}><header><strong><button type="button" className="page-link" onClick={() => openPageCheck(page.page)}>{t("第 {n} 页", { n: page.page })}</button></strong><span className={`method-badge ${outcome(page) === "noText" ? "notext" : page.method === "ai" ? "accepted" : "fallback"}`}>{outcome(page) === "noText" ? t("AI 判定无文字") : page.method === "ai" ? t("采用 {model}", { model: page.model ?? "" }) : fallbackLabel(page)}</span></header><div className="compare-columns"><section><h3>{t("最终 Markdown")}</h3>{outcome(page) === "noText" ? <p className="compare-empty">{page.note ? t("本页没有可提取的文字：{note}", { note: page.note }) : t("本页没有可提取的文字")}</p> : <pre>{page.markdown}</pre>}</section><section><h3>{result.mode === "ai" ? t("PDF 文字层（提示/回退）") : t("Surya 本地初稿")}</h3><pre>{page.rawMarkdown}</pre></section></div></article>
             ))}</div> : <div className="all-clear"><span>↔</span><h2>{t("这次没有 AI 对照记录")}</h2><p>{t("使用“重新 AI 精校”后，这里会保留最终结果与本地初稿。")}</p></div>)}
             {tab === "source" && sourceUrl && <iframe className="pdf-preview" src={sourceUrl} title={t("原始 PDF 预览")} />}
+            {tab === "page" && checkTarget && (
+              <div className="page-check">
+                <div className="page-check-bar">
+                  <div className="page-check-nav">
+                    <button type="button" className="secondary-button" disabled={checkTarget.page <= 1} onClick={() => goToPage(checkTarget.page - 1)} aria-label={t("上一页")}>‹</button>
+                    <strong>{t("第 {n} / {total} 页", { n: checkTarget.page, total: result.pageCount })}</strong>
+                    <button type="button" className="secondary-button" disabled={checkTarget.page >= result.pageCount} onClick={() => goToPage(checkTarget.page + 1)} aria-label={t("下一页")}>›</button>
+                  </div>
+                  <span className={`page-pill ${outcome(checkTarget)}`}>{methodLabel(checkTarget)}</span>
+                  {nextProblemPage !== null && <button type="button" className="quiet-button" onClick={() => goToPage(nextProblemPage)}>{t("下一个要检查的页 →")}</button>}
+                </div>
+                {result.pageCount > 1 && (
+                  <div className="page-strip" aria-label={t("全部页面")}>
+                    {result.pages.map((page) => {
+                      const state = outcome(page) === "fallback" ? "bad" : outcome(page) === "noText" ? "notext" : page.status === "review" ? "warn" : "ok";
+                      return <button key={page.page} type="button" className={`page-dot ${state}${page.page === checkTarget.page ? " current" : ""}`} aria-label={t("第 {n} 页", { n: page.page })} aria-current={page.page === checkTarget.page ? "page" : undefined} title={`${t("第 {n} 页", { n: page.page })} · ${methodLabel(page)}`} onClick={() => goToPage(page.page)} />;
+                    })}
+                  </div>
+                )}
+                <div className="page-check-body">
+                  <figure className="page-check-image">
+                    {imageFailedPage === checkTarget.page
+                      ? <p>{t("原图载入失败")}</p>
+                      : <>
+                          <span className="page-check-loading">{t("正在载入原图…")}</span>
+                          {/* eslint-disable-next-line @next/next/no-img-element -- 原图来自本机 8765 服务、按需现渲染，next/image 的优化管线用不上 */}
+                          <img key={checkTarget.page} src={libraryPageImageUrl(activeJobId, checkTarget.page)} alt={t("第 {n} 页原图", { n: checkTarget.page })} decoding="async" onError={() => setImageFailedPage(checkTarget.page)} />
+                        </>}
+                  </figure>
+                  <div className="page-check-text">
+                    <div className="page-check-reasons"><PageReasons page={checkTarget} onOpenSettings={openSettings} /></div>
+                    {checkHtml
+                      ? <div className="markdown-rendered" dangerouslySetInnerHTML={{ __html: checkHtml }} />
+                      : <p className="page-check-empty">{outcome(checkTarget) === "noText"
+                          ? (checkTarget.note ? t("本页没有可提取的文字：{note}", { note: checkTarget.note }) : t("本页没有可提取的文字"))
+                          : outcome(checkTarget) === "fallback"
+                            ? t("这页结果为空：AI 没成功，扫描页也没有文字层可回退。")
+                            : t("这页没有识别出文字。扫描页请改用本地高精度或 AI 精校。")}</p>}
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         </section>
       ) : null}

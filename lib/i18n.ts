@@ -254,6 +254,7 @@ export const en: Record<string, string> = {
   "采用 {model}": "Using {model}",
   "AI 未通过 · 已回退 PDF 文字层": "AI rejected · PDF text layer kept",
   "AI 未通过 · 已回退本地初稿": "AI rejected · local draft kept",
+  "AI 未通过 · 这页没有文字层可回退，结果为空": "AI failed · no text layer to fall back to, page is empty",
   "AI 判定无文字": "AI: no text on this page",
   "另有 {n} 页无文字": "+{n} with no text",
   "本页没有可提取的文字": "No extractable text on this page",

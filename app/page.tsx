@@ -471,9 +471,12 @@ function pageTimeLabel(page: PageResult) {
 
 /**
  * 回退页留下的是交给模型的那份初稿：AI 模式下是 PDF 文字层（method "text"），本地模式下是 Surya。
+ * 扫描版没有文字层（method "empty"）：没有东西可回退，这一页在结果里是空的——必须直说，
+ * 实测库里这样的页有四百多页，以前被写成「已回退」，看起来像有内容。
  * 分不清出处的（重新精校过的老记录）只说「本地初稿」，不冒充 Surya。
  */
 function fallbackLabel(page: PageResult) {
+  if (page.method === "empty") return t("AI 未通过 · 这页没有文字层可回退，结果为空");
   return page.method === "text" ? t("AI 未通过 · 已回退 PDF 文字层") : t("AI 未通过 · 已回退本地初稿");
 }
 

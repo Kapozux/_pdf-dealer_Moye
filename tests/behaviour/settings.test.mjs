@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { maskedKey, mergeExtraKeys, newRow, rowsFromSaved, rowsToPayload, splitKeys } from "../../lib/key-pool.mjs";
-import { createSettingsStore, defaultSettings, providerConfigured } from "../../server/settings.mjs";
+import { createSettingsStore, defaultSettings, geminiKeyRejected, providerConfigured } from "../../server/settings.mjs";
 
 const A = "AIzaSy-aaaa-1111";
 const B = "AIzaSy-bbbb-2222";
@@ -135,3 +135,12 @@ test("没存过设置时用默认值：Kimi 走国际站、百炼走北京兼容
     assert.equal(settings.ollamaBaseUrl, "http://127.0.0.1:11434");
     assert.deepEqual(settings, { ...defaultSettings });
   }));
+
+test("Gemini Key 拉黑只认明确的拒绝：401/403、400 + API_KEY_INVALID；报错文字里碰巧带 permission 不算", () => {
+  assert.equal(geminiKeyRejected(401, ""), true);
+  assert.equal(geminiKeyRejected(403, "The caller does not have permission"), true);
+  assert.equal(geminiKeyRejected(400, "API key not valid. Please pass a valid API key."), true);
+  assert.equal(geminiKeyRejected(400, "Invalid JSON payload"), false);
+  assert.equal(geminiKeyRejected(429, "Quota exceeded; check permission and billing"), false);
+  assert.equal(geminiKeyRejected(500, "unauthorized upstream hiccup"), false);
+});

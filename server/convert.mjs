@@ -33,7 +33,7 @@ import { aiFailed, aiNoText, aiOk, aiRejected, countFormulas, countOptions, isFa
 const TEXTLAYER_WORKER = join(dirname(fileURLToPath(import.meta.url)), "textlayer-worker.mjs");
 const TEXTLAYER_TIMEOUT_MS = Number(process.env.MOYE_TEXTLAYER_TIMEOUT_MS) || 15 * 60 * 1000;
 
-function runTextLayerWorker(pdfPath, args = [], onProgress = null) {
+function runTextLayerWorker(pdfPath, args = [], onProgress = null, signal = null) {
   return new Promise((resolve, reject) => {
     const child = spawn(
       process.execPath,
@@ -55,6 +55,13 @@ function runTextLayerWorker(pdfPath, args = [], onProgress = null) {
       lineBuffer = lines.pop();
       for (const line of lines) {
         const m = line.match(/^progress (\d+) (\d+)$/);
+        // 每读完一页看一眼取消 token：fast 模式整份就是这一步，以前要读完整本才停
+        if (m && signal?.cancelled) {
+          clearTimeout(timer);
+          child.kill("SIGKILL");
+          reject(new JobCancelled());
+          return;
+        }
         if (m) onProgress?.(Number(m[1]), Number(m[2]));
         else stderrTail = `${stderrTail}${line}\n`.slice(-4000);   // pdfjs 的 Warning 之类，只在失败时抛出
       }
@@ -76,7 +83,7 @@ function runTextLayerWorker(pdfPath, args = [], onProgress = null) {
 }
 
 /** @returns {Promise<{total:number, pages:object[]}>} 逐页文字层初稿 */
-const extractTextLayer = (pdfPath, onProgress) => runTextLayerWorker(pdfPath, [], onProgress);
+const extractTextLayer = (pdfPath, onProgress, signal = null) => runTextLayerWorker(pdfPath, [], onProgress, signal);
 /** 只要页数：同样走子进程，避免为了一个数字在服务进程里解析整本书。 */
 const pdfPageCount = async (pdfPath) => (await runTextLayerWorker(pdfPath, ["--count"])).total;
 
@@ -705,7 +712,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
     if (mode === "fast") {
       ({ pages, total } = await extractTextLayer(pdfPath, (page, count) =>
         onProgress(page, count, `读取文字层 ${page}/${count} 页`)
-      ));
+      , signal));
     } else if (mode === "ai") {
       // AI 模式直接让视觉模型读页面，**不再先跑一遍慢的 Surya**：
       // 既然要用更强的模型，为了一份会被覆盖的初稿等上几分钟没有意义。
@@ -715,7 +722,7 @@ export function createConverter({ runSurya, refinePage, loadSettings, renderer, 
       // 界面停在 0/N 一动不动，看起来就像卡死了。
       const hints = await extractTextLayer(pdfPath, (page, count) =>
         onProgress(page, count, `读取文字层作为提示 ${page}/${count} 页，随后交给视觉模型`)
-      );
+      , signal);
       total = hints.total;
       if (signal?.cancelled) throw new JobCancelled();   // 读文字层那一两分钟里点了取消：别再开始调模型
       pages = await refineWithAi(pdfPath, hints.pages, onProgress, checkpoint, new Map(), signal);

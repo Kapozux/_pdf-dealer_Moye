@@ -13,7 +13,14 @@
  *
  * 熔断：一个模型至少有两条线路真的试过、全部失败，才记它一次失败。预算用完一家都没轮到的不算
  * （以前也照记），补救轮只来得及试一家的也不算（一次超时说明不了模型挂了）。
+ *
+ * 账号级错误立刻停：401（Key 无效）、402（余额不足）是整个 OpenRouter 账号的问题，换供应商、
+ * 换模型都一样被拒。以前照样把所有供应商 × 所有模型试一遍，白烧一页的预算，还把模型记成熔断。
+ * 403 不在里面：OpenRouter 的 403 多是某个模型的内容审核拦截，换模型可能就过了。
  */
+
+/** 换家、换模型都没用的错误（错误上的 status 由 postWithRetries 带上）。 */
+export const isAccountError = (error) => error?.status === 401 || error?.status === 402;
 
 /**
  * @template T
@@ -27,9 +34,10 @@
  * @param {{ isDown: (model: string) => boolean, success: (model: string) => void, failure: (model: string) => void }} o.health
  * @param {(model: string, pinned: string | null, error: unknown) => void} [o.log]
  * @param {() => number} [o.now]  测试注入假时钟
+ * @param {(error: unknown) => boolean} [o.isFatal]  遇到这种错误整条链立刻停
  * @returns {Promise<{ result: T, model: string }>}
  */
-export async function failoverChain({ models, providers, perTryMs, budgetMs, minTryMs = 3000, call, health, log = () => {}, now = Date.now }) {
+export async function failoverChain({ models, providers, perTryMs, budgetMs, minTryMs = 3000, call, health, log = () => {}, now = Date.now, isFatal = isAccountError }) {
   const overallDeadline = now() + budgetMs;
   // 已熔断的模型跳过——除非它是唯一剩下的
   const usable = models.filter((model) => !health.isDown(model));
@@ -53,6 +61,7 @@ export async function failoverChain({ models, providers, perTryMs, budgetMs, min
       } catch (error) {
         lastError = error;
         log(model, pinned, error);
+        if (isFatal(error)) throw error;
       }
     }
     if (tried >= 2) health.failure(model);

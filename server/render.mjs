@@ -30,7 +30,8 @@ json.dump(out, sys.stdout)
 `;
 
 export function createRenderer({ python, timeoutMs = 120000 }) {
-  const available = Boolean(python && existsSync(python));
+  // 每次用的时候现查：服务跑着时在「设置 → 环境」里装好 Python 环境，不用重启就能用上
+  const isAvailable = () => Boolean(python && existsSync(python));
 
   /**
    * @param {string} pdfPath
@@ -39,7 +40,7 @@ export function createRenderer({ python, timeoutMs = 120000 }) {
    */
   async function renderPages(pdfPath, pages, { scale = 2, quality = 90 } = {}) {
     if (!pages.length) return {};
-    if (!available) {
+    if (!isAvailable()) {
       throw new Error("本机渲染环境不可用：找不到 Surya 的 Python 环境，无法为 AI 精校生成页面图像。");
     }
     // 超时按页数放大：一次渲染几十页时固定 120s 够用，但调用方若一次塞几百页
@@ -78,5 +79,10 @@ export function createRenderer({ python, timeoutMs = 120000 }) {
     });
   }
 
-  return { renderPages, available };
+  return {
+    renderPages,
+    get available() {
+      return isAvailable();
+    },
+  };
 }

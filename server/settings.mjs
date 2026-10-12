@@ -10,6 +10,7 @@
  *     这种局部保存不能把 Key / Base URL 冲掉）。多处同时保存会排队，不会互相覆盖。
  *   normalizeSettings(input, previous)  合并规则本体（测试连接、同步模型也用它，但不写盘）
  *   providerConfigured(settings, provider)  「这家能用了吗」的唯一判断
+ *   geminiKeyRejected(status, message)  哪些报错算「这把 Gemini Key 被拒」
  */
 
 import { randomUUID } from "node:crypto";
@@ -68,6 +69,18 @@ export function providerConfigured(settings, provider) {
     ollama: settings.ollamaModel,
   }[provider];
   return Boolean(credential);
+}
+
+/**
+ * 这把 Gemini Key 是不是被上游明确拒了（该从轮询里拉黑）。
+ *
+ * 只认状态码：401/403，或 400 且明说 API_KEY_INVALID（Gemini 对无效 Key 回的是 400）。
+ * 以前只按文字匹配 permission / unauthor，任何报错正文里碰巧带这两个词（比如 429、5xx 的说明），
+ * 这把 Key 就被拉黑到进程重启（docs 报告 B5）。拉黑在保存设置时清空，见 local-ocr-server 的 /api/settings。
+ */
+export function geminiKeyRejected(status, message) {
+  if (status === 401 || status === 403) return true;
+  return status === 400 && /API key not valid|API_KEY_INVALID/i.test(String(message));
 }
 
 export function normalizeSettings(input, previous = defaultSettings) {

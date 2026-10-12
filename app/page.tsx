@@ -8,7 +8,7 @@ import { explainError, summarizeCauses, type ErrorKind } from "../lib/explain-er
 import { newRow, rowsFromSaved, rowsToPayload, type KeyRow } from "../lib/key-pool.mjs";
 import {
   cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPageImageUrl, libraryPdfUrl, listJobs, searchLibrary, type SearchResult,
-  exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
+  exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineCostPerPage, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
   type Batch, type Job, type Reflect, type ReflectRange, type SpeedTable, type Stats, type TagBackfillState, type Usage, type UsageRow,
 } from "../lib/api";
 import { t, tServer, getActiveLang, setActiveLang, readStoredLang, storeLang, type Lang } from "../lib/i18n";
@@ -610,16 +610,6 @@ function findConverted(f: File, library: Job[]): { job: Job; exact: boolean } | 
   return done[0] ? { job: done[0], exact: false } : null;
 }
 
-/** 最近 AI 精校的实际花费，每页多少钱（中位数）。没有计过价的（直连 Kimi / Qwen）不算；样本不到 3 份不给数。 */
-function aiCostPerPage(library: Job[]): number | null {
-  const samples = library
-    .filter((job) => job.mode === "ai" && job.status === "done" && (job.cost_usd ?? 0) > 0 && job.page_count > 0)
-    .slice(0, 50)
-    .map((job) => (job.cost_usd as number) / job.page_count)
-    .sort((a, b) => a - b);
-  return samples.length >= 3 ? samples[Math.floor(samples.length / 2)] : null;
-}
-
 /** 外观：跟随系统 / 浅色 / 深色。存在 localStorage 的 moye_theme（layout.tsx 开页时就读它） */
 type Theme = "system" | "light" | "dark";
 const themeNames: Record<Theme, string> = { system: "跟随系统", light: "浅色", dark: "深色" };
@@ -666,20 +656,29 @@ function waitForJob(jobId: string, onProgress: (job: Job) => void): Promise<Job>
         })
         .catch(() => undefined);
     }, 4000);
+    // 2 秒后确认任务还在。GET /api/jobs 只给最近 200 条：老记录点「重新精校」时不在列表里，
+    // 要再按 id 问一次（/api/library/<id>，会连结果一起回来，只问这一次），确实 404 才算不存在。
+    // 这种老记录的进度只靠 SSE，上面的 4 秒轮询找不到它。
     setTimeout(() => {
-      if (!settled) {
-        void listJobs()
-          .then((jobs) => {
-            const job = jobs.find((item) => item.id === jobId);
-            if (!job) {
-              settled = true;
-              unsubscribe();
-              clearInterval(poll);
-              reject(new Error(t("任务不存在或已被清除。")));
-            }
-          })
-          .catch(() => undefined);
-      }
+      if (settled) return;
+      const gone = () => {
+        if (settled) return;
+        settled = true;
+        unsubscribe();
+        clearInterval(poll);
+        reject(new Error(t("任务不存在或已被清除。")));
+      };
+      void listJobs()
+        .then(async (jobs) => {
+          if (jobs.some((item) => item.id === jobId)) return;
+          try {
+            handle((await fetchLibraryEntry(jobId)).job);
+          } catch (caught) {
+            if (caught instanceof Error && caught.message === "记录不存在。") gone();
+            else console.warn(`[任务] 确认 ${jobId} 是否存在时出错，继续等进度：`, caught);
+          }
+        })
+        .catch(() => undefined);
     }, 2000);
   });
 }
@@ -822,7 +821,8 @@ export default function Home() {
     const timer = setTimeout(() => setLang(stored), 0);
     return () => clearTimeout(timer);
   }, []);
-  useEffect(() => { document.documentElement.lang = lang === "en" ? "en" : "zh-Hant"; }, [lang]);
+  // 界面文案是简体（i18n 只有 zh / en 两档），以前写的 zh-Hant 不对
+  useEffect(() => { document.documentElement.lang = lang === "en" ? "en" : "zh-Hans"; }, [lang]);
   function toggleLang() {
     const next: Lang = lang === "en" ? "zh" : "en";
     setLang(next);
@@ -886,11 +886,16 @@ export default function Home() {
       setSettingsDraft(draftFromSaved(loaded));
     }).catch(() => undefined);
     void fetchSpeed().then(setSpeed).catch(() => undefined);
+    // 待转区的花费预估要用（refineCostPerPage）；读不到只是不显示「约 $X」
+    void fetchUsage().then(setUsageData).catch(() => undefined);
     void fetchSetup().then(setSetupData).catch(() => undefined);
   }, []);
   // 每完成一份就刷新一次速度表：预计剩余时间用最近的样本
   useEffect(() => {
-    if (status === "complete" || (status === "batch" && !batchRunning)) void fetchSpeed().then(setSpeed).catch(() => undefined);
+    if (status === "complete" || (status === "batch" && !batchRunning)) {
+      void fetchSpeed().then(setSpeed).catch(() => undefined);
+      void fetchUsage().then(setUsageData).catch(() => undefined);   // 花费预估跟着更新
+    }
   }, [status, batchRunning]);
   // Esc 关面板（点背景关已经有了）
   useEffect(() => {
@@ -904,6 +909,15 @@ export default function Home() {
     if (toastTimer.current) clearTimeout(toastTimer.current);
     setToast(message);
     toastTimer.current = setTimeout(() => setToast(null), 2200);
+  }
+
+  /** 取消一份在跑的任务；失败要说出来（以前不看响应，取消没成功也像成功了）。 */
+  async function cancelLive(id: string) {
+    try {
+      await cancelJob(id);
+    } catch (caught) {
+      showToast(t("取消失败：{reason}", { reason: caught instanceof Error ? tServer(caught.message) : String(caught) }));
+    }
   }
 
   /**
@@ -963,14 +977,14 @@ export default function Home() {
     const pages = counts.reduce<number>((sum, n) => sum + (typeof n === "number" ? n : 0), 0);
     const unknown = counts.filter((n) => typeof n !== "number").length;
     const secPerPage = speed[mode]?.secPerPage ?? null;
-    const costPerPage = mode === "ai" ? aiCostPerPage(library) : null;
+    const costPerPage = mode === "ai" ? refineCostPerPage(usageData) : null;
     return {
       pages,
       unknown,
       seconds: secPerPage !== null && pages ? pages * secPerPage : null,
       cost: costPerPage !== null && pages ? pages * costPerPage : null,
     };
-  }, [staged, stagedPages, speed, mode, library]);
+  }, [staged, stagedPages, speed, mode, usageData]);
   // 「这页本来就没有文字」（照片、空白页）单独数：它在服务端也是 review（要出现在逐页质量里），
   // 但混进「建议检查」会把真正要看的页淹掉——笔记类文档几乎每张插图都会命中
   const noTextPages = useMemo(() => result?.pages.filter((page) => outcome(page) === "noText") ?? [], [result]);
@@ -1052,7 +1066,10 @@ export default function Home() {
     const timer = setTimeout(() => {
       void searchLibrary(term)
         .then((results) => { if (latestSearch.current === term) setTextHits(new Map(results.map((r) => [r.id, r]))); })
-        .catch((caught) => console.warn("[搜索] 全文搜索失败，只按文件名和标签过滤：", caught));
+        .catch((caught) => {
+          console.warn("[搜索] 全文搜索失败，只按文件名和标签过滤：", caught);
+          if (latestSearch.current === term) showToast(t("全文搜索失败，只按文件名和标签过滤：{reason}", { reason: caught instanceof Error ? tServer(caught.message) : String(caught) }));
+        });
     }, 250);
     return () => clearTimeout(timer);
   }, [query, screen]);
@@ -1222,7 +1239,10 @@ export default function Home() {
    */
   async function loadDoc(id: string) {
     try {
-      const job = (await listJobs()).find((item) => item.id === id) ?? null;
+      // listJobs 只取最近 200 条；更老的记录按 id 取（连结果一起，已完成的就直接用这份，不再取第二遍）
+      let entry: Awaited<ReturnType<typeof fetchLibraryEntry>> | null = null;
+      let job = (await listJobs()).find((item) => item.id === id) ?? null;
+      // 先切到结果页再按 id 取：取不到（记录已删、链接写错）时报错要显示在结果页上
       setScreen("converter");
       setActiveJobId(id);
       setCheckPage(0);
@@ -1230,6 +1250,10 @@ export default function Home() {
       setSourceUrl(libraryPdfUrl(id));
       setError("");
       setRefineWarning("");
+      if (!job) {
+        entry = await fetchLibraryEntry(id);
+        job = entry.job;
+      }
       if (job) setActiveFilename(job.filename);
       if (job && (job.status === "queued" || job.status === "running")) {
         setMode(job.mode);
@@ -1248,8 +1272,8 @@ export default function Home() {
       } else if (job && job.status !== "done") {
         throw new Error(job.error || t("这份任务没有完成。"));
       }
-      // listJobs 只取最近 200 条；更老的记录直接按 id 取结果
-      const { job: storedJob, result: stored } = await fetchLibraryEntry(id);
+      // 刚跑完的要重新取；老记录上面已经取过、且当时就是 done 的直接用
+      const { job: storedJob, result: stored } = entry && entry.job.status === "done" ? entry : await fetchLibraryEntry(id);
       setActiveJob(storedJob);
       setActiveFilename(storedJob.filename);
       setMode(stored.mode);
@@ -1303,7 +1327,14 @@ export default function Home() {
     setScreen("converter");
     if (batchId === id && batchItems.length) { setStatus("batch"); return; }
     try {
-      const jobs = (await listJobs()).filter((job) => job.batch_id === id);
+      // /api/jobs 只有最近 200 条，老批次（或跨过 200 条边界的批次）的已完成文档要从 Library 补（Library 给到 500 条）。
+      // 同一份两边都有时用 /api/jobs 那份（进度更新）。仍有漏网的：200 条以外、正在重新精校的那份（不是 done，Library 不给），
+      // 要服务端给一个按批次查的接口才能补齐
+      const [recent, done] = await Promise.all([listJobs(), listLibraryItems()]);
+      const seen = new Set<string>();
+      const jobs = [...recent, ...done]
+        .filter((job) => job.batch_id === id && !seen.has(job.id) && seen.add(job.id))
+        .sort((a, b) => b.created_at.localeCompare(a.created_at));   // 跟 /api/jobs 一样新的在前
       if (!jobs.length) throw new Error(t("找不到这个批次，可能已被删除。"));
       const toMs = (iso: string | null) => (iso ? new Date(iso).getTime() : undefined);
       const items: BatchItem[] = jobs.map((job) => ({
@@ -1434,8 +1465,9 @@ export default function Home() {
   async function runBackfill() {
     try {
       setBackfillState(await startTagBackfill());
-    } catch {
-      /* 打标签失败不影响主流程，面板上没反应就是没反应 */
+    } catch (caught) {
+      // 不影响主流程，但要说出来：以前吞掉了，点了按钮没反应，不知道是没启动还是在跑
+      showToast(t("补标签没有启动：{reason}", { reason: caught instanceof Error ? tServer(caught.message) : String(caught) }));
     }
   }
   // 补标签跑起来之后轮询进度；跑完再刷一次统计，把新标签体现出来
@@ -1445,6 +1477,10 @@ export default function Home() {
       void fetchTagBackfillStatus().then((next) => {
         setBackfillState(next);
         if (!next.running) void fetchStats().then(setStats).catch(() => undefined);
+      }).catch((caught) => {
+        // 读不到进度就停止轮询并说一声（服务端可能还在补，重新点一次会接上进度）
+        setBackfillState((prev) => (prev ? { ...prev, running: false } : prev));
+        showToast(t("读不到补标签进度：{reason}", { reason: caught instanceof Error ? tServer(caught.message) : String(caught) }));
       });
     }, 1500);
     return () => clearInterval(timer);
@@ -1769,19 +1805,29 @@ export default function Home() {
   /** 下载批次里某一份的 Markdown（同样从服务端取）。 */
   async function downloadBatchItem(item: BatchItem) {
     if (!item.jobId) return;
-    const { result: stored } = await fetchLibraryEntry(item.jobId);
-    download(stored.markdown, docDownloadName(library.find((j) => j.id === item.jobId), stored.title, "md"), "text/markdown;charset=utf-8");
+    try {
+      const { job, result: stored } = await fetchLibraryEntry(item.jobId);
+      download(stored.markdown, docDownloadName(job, stored.title, "md"), "text/markdown;charset=utf-8");
+    } catch (caught) {
+      showToast(t("下载失败：{reason}", { reason: caught instanceof Error ? tServer(caught.message) : String(caught) }));
+    }
   }
 
   async function downloadBatchMarkdown() {
     const completed = batchItems.filter((item) => item.status === "complete" && item.jobId);
     if (!completed.length) return;
-    const parts = await Promise.all(
-      completed.map(async (item) => {
-        const { result: stored } = await fetchLibraryEntry(item.jobId!);
-        return `<!-- ${t("来源文件")}：${item.name} -->\n\n${stored.markdown}`;
-      })
-    );
+    let parts: string[];
+    try {
+      parts = await Promise.all(
+        completed.map(async (item) => {
+          const { result: stored } = await fetchLibraryEntry(item.jobId!);
+          return `<!-- ${t("来源文件")}：${item.name} -->\n\n${stored.markdown}`;
+        })
+      );
+    } catch (caught) {
+      showToast(t("下载失败：{reason}", { reason: caught instanceof Error ? tServer(caught.message) : String(caught) }));
+      return;
+    }
     download(parts.join("\n\n---\n\n"), `${t("墨页批量转换")}-${new Date().toISOString().slice(0, 10)}.md`, "text/markdown;charset=utf-8");
   }
 
@@ -1892,20 +1938,29 @@ export default function Home() {
 
   async function copyMarkdown() {
     if (!result) return;
-    await navigator.clipboard.writeText(result.markdown);
+    try {
+      await navigator.clipboard.writeText(result.markdown);
+    } catch (caught) {
+      // 没有剪贴板权限 / 非安全上下文时会被拒；提示去用「下载 .md」
+      showToast(t("复制失败，改用「下载 .md」：{reason}", { reason: caught instanceof Error ? tServer(caught.message) : String(caught) }));
+      return;
+    }
     setCopied(true);
     window.setTimeout(() => setCopied(false), 1600);
   }
 
-  /**
-   * only="fallback"：只把上次回退的页再交给模型，成功的页原样保留——
-   * 几百页的书只坏了几十页时，整份重跑既费钱又可能把好页跑坏。
-   */
+  /** 当前这份的文件名（下载 .md / PDF / 报告共用，规则见 docDownloadName）。 */
+  function activeDownloadName(ext: string, suffix = "") {
+    const job = activeJob?.id === activeJobId ? activeJob : library.find((j) => j.id === activeJobId);
+    // 报告是「名字 日期-report.json」：后缀插在扩展名前
+    return docDownloadName(job, result?.title ?? "", ext).replace(/\.[^.]+$/, `${suffix}.${ext}`);
+  }
+
   async function downloadResultPdf() {
     if (!activeJobId || !result || pdfBusy) return;
     setPdfBusy(true);
     try {
-      downloadBlob(await fetchLibraryDocumentPdf(activeJobId), `${result.title}.pdf`);
+      downloadBlob(await fetchLibraryDocumentPdf(activeJobId), activeDownloadName("pdf"));
     } catch (caught) {
       setRefineWarning("");
       setError(t("PDF 生成失败：{reason}", { reason: caught instanceof Error ? tServer(caught.message) : String(caught) }));
@@ -1915,6 +1970,10 @@ export default function Home() {
     }
   }
 
+  /**
+   * only="fallback"：只把上次回退的页再交给模型，成功的页原样保留——
+   * 几百页的书只坏了几十页时，整份重跑既费钱又可能把好页跑坏。
+   */
   async function rerunAiRefinement(only: "all" | "fallback" = "all") {
     if (!activeJobId || !result) return;
     setMode("ai");
@@ -1976,7 +2035,7 @@ export default function Home() {
             // 进行中的任务在哪个界面都看得见，不只是首页
             <ActiveJobsMenu jobs={activeJobs} now={now}
               onOpen={(j) => navigate(j.batch_id ? { name: "batch", id: j.batch_id } : { name: "doc", id: j.id })}
-              onCancel={(j) => void cancelJob(j.id)} />
+              onCancel={(j) => void cancelLive(j.id)} />
           )}
           <button className={`library-nav ${screen === "library" ? "active" : ""}`} type="button" onClick={showLibrary} disabled={batchRunning}>Library <b>{library.length}</b></button>
           <button className="lang-toggle theme-toggle" type="button" onClick={cycleTheme} aria-label={t("外观：{mode}", { mode: t(themeNames[theme]) })} title={t("外观：{mode}（点一下切换）", { mode: t(themeNames[theme]) })}>{themeIcons[theme]}</button>
@@ -2149,7 +2208,7 @@ export default function Home() {
                         {j.status === "queued" ? t("排队中") : j.total ? `${j.page}/${j.total} ${t("页")}` : t("处理中")}
                         {" · ⏱ "}{formatElapsed(now - new Date(j.created_at).getTime())}
                       </span>
-                      <button type="button" onClick={() => void cancelJob(j.id)}>{t("取消")}</button>
+                      <button type="button" onClick={() => void cancelLive(j.id)}>{t("取消")}</button>
                     </li>
                   ))}
                 </ul>
@@ -2368,12 +2427,12 @@ export default function Home() {
               )}
               {pdfBusy && <span className="busy-chip" role="status">{t("正在生成 PDF…")}</span>}
               <button type="button" className="secondary-button" onClick={copyMarkdown}>{copied ? t("已复制") : t("复制 Markdown")}</button>
-              <button type="button" className="primary-button" onClick={() => download(result.markdown, docDownloadName(activeJob?.id === activeJobId ? activeJob : library.find((j) => j.id === activeJobId), result.title, "md"), "text/markdown;charset=utf-8")}>{t("下载 .md")}</button>
+              <button type="button" className="primary-button" onClick={() => download(result.markdown, activeDownloadName("md"), "text/markdown;charset=utf-8")}>{t("下载 .md")}</button>
               <MoreMenu label={t("更多操作")}>{(close) => (
                 <>
                   <button type="button" role="menuitem" disabled={pdfBusy} onClick={() => { close(); void downloadResultPdf(); }} title={t("把渲染后的 Markdown（含公式）打印成 PDF")}>{t("下载 PDF")}</button>
                   {!batchRunning && <button type="button" role="menuitem" onClick={() => { close(); void rerunAiRefinement("all"); }}>{result.mode === "ai" ? t("重新 AI 精校") : t("用 AI 精校这份")}</button>}
-                  <button type="button" role="menuitem" onClick={() => { close(); download(JSON.stringify(result, null, 2), `${result.title}-report.json`, "application/json"); }}>{t("导出完整报告")}</button>
+                  <button type="button" role="menuitem" onClick={() => { close(); download(JSON.stringify(result, null, 2), activeDownloadName("json", "-report"), "application/json"); }}>{t("导出完整报告")}</button>
                 </>
               )}</MoreMenu>
             </div>
@@ -2780,7 +2839,7 @@ export default function Home() {
                             .filter((p) => !settingsDraft.channels?.length || settingsDraft.channels.includes(p))
                             .reduce((sum, p) => sum + (settings.channelWeights?.[p] ?? 0), 0)}
                         </b>{" "}
-                        {t("路 · 实测 84 路可靠，再往上会有请求挂死")}
+                        {t("路 · 每家的路数按实测定（见各家后面的数字）")}
                       </div>
                     </>
                   )}
@@ -2794,7 +2853,7 @@ export default function Home() {
                           <span className="keypool-title">{t("并行密钥")}</span>
                           <small>{t("实测：同一 Google")} <b>{t("账号")}</b>{t("下的 Key（哪怕分属不同项目）共用同一份吞吐，加了不会更快；")}<b>{t("换一个 Google 账号")}</b>{t("的 Key 才是独立配额——实测两个账号并行提速")} <b>{t("3.3 倍")}</b>。</small>
                         </div>
-                        <span className="keypool-badge" title={t("并发 = 6 × 独立项目数")}>
+                        <span className="keypool-badge" title={t("并发 = 6 × min(独立项目数, Key 数)")}>
                           {t("{n} 把 Key · 并发 {c}", { n: extraKeys.filter((k) => k.masked || k.value.trim()).length + 1, c: 6 * Math.max(1, Math.min(settingsDraft.geminiProjects || 1, extraKeys.filter((k) => k.masked || k.value.trim()).length + 1)) })}
                         </span>
                       </div>

@@ -117,3 +117,25 @@ test("重新精校还在排队就被取消：同样退回完成", () =>
     queue.cancel("first");
     await waitFor(() => store.get("first").status === "cancelled", "第一份也停下");
   }));
+
+test("fast 模式：读文字层时取消，读到下一页就停，不等读完整本", () =>
+  withDir(async (dir) => {
+    const pdf = await PDFDocument.create();
+    for (let i = 0; i < 40; i += 1) pdf.addPage([100, 100]);
+    const pdfPath = join(dir, "source.pdf");
+    await writeFile(pdfPath, await pdf.save());
+    const signal = { cancelled: false };
+    let lastPage = 0;
+    const converter = createConverter({
+      loadSettings: async () => ({ aiConfigured: false }),
+      renderer: { renderPages: async () => ({}) },
+      refinePage: async () => { throw new Error("fast 模式不该调模型"); },
+      runSurya: async () => ({ pages: [] }),
+    });
+    const onProgress = (pageNumber) => {
+      lastPage = pageNumber;
+      if (pageNumber === 2) signal.cancelled = true;
+    };
+    await assert.rejects(converter.convertPdf(pdfPath, "测试", "fast", onProgress, null, { signal }), JobCancelled);
+    assert.ok(lastPage < 40, `取消后还读到了第 ${lastPage} 页`);
+  }));

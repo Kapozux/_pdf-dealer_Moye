@@ -237,7 +237,8 @@ export function createSetup({ root, venv, logFile, ollamaBase, listOllamaModels,
     const probed = sourceProbe.at > 0;
     return {
       modelSource: {
-        probing: !probed,
+        // 只有真在测才算「测速中」：Ollama 连不上时根本不会去测，以前这里会一直是 true
+        probing: sourceProbe.running,
         official: sourceProbe.official,
         modelscope: sourceProbe.modelscope,
         // 魔搭只要不比官方慢一半以上就用它。只测前 3MB 抓不到官方源的真实问题：2026-09-24 实测

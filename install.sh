@@ -46,8 +46,9 @@ only=""; model=""; assume_yes="${MOYE_YES:-}"
 want_surya=""; want_ollama=""; want_office=""; want_browser="yes"; want_services="yes"
 while (( $# )); do
   case "$1" in
-    --only) only="$2"; shift ;;
-    --model) model="$2"; shift ;;
+    # set -u 下直接取 $2 会崩成一句 "parameter not set"，先给人话
+    --only) (( $# >= 2 )) || die "--only 后面要跟组件名：python|surya|browser|libreoffice|ollama|ollama-model"; only="$2"; shift ;;
+    --model) (( $# >= 2 )) || die "--model 后面要跟模型名，例如 --model qwen3-vl:8b-instruct"; model="$2"; shift ;;
     --yes|-y) assume_yes=1 ;;
     --with-surya) want_surya=yes ;;
     --with-ollama) want_ollama=yes ;;
@@ -295,10 +296,10 @@ install_ollama() {
   return 1
 }
 
-# 按内存推荐模型：模型本体 + 16k 上下文的缓存都要常驻内存
+# 按内存推荐模型：模型本体 + 16k 上下文的缓存都要常驻内存。
+# 阈值 15.5GiB，跟 server/setup.mjs 的 recommendedOllamaModel 同一条规则，改一边要改另一边
 recommended_model() {
-  local mem_gb=$(( $(sysctl -n hw.memsize) / 1024 / 1024 / 1024 ))
-  if (( mem_gb >= 16 )); then print qwen3-vl:8b-instruct; else print qwen3-vl:4b-instruct; fi
+  if (( $(sysctl -n hw.memsize) >= 31 * 512 * 1024 * 1024 )); then print qwen3-vl:8b-instruct; else print qwen3-vl:4b-instruct; fi
 }
 # 模型下载源。Ollama 官方库的模型文件放在 Cloudflare R2 上，2026-09-24 在国内网络实测：
 # 约 100KB/s，而且分块反复断开，最后 "max retries exceeded" 直接放弃（走系统代理也一样，
@@ -313,8 +314,9 @@ probe_speed() {  # probe_speed <manifest-url> <blob-url-prefix> → 字节/秒�
   [[ -n "$digest" ]] || { print 0; return; }
   curl -sL -o /dev/null -r 0-3000000 --max-time 10 -w '%{speed_download}' "$2/$digest" 2>/dev/null | cut -d. -f1 || print 0
 }
+# 结果放进全局 _model_source，不 print：在 $(...) 子 shell 里调的话测速结果存不住，每次都要重测
 model_source() {
-  if [[ -n "${MOYE_MODEL_SOURCE:-}" ]]; then print -r -- "$MOYE_MODEL_SOURCE"; return; fi
+  if [[ -n "${MOYE_MODEL_SOURCE:-}" ]]; then _model_source="$MOYE_MODEL_SOURCE"; return; fi
   if [[ -z "${_model_source:-}" ]]; then
     local official mirror
     official="$(probe_speed https://registry.ollama.ai/v2/library/qwen3-vl/manifests/4b https://registry.ollama.ai/v2/library/qwen3-vl/blobs)"
@@ -324,9 +326,9 @@ model_source() {
     (( ${mirror:-0} > 0 && ${mirror:-0} * 2 >= ${official:-0} )) && _model_source=modelscope || _model_source=ollama
     info "下载源测速：Ollama 官方 $(( ${official:-0} / 1024 ))KB/s，魔搭 $(( ${mirror:-0} / 1024 ))KB/s → 用${_model_source/modelscope/魔搭}" >&2
   fi
-  print -r -- "$_model_source"
 }
-# 官方名 → 魔搭上的同一个模型（Q4_K_M 与官方默认量化同级）。没有镜像的原样返回
+# 官方名 → 魔搭上的同一个模型（Q4_K_M 与官方默认量化同级）。没有镜像的原样返回。
+# 结果放进全局 mirrored（理由同 model_source：别在子 shell 里调）
 mirror_model() {
   local mirror=""
   case "$1" in
@@ -335,14 +337,18 @@ mirror_model() {
     qwen3-vl:2b-instruct) mirror=modelscope.cn/Qwen/Qwen3-VL-2B-Instruct-GGUF:Q4_K_M ;;
   esac
   # 没有镜像（或者传进来的已经是镜像名）就不用测速了
-  if [[ -n "$mirror" && "$(model_source)" == modelscope ]]; then print -r -- "$mirror"; else print -r -- "$1"; fi
+  [[ -n "$mirror" ]] && model_source
+  if [[ -n "$mirror" && "$_model_source" == modelscope ]]; then mirrored="$mirror"; else mirrored="$1"; fi
 }
 pull_ollama_model() {
-  local name; name="$(mirror_model "${1:-$(recommended_model)}")"
+  mirror_model "${1:-$(recommended_model)}"
+  local name="$mirrored"
   step "下载视觉模型 $name"
   ollama_up || install_ollama || return 1
   # /api/pull 是流式 JSON 行；用 node 画一行进度，免得依赖 python3（没装开发者工具的 Mac 上它会弹安装框）
-  curl -fsN "$OLLAMA_URL/api/pull" -d "{\"model\":\"$name\"}" | node -e '
+  # 整个下载可能要一小时，不能设总超时；只在连续 5 分钟一个字节都没收到时放弃（卡死），
+  # 不然官方源「分块反复断开」时这里会一直挂着，页面上的安装按钮也一直转
+  curl -fsN --connect-timeout 10 --speed-limit 1 --speed-time 300 "$OLLAMA_URL/api/pull" -d "{\"model\":\"$name\"}" | node -e '
     const rl = require("readline").createInterface({ input: process.stdin });
     let last = "", failed = "";
     rl.on("line", (line) => {
@@ -353,7 +359,7 @@ pull_ollama_model() {
       if (text !== last) { process.stdout.write(`\r  ${text.padEnd(60)}`); last = text; }
     });
     rl.on("close", () => { process.stdout.write("\n"); if (failed) { console.error("  ✗ " + failed); process.exit(1); } });
-  ' || { warn "模型下载失败。"; return 1; }
+  ' || { warn "模型下载失败（或 5 分钟没有任何进展，已放弃）。重试会接着已下载的部分继续。"; return 1; }
   ok "模型 $name 已就绪"
 }
 
@@ -398,7 +404,7 @@ ensure_python
 
 print
 print -r -- "${c_b}可选组件${c_0}  ${c_dim}（之后也可以在页面「设置 → 环境」里一键补装）${c_0}"
-[[ -z "$want_ollama" ]] && ask "装本机 AI（Ollama + 视觉模型约 $( [[ "$(recommended_model)" == *8b ]] && echo 6 || echo 3 )GB）？不用 API Key，页面图像不离开这台 Mac" y && want_ollama=yes
+[[ -z "$want_ollama" ]] && ask "装本机 AI（Ollama + 视觉模型约 $( [[ "$(recommended_model)" == *8b* ]] && echo 6 || echo 3 )GB）？不用 API Key，页面图像不离开这台 Mac" y && want_ollama=yes
 [[ -z "$want_surya" ]] && ask "装 Surya 本地高精度识别（扫描件/公式/表格，约 2GB，需要 Homebrew）？" n && want_surya=yes
 [[ -z "$want_office" ]] && ask "装 LibreOffice 以支持 PPT / Word（约 700MB）？" n && want_office=yes
 
@@ -408,7 +414,8 @@ failures=()
 [[ "$want_office" == yes ]] && { install_libreoffice || failures+=("LibreOffice"); }
 ollama_model=""
 if [[ "$want_ollama" == yes ]]; then
-  ollama_model="$(mirror_model "${model:-$(recommended_model)}")"
+  mirror_model "${model:-$(recommended_model)}"
+  ollama_model="$mirrored"
   { install_ollama && pull_ollama_model "$ollama_model"; } || { failures+=("Ollama"); ollama_model=""; }
 fi
 

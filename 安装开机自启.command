@@ -21,8 +21,8 @@ done
 [[ -n "$node_dir" ]] || { echo "找不到 Node.js。先运行 ./install.sh"; exit 1; }
 export PATH="$node_dir:$PATH"
 
-# 重装服务会重启识别服务，而任务进度只在整份文档跑完时落盘（CLAUDE.md 第一条）。
-# 有任务在跑就先问一句，别把用户正在转的书打断。
+# 重装服务会重启识别服务（CLAUDE.md 第一条）。现在有逐页存档、重启后会续跑，
+# 但在途的几页还是要重算；有任务在跑就先问一句，别把用户正在转的书打断。
 if [[ -f "$project_dir/data/moye.db" ]] && command -v sqlite3 >/dev/null 2>&1; then
   active="$(sqlite3 "$project_dir/data/moye.db" "select count(*) from jobs where status in ('queued','running')" 2>/dev/null || echo 0)"
   if [[ "$active" != "0" && -n "$active" ]]; then

@@ -96,6 +96,8 @@ export class AdaptivePacer {
       const lane = this.lanes.get(provider);
       if (lane) {
         lane.max = Math.max(1, weight);
+        // min 也要跟着收：只改 max 时，max 降到 min 以下后失败一次 limit 会被抬回 min，超过 max
+        lane.min = Math.max(1, Math.min(this.minPerChannel, lane.max));
         lane.limit = Math.min(lane.limit, lane.max);
         if (slowMs) lane.slowMs = slowMs;
       } else {

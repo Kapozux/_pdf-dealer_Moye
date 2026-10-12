@@ -12,8 +12,8 @@
 
 ### 1. 不要随便重启服务
 
-`server/queue.mjs` 的任务进度**只在整份文档跑完时才落盘**。
-中途重启 = 所有在跑的文档从头再来。
+AI 模式现在有逐页存档（`data/jobs/<id>/pages.jsonl`），重启后已完成的页直接续用；
+但在途的那几页要重算，非 AI 模式和逐页存档之前的老经验都是「中途重启 = 从头再来」。
 
 > 2026-08-18 实测教训：一批 15 份 537 页的任务，因为 4 次重启白跑了 800+ 页，
 > 比整批还多，35 分钟没跑完。用户当时急着要文件。
@@ -21,7 +21,7 @@
 **规则**：
 - 重启前先查 `sqlite3 data/moye.db "select count(*) from jobs where status in ('queued','running')"`
 - 有任务在跑 → **先问用户**，不要自作主张
-- 已实现逐页存档（`data/jobs/<id>/pages.jsonl`），重启会续跑；但仍要确认
+- 有逐页存档、重启会续跑，但仍要确认
 
 ### 2. `npm run build` 之后必须重启网页服务
 
@@ -101,10 +101,12 @@ grep '\[AI失败\]\|\[换供应商\]\|\[换模型\]\|\[模型熔断\]\|\[补救\
 ```
 
 - **浏览器只是观察者**，转换全在服务端。关页面任务照跑。
-- `server/queue.mjs` 按模式限流：fast 4 / balanced 1 / math 1 / ai 48
+- `server/queue.mjs` 按模式限流：fast 4 / balanced 1 / math 1 / ai 1（同时跑几份文档；`MOYE_CONCURRENCY` 调 balanced/math，`MOYE_AI_JOB_CONCURRENCY` 调 ai）
 - **取消是真的**：队列给每个任务一个 token，convert.mjs 每领一页之前看一眼，取消后只把在途的几页跑完（`JobCancelled`）。重新精校被取消时记录退回 done、旧结果原样保留（`_settleCancelled`），不会从 Library 消失
 - `server/convert.mjs` 的 `aiGate` 是**全局**闸，限制「此刻打向模型的请求总数」。
-  job 级并发只是喂料口，真正的天花板是 aiGate。
+  job 级并发只是喂料口，真正的天花板是 aiGate。上限不是固定数，按设置算（local-ocr-server.mjs 的 `aiPageConcurrency` / `channelWeight`）：
+  OpenRouter 8 × 白名单供应商数（默认 5 家 = 40）、Kimi 8、Qwen 8、Gemini 6 × 项目数（受可用 Key 数限制）、Ollama 1；
+  多渠道模式各家相加（例：四家云端全开、Gemini 2 个项目且有 2 个 Key = 40+12+8+8 = 68），多渠道下一家都没配时兜底 6。`MOYE_AI_PAGE_CONCURRENCY` 可直接覆盖
 - 三层兜底：**换供应商** → **换模型** → **回退 PDF 文字层**
 - **本机 Ollama 是第五家 provider**（`callOllama`，local-ocr-server.mjs）：没有 Key，「已配置」= 选了模型（`ollamaModel`）。走 Ollama 原生 `/api/chat` 而不是 `/v1` 兼容层——兼容层设不了 `num_ctx`，Ollama 默认上下文只有几千 token，图像 + 提示 + 初稿会被**静默截断**。模型能力（vision / thinking）问 `/api/show` 并缓存：不带 vision 的直接报错；**带 thinking 的也直接拒绝**——2026-09-24 实测（Ollama 0.34.3），官方 `qwen3-vl:8b` 就是思考版，`think:false` + JSON Schema 时回答被写进 `message.thinking`、正文为空且只有半截，不给格式时 `think:false` 被无视、先想 1.4 万字；换 Instruct 版（`qwen3-vl:8b-instruct` / 魔搭 `Qwen3-VL-8B-Instruct-GGUF`）同一页一次出合法 JSON。所以推荐和镜像表里全是 `-instruct`，别改回不带后缀的标签。并发 1、单次超时 180s、补救轮也用 180s（云端那套 25s 补救在本机必败）、初稿截到 6000 字、num_ctx 16384。2026-09-24 第一次实测（48GB Mac、魔搭 Qwen3-VL-8B-Instruct Q4_K_M、4 页 IB 物理作业）：正常页 5～15s、输出 200～500 token，首页另加约 20s 冷启动加载模型——180s 超时和 6144 的 num_predict 都宽得很，但样本只有一份，没据此收紧。**会陷入死循环**：温度 0 时某页在 JSON 字符串里无限输出 `\n` 写满上限（约 100s），所以撞上限时当场换 `presence_penalty 1.5` 重试一次；**别用 `repeat_penalty`**，它会让模型把 JSON 里的 `\\frac` 写成 `\frac`，公式直接坏掉（详见 `callOllama` 里的注释）。费用记 0（不是 null，否则界面显示「未计价」）。页面图像不出本机，顶栏隐私标签和模式说明靠 `aiStaysLocal`（lib/ai-settings.ts）判断
 - Python 环境位置：`MOYE_VENV` → 仓库里的 `.venv`（一键安装建的）→ 老的 `../.venv-marker`，按顺序找第一个有 `bin/python` 的
@@ -144,22 +146,26 @@ server/jobstore.mjs    SQLite 任务表 + 磁盘布局 + 重启恢复 + 逐页 c
 server/render.mjs      spawn Python(pypdfium2) 把 PDF 页转 JPEG，供 AI 模式用；convert.mjs 按 48 页一组滚动调用它，不是一次渲染整本
 server/textlayer-worker.mjs  读 PDF 文字层的短命子进程（pdfjs 解析大书要 3GB 且释放不掉，放子进程里跑完即退，服务本体不背）
 server/image2pdf.mjs   图片（png/jpg/webp/bmp/tiff/gif/heic）→ PDF：用 Surya venv 里的 Pillow，按 resolution=144 存，页面尺寸正好是像素的一半，配 render.mjs 的 scale=2 回渲即原始像素（实测无损）；HEIC 走 macOS sips；长边超 4000px 缩到 4000
-server/usage.mjs       模型用量与费用记账（data/usage.db，独立于 moye.db）：四条 provider 路径（callGemini / callOpenAiCompatible / callTextModel 两支）拿到响应体先记一笔再解析。归属（ref=任务 id、purpose=refine/card/reflect/test）靠 AsyncLocalStorage 的 `usage.scope` 从队列 run / generateCardMeta / generateReflectText / 测试连接 入口传下来，中间层不用改签名。费用两种来源：OpenRouter 响应带 `usage.cost`（请求要带 `usage:{include:true}`）照抄；Gemini 按内置价格表算，`data/prices.json` 可覆盖、30 秒热重读；查不到价的模型（直连 Kimi / Qwen）只记 token、界面标「未计价」，**不要瞎猜价格**。任务跑完 `jobStore.setCost` 把合计抄进 jobs 表（cost_usd 等列），结果页和 Library 只读那几列；面板「用量」栏读 `/api/usage`。逐页 `usage` 字段是顺手带回结果里的，完整账以 usage.db 为准
-server/reflect.mjs     「回顾」栏目：按时段算统计（转换最多的星期/时段、按日曲线、按页数的主题占比）+ 让模型写叙事（OpenRouter 上的 Claude Opus 4.6，没 key 回落当前服务商），中英并行生成、缓存在 data/reflect-cache.json。叙事是**提前算好**的：启动 90s 后首跑、每 6h 检查、每次转换完成 10 分钟防抖后重算；打开面板缓存过期就先给旧的（stale=true）并后台重算，前端每 6s 轮询。只有点刷新才同步等
+server/usage.mjs       模型用量与费用记账（data/usage.db，独立于 moye.db）：五条 provider 路径（callGemini / callOpenAiCompatible / callTextModel 两支 / 本机 Ollama 的 callOllama 与 callOllamaText 共用的 recordOllama）拿到响应体先记一笔再解析。归属（ref=任务 id、purpose=refine/card/reflect/test）靠 AsyncLocalStorage 的 `usage.scope` 从队列 run / generateCardMeta / generateReflectText / 测试连接 入口传下来，中间层不用改签名。费用两种来源：OpenRouter 响应带 `usage.cost`（请求要带 `usage:{include:true}`）照抄；Gemini 按内置价格表算，`data/prices.json` 可覆盖、30 秒热重读；查不到价的模型（直连 Kimi / Qwen）只记 token、界面标「未计价」，**不要瞎猜价格**。任务跑完 `jobStore.setCost` 把合计抄进 jobs 表（cost_usd 等列），结果页和 Library 只读那几列；面板「用量」栏读 `/api/usage`。逐页 `usage` 字段是顺手带回结果里的，完整账以 usage.db 为准
+server/reflect.mjs     「回顾」栏目：按时段算统计（转换最多的星期/时段、按日曲线、按页数的主题占比）+ 让模型写叙事（默认 Gemini `gemini-3.5-flash-lite`，`REFLECT_MODEL` 可换；设了 `REFLECT_OPENROUTER_MODEL` 且有 OpenRouter Key 才先走 OpenRouter，失败依次回落 Gemini → 当前服务商。原来默认 Claude Opus 4.6，吃掉了 usage.db 里 99% 的花销，换掉了——见 local-ocr-server.mjs 里 REFLECT_GEMINI_MODEL 的注释），中英两份在同一个请求里写出、缓存在 data/reflect-cache.json。叙事是**提前算好**的：启动 90s 后首跑、每 6h 检查、每次转换完成 10 分钟防抖后重算；打开面板缓存过期就先给旧的（stale=true）并后台重算，前端每 6s 轮询。只有点刷新才同步等
 server/setup.mjs       「设置 → 环境」：检测各组件（Python 环境 / Surya+llama-server / LibreOffice / 自带浏览器 / Ollama 及其视觉模型 / AI 服务）装没装，页面按钮一键补装。**安装逻辑只在 install.sh 一份**，这里 spawn `install.sh --only <组件> --yes`、把输出收成最后 40 行给页面、同时写 logs/setup.log；只有 Ollama 拉模型直接读 `/api/pull` 的流（要字节级进度条）。拉完模型：还没选过 Ollama 模型就填上；一个 AI 都没配就直接把 provider 设成 ollama——已在用云端的不改 provider。
                        **模型下载源**：Ollama 官方库的文件在 Cloudflare R2 上，2026-09-24 在用户网络上实测约 100KB/s、分块反复 EOF 后 `max retries exceeded` 放弃（走系统代理也没用——Ollama 不读 macOS 系统代理；用户时区是 Asia/Taipei，按时区猜也不准）。魔搭有同一模型的 Ollama 格式（`modelscope.cn/Qwen/Qwen3-VL-8B-Instruct-GGUF:Q4_K_M`，本体 + 视觉投影两层），同机约 1MB/s。所以两边各取前 3MB 实测速度选源（`probeSpeed` / install.sh 的 `probe_speed`），镜像表 `OLLAMA_MIRRORS` 与 install.sh 的 `mirror_model` 是同一张，改一边要改另一边
 install.sh             一键安装（`一键安装.command` 双击转发、`curl … | zsh` 远程也是它）：Node（找不到 ≥22.13 就从 nodejs.org 下到 .runtime/node，校验 SHASUMS256）、npm 依赖、uv（UV_UNMANAGED_INSTALL 装进 .runtime/uv，不改 shell 配置）、Python 3.12 venv（.venv，带 pypdfium2+Pillow），可选 Ollama（下 Ollama-darwin.zip 到 /Applications 或 ~/Applications）+ 按内存推荐的视觉模型、Surya（**还要 llama.cpp 的 llama-server**，只能 brew 装，没 brew 就明说）、LibreOffice（brew 或给下载链接）、自带浏览器，最后调 `安装开机自启.command`。可重复跑，装过的跳过；非交互时按默认值、不提问。`uninstall.sh` 撤开机自启
 server/filenames.mjs   源文件名 → 标题的唯一一份扩展名正则（队列标题、自动标签、ZIP 条目名共用，以前各写一份，加 Word 时漏掉 ZIP 那份）
 server/zip.mjs         手写最小 ZIP 打包器，只为 Library 整包下载存在
+server/fetch-timeout.mjs  带超时的 fetch，超时一直覆盖到**读完响应体**（以前收到响应头就清计时器，上游迟迟不发完正文时一页能一直挂着、占着 aiGate 名额）。超时报「请求超时（Ns 未返回）」而不是 "This operation was aborted"。带退避重试的 `postWithRetries` 也在这里（从 local-ocr-server.mjs 搬来，有行为测试）：4xx 和超过次数的 429 直接抛、不重试，抛出的错误带上游 `status`；local-ocr-server 只包一层接 Gemini Key 拉黑（`geminiKeyRejected`）
+server/openrouter-failover.mjs  OpenRouter 兜底链的顺序和预算（外层换模型、内层换供应商）：第 0 次不钉供应商让 OpenRouter 自己挑，失败才按白名单顺序逐家钉死，**不轮转**（实测轮转平均每页 236s）；整页一份总预算；熔断只在至少两条线路真试过且全挂时才记。真正的调用和熔断记账由 local-ocr-server 注入，有行为测试
+server/search.mjs      资料库全文搜索 + 卡片预览。不用 SQLite FTS5（默认分词不切中文，trigram 搜不了两个字的词），全库 Markdown 放内存逐页子串查找；首次搜索时载入，之后按 jobs 表的 updated_at 增量同步
+server/office2pdf.mjs  PPT/PPTX/DOC/DOCX → PDF（LibreOffice headless，每次独立 -env:UserInstallation 临时 profile，免得并发时互相锁死），转完复用 PDF 管线。先查文件头签名再交给 soffice——它对认不出的输入会退出码 0、吐一页乱码 PDF
 server/images2pdf.mjs  很多图片 → 一份成品 PDF（反方向的旁路，跟 md2pdf 同一类：不进队列、不进 Library、不识别）。**和上面的 image2pdf.mjs 是两条路，别改错**：那条是为了喂识别管线（resolution=144、长边压到 4000px），这条的 PDF 本身就是交付物，所以一个像素都不缩，JPEG/PNG 原字节用 pdf-lib 直接 embed——Pillow 存 PDF 会把每张重新编码成 JPEG，成品会比原图糊一档；只有 webp/heic/tiff/bmp/gif、多帧、带 EXIF 旋转的才过一道 Pillow 转 JPEG(q95)/PNG，HEIC 照旧先走 sips。页面尺寸不影响存进去的像素（PDF 里是矢量坐标），按「图片自身比例、长边 = A4 长边 842pt」排版，每页被填满无白边，比原图小的不放大。上传分两步（`POST /api/images2pdf/part` 逐张流式落到 `tmp/images2pdf/<session>/`，`POST /api/images2pdf/build` 按页序合成后回 PDF 并删暂存，另有 2 小时的残留扫除），是为了不把几十张照片一次性堆进内存；坏图逐张跳过、原因走 `X-Moye-Skipped` 响应头回到页面（规矩四：不静默吞错误）
-server/md2pdf.mjs      Markdown → PDF（反方向）：marked + KaTeX 渲染成 HTML，再用**自带的** chrome-headless-shell 无头打印（DevTools 协议 Page.printToPDF；`npm run browser:install` 下到 `data/browser/`，独立程序 + 独立 profile，和用户的 Chrome 无关——2026-09-14 直接调 /Applications 里的 Chrome 时把用户正开着的 Chrome 关掉过一次，原因没查清，**测试时也绝不要再启动用户的 Chrome**）。没装自带浏览器才兜底用系统 Chrome，日志 `[PDF]` 会提醒。入口两个：结果页「下载 PDF」（GET /api/library/<id>/document.pdf）和首页拖入 .md（POST /api/md2pdf）。不进队列不进 Library。**不要传 --user-data-dir**：全新 profile 实测要等 60～113s，不传 2s。**不要用 `--print-to-pdf` 命令行开关**：它退出时有竞态，大 PDF 没写完就 SIGTRAP 崩（912 页的书 3/3 必崩），现在走 `--remote-debugging-pipe` + `Page.printToPDF` 流式取回。单次打印超过约 150 页 Chrome 渲染进程也会偶发崩，所以大文档按标题切段（`splitMarkdownForPrint`，默认 300KB 一段）分别打印、失败重试、再用 pdf-lib 合并，日志标签 `[PDF重试]`。版面逐条对照 obsidian.asar 里的 app.css 抄的（用户要「和 Obsidian 导出 PDF 一样」；2026-09-14 核对过：导出字体是 **Arial**、正文纯黑、Letter + 1cm 边距 + 32px 内边距、文件名印成第一个 h1、标题上下只有 1rem、链接带下划线、自绘圆点和勾选框、提示框带 lucide 图标——细节见 PRINT_CSS 的注释），语法也按 Obsidian：单换行即换行、`> [!note]` 提示框、`==高亮==`、`[[双链]]`、去掉 YAML 属性区——只在 PDF 这条路，页面「渲染」tab 不受影响
+server/md2pdf.mjs      Markdown → PDF（反方向）：marked + KaTeX 渲染成 HTML，再用**自带的** chrome-headless-shell 无头打印（DevTools 协议 Page.printToPDF；`npm run browser:install` 下到 `data/browser/`，独立程序 + 独立 profile，和用户的 Chrome 无关——2026-09-14 直接调 /Applications 里的 Chrome 时把用户正开着的 Chrome 关掉过一次，原因没查清，**测试时也绝不要再启动用户的 Chrome**）。没装自带浏览器才兜底用系统 Chrome，日志 `[PDF]` 会提醒。入口两个：结果页「下载 PDF」（GET /api/library/<id>/document.pdf）和首页拖入 .md（POST /api/md2pdf）。不进队列不进 Library。**不要每次传一个全新的 --user-data-dir**：全新 profile 实测要等 60～113s，不传 2s。自带的 headless-shell 传的是固定的 `data/browser/profile`（只冷启动一次，并发实例共用；headless-shell 不建 SingletonLock），兜底的系统 Chrome 不传。**不要用 `--print-to-pdf` 命令行开关**：它退出时有竞态，大 PDF 没写完就 SIGTRAP 崩（912 页的书 3/3 必崩），现在走 `--remote-debugging-pipe` + `Page.printToPDF` 流式取回。单次打印超过约 150 页 Chrome 渲染进程也会偶发崩，所以大文档按标题切段（`splitMarkdownForPrint`，默认 300KB 一段）分别打印、失败重试、再用 pdf-lib 合并，日志标签 `[PDF重试]`。版面逐条对照 obsidian.asar 里的 app.css 抄的（用户要「和 Obsidian 导出 PDF 一样」；2026-09-14 核对过：导出字体是 **Arial**、正文纯黑、Letter + 1cm 边距 + 32px 内边距、文件名印成第一个 h1、标题上下只有 1rem、链接带下划线、自绘圆点和勾选框、提示框带 lucide 图标——细节见 PRINT_CSS 的注释），语法也按 Obsidian：单换行即换行、`> [!note]` 提示框、`==高亮==`、`[[双链]]`、去掉 YAML 属性区——只在 PDF 这条路，页面「渲染」tab 不受影响
 lib/ai-settings.ts     AI 设置的类型 + 浏览器→8765 的设置类 API 客户端（局部保存用 patchAiSettings，只发改动的字段）
 lib/page-result.mjs    「一页最后算什么」的唯一定义：outcome()（ai / noText / fallback / local）、四种 AI 结果的构造、重跑用的 toDraft（白名单取字段）、页面度量。前后端共用，所以是 .mjs + JSDoc
 lib/key-pool.mjs       额外 Gemini Key 列表的页面↔服务端协议，两半写在一起：页面 rowsFromSaved / rowsToPayload，服务端 mergeExtraKeys。占位符带出处 `__KEEP__:<位置>:<末4位>`
 server/settings.mjs    settings.local.json 的 load / save（部分保存：没传的字段沿用；多处同时保存会排队）、normalizeSettings、providerConfigured（「这家能用了吗」的唯一判断）
 server/request-guard.mjs  8765 只接本机请求：Host 必须是 127.0.0.1/localhost/[::1]:8765（防 DNS rebinding），带 Origin 的必须是本机页面（任意端口，Moye 3000、Verbatim 5001）；不带 Origin 的本机程序（curl、install.sh、Verbatim 的 sources.py）照常放行。加它是因为任意网页都能对本机发不预检的 POST——改 AI 服务地址就能让之后每次转换把 Key 发出去。新加调用方时用 127.0.0.1:8765
 lib/explain-error.mjs  报错 → 类别（额度 / Key / 限流 / 超时 / 连不上 / 模型 / 拦截 / 输出坏 / 没过校验 / 空文件）+ 重跑有没有用。规则按库里真实报错定（2026-10-02 全库 1184 页回退页全部归得了类）；Gemini 额度用完回的是 429，所以「额度」排在「限流」前。文案在 page.tsx 的 errorCopy（走 i18n）；报错原文从 reasons 里读回用 page-result.mjs 的 parseAiReason / fallbackCause
-lib/safe-url.mjs       Markdown 里链接 / 图片地址的白名单（javascript: 之类只留文字，外链图片不自动加载）；页面的 renderMarkdown 用 safeLinkRenderers。md2pdf.mjs 那份渲染还没接上
+lib/safe-url.mjs       Markdown 里链接 / 图片地址的白名单（javascript: 之类只留文字，外链图片不自动加载）；页面的 renderMarkdown 和 md2pdf.mjs 的渲染都用 safeLinkRenderers
 scripts/screenshot.mjs 给跑着的页面截图（三个宽度 × 浅色 / 深色，改 UI 后对照用）：用 data/browser/ 自带的无头浏览器 + 临时 profile，走 DevTools 协议（页面上一直开着 SSE，`--screenshot` 那种等网络空闲的方式永远等不到头）
                        结果页「逐页核对」：左原图（GET /api/library/<id>/page/<n>.jpg，服务端用 pypdfium2 现渲染一页、最近 40 页缓存在内存）、右这一页的结果；地址 #/doc/<id>/p/<n> 可直接分享到某一页，同一份文档里前进后退不重新拉结果
 lib/api.ts             浏览器→8765 的任务类 API 客户端（提交/查询/SSE 订阅/Library/导出）
@@ -236,9 +242,14 @@ launchctl kickstart -k gui/$(id -u)/com.kapozux.moye-web   # 重启网页服务
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `MOYE_AI_JOB_CONCURRENCY` | 1（2026-08-18 起，原为 48） | 同时跑几份文档（喂料口，非上限）。默认改回 1 是实测结论：全局并发预算（aiGate，约 60 路）是所有文档共享的，开太多份文档只会把预算摊薄，谁都吃不满、谁都不交付；一份文档独占预算跑完最快。只有「一次转很多小文档（每份一两页）」时才该调大，调到「预算 ÷ 平均页数」左右——见 `server/queue.mjs` 里这行的注释 |
+| `MOYE_AI_JOB_CONCURRENCY` | 1（2026-08-18 起，原为 48） | 同时跑几份文档（喂料口，非上限）。默认改回 1 是实测结论：全局并发预算（aiGate，按渠道算，单 OpenRouter 默认 40 路，见「架构要点」）是所有文档共享的，开太多份文档只会把预算摊薄，谁都吃不满、谁都不交付；一份文档独占预算跑完最快。只有「一次转很多小文档（每份一两页）」时才该调大，调到「预算 ÷ 平均页数」左右——见 `server/queue.mjs` 里这行的注释 |
 | `MOYE_AI_PAGE_CONCURRENCY` | 按渠道权重 | 覆盖全局 aiGate 上限 |
-| `MOYE_PAGE_TIMEOUT_MS` | 30000 | 单次模型调用超时（实测 p50 约 13s） |
+| `MOYE_PAGE_TIMEOUT_MS` | 30000 | 单次模型调用超时（实测 p50 约 13s）；下面按渠道单独设了的以渠道为准 |
+| `MOYE_TIMEOUT_OPENROUTER` | 30000 | OpenRouter 单次调用超时 |
+| `MOYE_TIMEOUT_QWEN` | 45000 | Qwen 直连单次调用超时 |
+| `MOYE_TIMEOUT_KIMI` | 45000 | Kimi 直连单次调用超时 |
+| `MOYE_TIMEOUT_GEMINI` | 75000 | Gemini 单次调用超时（各家约 3 倍 p50，理由见 `PROVIDER_TIMEOUT_MS` 的注释） |
+| `MOYE_PAGE_BUDGET_MS` | 150000 | 单页总时间预算（含所有重试和回退模型），超了直接回退文字层 |
 | `MOYE_RESCUE_TIMEOUT_MS` | 25000 | 补救轮超时（只试一次） |
 | `MOYE_OPENROUTER_PROVIDERS` | CoreWeave,Parasail,Inceptron,Baidu,Cloudflare | 供应商白名单 |
 | `MOYE_OPENROUTER_FALLBACK_MODELS` | z-ai/glm-5v-turbo | 模型兜底链。曾经还带 qwen/qwen3.7-flash，2026-08-25 起白名单五家对它全部返回 404（没有供应商在提供了），摘掉了 |
@@ -246,7 +257,14 @@ launchctl kickstart -k gui/$(id -u)/com.kapozux.moye-web   # 重启网页服务
 | `MOYE_RENDER_CHUNK_PAGES` | 48 | AI 模式一次渲染几页。2026-08-29 实测：698 页整本一次渲染 = 350MB base64 走 stdout，120s 必超时；分组后单次约 2s / 25MB，内存上限从整本变成约两组，服务进程峰值 3.9GB → 0.8GB |
 | `MOYE_TEXTLAYER_TIMEOUT_MS` | 900000 | 读文字层子进程的超时（698 页实测 20s，给足 15 分钟） |
 | `MOYE_IMAGEBOOK_TIMEOUT_MS` | 300000 | 「很多图片 → 一份 PDF」里单次 Pillow / sips 调用的超时 |
+| `MOYE_OFFICE_TIMEOUT_MS` | 120000 | 单份 Office 文档 soffice 转 PDF 的超时 |
+| `MOYE_IMAGE_TIMEOUT_MS` | 120000 | 单张图片转 PDF（进识别管线那条）的超时 |
+| `MOYE_SOFFICE` | PATH 里的 soffice，没有再找 LibreOffice.app | LibreOffice 路径 |
 | `MOYE_UPLOAD_BUFFER_MB` | 512 | Office 文档和图片要整份收进内存再转 PDF，超过这个大小直接拒收（让用户先导出成 PDF） |
+| `MOYE_PORT` | 8765 | 识别服务端口（页面和各脚本都写死了 8765，改了要一起改） |
+| `MOYE_CONCURRENCY` | 1 | 本机识别（balanced / math 车道）同时几份；不影响 AI 模式 |
+| `REFLECT_MODEL` | gemini-3.5-flash-lite | 「回顾」叙事用的 Gemini 模型 |
+| `REFLECT_OPENROUTER_MODEL` | 空 | 设了（且有 OpenRouter Key）就先用它写回顾叙事，例 `anthropic/claude-opus-4.6` |
 | `MOYE_VENV` | `.venv`，没有就 `../.venv-marker` | Python 环境（pypdfium2 / Pillow / 可选 Surya） |
 | `MOYE_OLLAMA_CONCURRENCY` | 1 | 本机 Ollama 同时几页。Ollama 默认一个模型只并行 1 路（OLLAMA_NUM_PARALLEL），调大它之后再跟着调这个 |
 | `MOYE_TIMEOUT_OLLAMA` | 180000 | 本机 Ollama 单次调用超时（实测正常页 5～15s，只测过一份 4 页文档） |

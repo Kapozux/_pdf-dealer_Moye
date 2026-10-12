@@ -449,7 +449,7 @@ export const en: Record<string, string> = {
   "还没有配置任何 API Key": "No API key configured yet",
   "{n} 路": "{n} slots",
   "合计并发": "Total concurrency",
-  "路 · 实测 84 路可靠，再往上会有请求挂死": "slots · 84 measured reliable, beyond that requests hang",
+  "路 · 每家的路数按实测定（见各家后面的数字）": "slots · each provider's share was set by measurement (the number after each name)",
   "已配置 {masked}；留空则保留原值": "Configured {masked}; leave empty to keep it",
   "尚未配置": "Not configured",
   "在 Kimi 开放平台创建 API Key": "Create a key on the Kimi open platform",
@@ -461,7 +461,7 @@ export const en: Record<string, string> = {
   "换一个 Google 账号": "a different Google account",
   "的 Key 才是独立配额——实测两个账号并行提速": "gets its own quota — two accounts measured",
   "3.3 倍": "3.3× faster",
-  "并发 = 6 × 独立项目数": "concurrency = 6 × independent accounts",
+  "并发 = 6 × min(独立项目数, Key 数)": "concurrency = 6 × min(independent accounts, keys)",
   "{n} 把 Key · 并发 {c}": "{n} keys · concurrency {c}",
   "上方主 Key": "Primary key above",
   "主": "primary",
@@ -579,6 +579,12 @@ export const en: Record<string, string> = {
   "下载中…": "Downloading…",
   "下载模型": "Download model",
   "下载失败：": "Download failed: ",
+  "下载失败：{reason}": "Download failed: {reason}",
+  "补标签没有启动：{reason}": "Tag backfill did not start: {reason}",
+  "读不到补标签进度：{reason}": "Couldn't read tag backfill progress: {reason}",
+  "复制失败，改用「下载 .md」：{reason}": "Copy failed; use Download .md instead: {reason}",
+  "取消失败：{reason}": "Cancel failed: {reason}",
+  "全文搜索失败，只按文件名和标签过滤：{reason}": "Full-text search failed; filtering by file name and tags only: {reason}",
   "这台电脑 {n}GB 内存。": "This computer has {n}GB of RAM. ",
   "还没有能看图的模型，先下载一个。": "No vision model yet; download one first.",
   "Surya 本地高精度识别": "Surya local high-accuracy OCR",
@@ -646,9 +652,12 @@ const serverPatterns: [RegExp, string][] = [
   [/^保留 (\d+) 页上次已成功的 AI 结果$/, "Keeping $1 pages that AI already got right"],
   [/^没有回退的页面需要重跑。$/, "No fallback pages to re-run."],
   // Markdown → PDF（server/md2pdf.mjs）
-  [/^没有找到 Chrome \/ Chromium \/ Edge/, "No Chrome / Chromium / Edge found, cannot generate PDF. Set MOYE_CHROME to your browser path."],
+  // 文案逐条对照 md2pdf.mjs 里的 throw（2026-10-12）；以前那条「没有找到 Chrome / Chromium / Edge」服务端早就不说了
+  [/^没有找到可用的浏览器，无法生成 PDF。/, "No usable browser found, cannot generate PDF. Run npm run browser:install to download a standalone headless browser (about 100MB, in data/browser/), or set MOYE_CHROME to a browser path."],
+  [/^MOYE_CHROME 指定的浏览器不存在：(.+)$/, "The browser set in MOYE_CHROME does not exist: $1"],
   [/^Chrome 打印超时（(\d+)s 未返回）。$/, "Chrome print timed out ($1 s)."],
-  [/^Chrome 打印失败（exit (\d+)）：(.*)$/, "Chrome print failed (exit $1): $2"],
+  [/^Chrome 打印中途退出（exit (\S+?)）：([\s\S]*)$/, "Chrome exited while printing (exit $1): $2"],
+  [/^Chrome (\S+) 出错：([\s\S]*)$/, "Chrome $1 error: $2"],
   [/^缺少 Markdown 内容。$/, "No Markdown content."],
   // 逐页原因（convert.mjs）
   [/^文字层过少；扫描页或公式页请改用本地高精度$/, "Very little text layer; use High accuracy for scanned or formula pages"],
@@ -705,7 +714,3 @@ export function tServer(text: string | null | undefined): string {
   return text;
 }
 
-/** 给 serverPatterns 追加条目（放在文件末尾集中定义，见 server-strings 段）。 */
-export function defineServerStrings(entries: [RegExp, string][]) {
-  serverPatterns.push(...entries);
-}

@@ -2,7 +2,8 @@
  * Markdown → PDF。
  *
  * 渲染链：marked + KaTeX 出 HTML（公式先占位再交给 marked、原文裸 HTML 一律转义，这两条与
- * app/page.tsx 的 renderMarkdown 相同），再用本机的 Chrome 无头模式 --print-to-pdf 打印成 PDF。
+ * app/page.tsx 的 renderMarkdown 相同），再交给无头浏览器打印成 PDF：首选 data/browser/ 里自带的
+ * chrome-headless-shell（没装才兜底用系统 Chrome），走 --remote-debugging-pipe + Page.printToPDF（见 htmlToPdf）。
  *
  * 观感对齐 Obsidian 阅读视图的「导出为 PDF」（用户的笔记都在 Obsidian 里看，要的就是那个样子）：
  * 排版数值取自 Obsidian 1.12 默认浅色主题的 CSS 变量，样式是照着数值自己写的，没有拷贝它的文件。
@@ -12,13 +13,15 @@
  *
  * 为什么用 Chrome 而不是别的：
  * - 公式要真正排版出来。pandoc/wkhtmltopdf 没装；LibreOffice 能转 HTML 但 KaTeX 的 CSS 排版会散架；
- *   Python 环境里也没有 weasyprint/reportlab。Chrome 本来就在（/Applications），排版和浏览器里
- *   看到的「渲染」tab 完全一致，中文字体走系统 PingFang，不用额外装东西。
+ *   Python 环境里也没有 weasyprint/reportlab。Chromium 的排版和浏览器里看到的「渲染」tab 完全一致，
+ *   中文字体走系统 PingFang。现在用的是 npm run browser:install 下到 data/browser/ 的独立无头浏览器。
  * - KaTeX 的字体内联成 data URI：file:// 页面加载 file:// 字体在 Chrome 里受同源限制，内联最稳。
  *
- * 不要传 --user-data-dir。2026-09-07 实测（Chrome 152）：给一个全新的 profile 目录，无头打印要等
+ * 不要每次给一个全新的 --user-data-dir。2026-09-07 实测（Chrome 152）：给一个全新的 profile 目录，无头打印要等
  * 60～113 秒才返回（首次初始化在等什么，没深究）；不传则 2 秒完成，两路并发各自成功，用户自己的
  * Chrome 正开着也互不影响——新无头模式自己会用临时 profile。
+ * 兜底的系统 Chrome 因此不传；自带的 headless-shell 传的是固定的 data/browser/profile（只冷启动一次），
+ * 并发的几个实例共用它——headless-shell 不建 SingletonLock，不会像桌面版那样把第二个实例转交给第一个。
  */
 import { spawn } from "node:child_process";
 import { access, mkdir, mkdtemp, readdir, readFile, rm, writeFile } from "node:fs/promises";
@@ -586,7 +589,8 @@ async function htmlToPdfWithRetry(html, label) {
     try {
       return await htmlToPdf(html);
     } catch (error) {
-      if (attempt >= PRINT_ATTEMPTS || /没有找到 Chrome|超时/.test(error.message)) throw error;
+      // 找不到浏览器、超时这两种重试也没用（文案见 findChrome 和 htmlToPdf 的报错）
+      if (attempt >= PRINT_ATTEMPTS || /没有找到可用的浏览器|指定的浏览器不存在|超时/.test(error.message)) throw error;
       console.error(`[PDF重试] ${label} 第 ${attempt} 次失败，重试：${error.message}`);
     }
   }

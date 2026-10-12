@@ -13,6 +13,7 @@ import { existsSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, extname } from "node:path";
+import { findSoffice, which } from "./setup.mjs";
 
 const OFFICE_EXTENSIONS = new Set([".ppt", ".pptx", ".doc", ".docx"]);
 
@@ -39,7 +40,16 @@ function looksLikeOfficeFile(buffer, ext) {
 }
 
 export function createOfficeConverter({ soffice = "soffice", timeoutMs = 120000 } = {}) {
-  const available = Boolean(soffice);
+  /**
+   * 真正要 spawn 的 soffice 路径，找不到就是 null。每次转换现查（不在构造时定死）：
+   * 调用方找不到时会传光秃秃的 "soffice"，服务跑着时装好 LibreOffice 也要能直接用上。
+   * 以前 available 恒为 true，没装时用户看到的是 spawn ENOENT，而不是下面那句「没装 LibreOffice」。
+   */
+  function resolveSoffice() {
+    if (!soffice) return null;
+    if (soffice.includes("/")) return existsSync(soffice) ? soffice : null;
+    return which(soffice, ["/opt/homebrew/bin", "/usr/local/bin"]) ?? (soffice === "soffice" ? findSoffice() : null);
+  }
 
   /**
    * @param {Buffer} buffer 原始 PPT/PPTX/Word 字节
@@ -47,7 +57,8 @@ export function createOfficeConverter({ soffice = "soffice", timeoutMs = 120000 
    * @returns {Promise<Buffer>} 转换出的 PDF 字节
    */
   async function convertToPdf(buffer, originalName) {
-    if (!available) {
+    const command = resolveSoffice();
+    if (!command) {
       throw new Error("本机没有安装 LibreOffice（找不到 soffice），无法把 Office 文档转成 PDF。");
     }
     const ext = extname(originalName || "").toLowerCase() || ".pptx";
@@ -60,7 +71,7 @@ export function createOfficeConverter({ soffice = "soffice", timeoutMs = 120000 
       await writeFile(input, buffer);
       await new Promise((resolve, reject) => {
         const child = spawn(
-          soffice,
+          command,
           [
             `-env:UserInstallation=file://${dir}/profile`,
             "--headless",
@@ -100,5 +111,10 @@ export function createOfficeConverter({ soffice = "soffice", timeoutMs = 120000 
     }
   }
 
-  return { convertToPdf, available };
+  return {
+    convertToPdf,
+    get available() {
+      return Boolean(resolveSoffice());
+    },
+  };
 }

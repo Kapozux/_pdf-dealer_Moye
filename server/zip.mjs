@@ -3,7 +3,7 @@
  *
  * 只为一件事存在：把一个批次里的 Markdown 打成一个包让浏览器下载。
  * 为此引入 archiver/jszip 不值当——ZIP 的「多个 deflate 块 + 中央目录」结构
- * 本身很简单，用 node:zlib 直接拼即可，这个项目的依赖也就 linkedom 一个。
+ * 本身很简单，用 node:zlib 直接拼即可，不必为一个打包功能再加一个依赖。
  *
  * 生成的是标准 ZIP（store 或 deflate），macOS 归档工具、Windows 资源管理器
  * 和 unzip 都能直接打开。文件名统一按 UTF-8 写并置 EFS 标志位（bit 11），

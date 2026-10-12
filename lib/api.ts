@@ -67,6 +67,23 @@ export type Usage = {
   pricesPath: string;
 };
 
+/**
+ * AI 精校大约每页多少钱（待转区的「约 $X」）：/api/usage 里 purpose=refine 那一行，已计价费用 ÷ 已计价调用次数。
+ * 不再用 jobs.cost_usd ÷ page_count——cost_usd 是这份文档名下所有调用的合计，重新精校过几次、
+ * 打过标签的文档会被算成好几倍。一次调用约等于一页（补救轮会让个别页调两次，所以略偏低）。
+ * 本月够 20 次就用本月（跟得上现在用的服务商），否则用累计；不足 3 次不给数（直连 Kimi / Qwen 没价，不算）。
+ */
+export function refineCostPerPage(usage: Pick<Usage, "by"> | null): number | null {
+  if (!usage) return null;
+  for (const scope of ["month", "all"] as const) {
+    const row = usage.by.purpose[scope].find((item) => item.key === "refine");
+    const priced = row ? row.calls - row.unpriced : 0;
+    if (scope === "month" && priced < 20) continue;
+    return row && priced >= 3 ? row.costUsd / priced : null;
+  }
+  return null;
+}
+
 /** /api/speed：按模式的每页秒数中位数；样本不足 3 份时 secPerPage 为 null（不猜） */
 export type SpeedTable = Record<string, { n: number; secPerPage: number | null }>;
 
@@ -172,8 +189,9 @@ export async function listJobs(): Promise<Job[]> {
   return jobs;
 }
 
+/** 取消一份任务。服务端回非 2xx（或连不上）就抛错，让页面说出来——以前不看状态码，取消失败也像成功了。 */
 export async function cancelJob(id: string): Promise<void> {
-  await fetch(`${SERVICE_BASE}/api/jobs/${id}/cancel`, { method: "POST" });
+  await asJson(await fetch(`${SERVICE_BASE}/api/jobs/${id}/cancel`, { method: "POST" }));
 }
 
 export async function listLibraryItems(): Promise<Job[]> {
@@ -283,10 +301,8 @@ export type SearchResult = { id: string; count: number; hits: SearchHit[] };
 
 /** 资料库全文搜索（正文逐页找，中文两个字也行），按命中次数排。 */
 export async function searchLibrary(query: string): Promise<SearchResult[]> {
-  const response = await fetch(`${SERVICE_BASE}/api/search?q=${encodeURIComponent(query)}`);
-  const payload = await response.json() as { results?: SearchResult[]; error?: string };
-  if (!response.ok) throw new Error(payload.error || "搜索失败。");
-  return payload.results ?? [];
+  const { results } = await asJson<{ results?: SearchResult[] }>(await fetch(`${SERVICE_BASE}/api/search?q=${encodeURIComponent(query)}`));
+  return results ?? [];
 }
 
 export function libraryPdfUrl(id: string): string {

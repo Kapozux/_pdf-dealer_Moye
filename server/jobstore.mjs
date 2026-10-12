@@ -251,15 +251,20 @@ export class JobStore {
   speedTable() {
     const rows = this.db
       .prepare(
-        `SELECT mode, duration_ms, page_count FROM jobs
-          WHERE status = 'done' AND duration_ms > 0 AND page_count > 0
-          ORDER BY finished_at DESC LIMIT 400`
+        // 每个模式各取最近 50 份。以前是所有模式合起来取最近 400 行再分，
+        // 冷门模式会被热门模式挤出窗口、凑不满 3 个样本
+        `SELECT mode, duration_ms, page_count FROM (
+           SELECT mode, duration_ms, page_count,
+                  ROW_NUMBER() OVER (PARTITION BY mode ORDER BY finished_at DESC) AS rn
+             FROM jobs
+            WHERE status = 'done' AND duration_ms > 0 AND page_count > 0
+         ) WHERE rn <= 50`
       )
       .all();
     const byMode = new Map();
     for (const row of rows) {
       const list = byMode.get(row.mode) || [];
-      if (list.length < 50) list.push(row.duration_ms / 1000 / row.page_count);
+      list.push(row.duration_ms / 1000 / row.page_count);
       byMode.set(row.mode, list);
     }
     const table = {};
@@ -408,7 +413,8 @@ export class JobStore {
     for (const job of pending) {
       let hasSource = false;
       try {
-        await readFile(this.sourcePath(job.id));
+        // 只看在不在：以前用 readFile，大书启动时会把整份 PDF 白读进内存一遍
+        await access(this.sourcePath(job.id));
         hasSource = true;
       } catch {
         hasSource = false;
@@ -424,10 +430,6 @@ export class JobStore {
     return { requeued: requeued.length, failed: pending.length - requeued.length };
   }
 
-  /**
-   * fallback_count 列是后加的，老记录是 NULL。逐份读 result.json 算一次写回去，
-   * 之后就只走 SQL。读不到 result.json 的记为 0，别每次启动都再试一遍。
-   */
   /**
    * 预览以前直接取 Markdown 开头，每张卡都是「标题 由墨页转换，共 N 页……」。
    * 启动时把这种老预览按 previewOf 的规则从 document.md 重算一遍（只动这一列）。
@@ -449,6 +451,10 @@ export class JobStore {
     return updated;
   }
 
+  /**
+   * fallback_count 列是后加的，老记录是 NULL。逐份读 result.json 算一次写回去，
+   * 之后就只走 SQL。读不到 result.json 的记为 0，别每次启动都再试一遍。
+   */
   async backfillFallbackCounts() {
     const rows = this.db.prepare("SELECT id FROM jobs WHERE status = 'done' AND fallback_count IS NULL").all();
     const write = this.db.prepare("UPDATE jobs SET fallback_count = ? WHERE id = ?");

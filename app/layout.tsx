@@ -14,7 +14,7 @@ const themeScript = "try{var t=localStorage.getItem('moye_theme');if(t==='dark'|
 
 export default function RootLayout({ children }: Readonly<{ children: React.ReactNode }>) {
   return (
-    <html lang="zh-Hant" suppressHydrationWarning>
+    <html lang="zh-Hans" suppressHydrationWarning>
       <head><script dangerouslySetInnerHTML={{ __html: themeScript }} /></head>
       <body>{children}</body>
     </html>

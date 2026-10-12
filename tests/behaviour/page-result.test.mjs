@@ -90,3 +90,10 @@ test("toDraft：回退页保留初稿的真实出处，结果页才不会把 PDF
   assert.equal(toDraft(aiOk(draft, reply)).method, "surya");               // 被采用的页出处没记，沿用老口径
   assert.equal(toDraft(aiNoText({ ...draft, markdown: "" }, {})).method, "empty");
 });
+
+test("空内容算 0 行：aiOk 和 toDraft 口径一致", () => {
+  const empty = aiOk(draft, { markdown: "  \n ", model: "m", provider: "gemini" });
+  assert.equal(empty.lineCount, 0);
+  assert.equal(toDraft({ ...draft, markdown: "", rawMarkdown: "" }).lineCount, 0);
+  assert.equal(aiOk(draft, reply).lineCount, 3);
+});

@@ -16,10 +16,10 @@ import { createConverter, gateStats } from "./server/convert.mjs";
 import { isFallback } from "./lib/page-result.mjs";
 import { maskedKey, splitKeys } from "./lib/key-pool.mjs";
 import { foreignRequestReason, LOCAL_ORIGIN } from "./server/request-guard.mjs";
-import { fetchWithTimeout } from "./server/fetch-timeout.mjs";
+import { fetchWithTimeout, postWithRetries as postWithRetriesRaw } from "./server/fetch-timeout.mjs";
 import { failoverChain } from "./server/openrouter-failover.mjs";
 import { createSearchIndex } from "./server/search.mjs";
-import { ALL_PROVIDERS, createSettingsStore, defaultSettings, normalizeSettings, providerConfigured } from "./server/settings.mjs";
+import { ALL_PROVIDERS, createSettingsStore, defaultSettings, geminiKeyRejected, normalizeSettings, providerConfigured } from "./server/settings.mjs";
 import { createRenderer } from "./server/render.mjs";
 import { createOfficeConverter, isOfficeFile } from "./server/office2pdf.mjs";
 import { createImageConverter, isImageFile } from "./server/image2pdf.mjs";
@@ -43,7 +43,8 @@ const venvPython = join(venv, "bin/python");
 const surya = join(venv, "bin/surya_ocr");
 const jobRoot = resolve(root, "tmp/pdfs/moye-web-job-");
 const settingsPath = resolve(root, "settings.local.json");
-// 用量记账（data/usage.db）：四条 provider 路径拿到响应体后各记一笔，归属靠 usage.scope 传
+// 用量记账（data/usage.db）：五条 provider 路径（callGemini / callOpenAiCompatible / callTextModel 两支 / Ollama 的 recordOllama）
+// 拿到响应体后各记一笔，归属靠 usage.scope 传
 const usage = createUsage(resolve(root, "data"));
 const port = Number(process.env.MOYE_PORT) || 8765;
 const maxJsonBytes = 24 * 1024 * 1024;
@@ -87,18 +88,27 @@ function sendPdf(response, buffer, filename, extraHeaders = {}) {
   response.end(buffer);
 }
 
+/**
+ * 请求本身有问题（缺字段、格式不对、超限）的错误：统一出口按 httpStatus 回 400。
+ * 以前出口按报错文字猜状态码，没列进正则的（会话 id 不合法、图片格式不支持、超过 500 张、
+ * 批次没有已完成文档）全被报成 500（docs 报告 C2）。
+ */
+function badRequest(message) {
+  return Object.assign(new Error(message), { httpStatus: 400 });
+}
+
 async function readJson(request, limit = maxJsonBytes) {
   const chunks = [];
   let size = 0;
   for await (const chunk of request) {
     size += chunk.length;
-    if (size > limit) throw new Error("请求内容过大。");
+    if (size > limit) throw badRequest("请求内容过大。");
     chunks.push(chunk);
   }
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
   } catch {
-    throw new Error("请求不是有效的 JSON。");
+    throw badRequest("请求不是有效的 JSON。");
   }
 }
 
@@ -125,6 +135,7 @@ function geminiKeyPool(settings) {
 let geminiKeyCursor = 0;
 // 认证失败（401/403/"API key not valid"）的 key 拉黑，之后不再轮到它——
 // 否则一把废 key 会按比例吃掉转换请求，表现为「部分页面莫名失败」。
+// 保存设置时清空（用户可能刚换了 Key、开通了 API），测试连接通过的那把也当场放出来。
 const geminiDeadKeys = new Set();
 
 function liveGeminiKeys(settings) {
@@ -133,9 +144,9 @@ function liveGeminiKeys(settings) {
   return live.length ? live : pool;   // 全挂了就还用原池，让错误如实抛出
 }
 
-function markGeminiKeyDead(key, message) {
+function markGeminiKeyDead(key, status, message) {
   if (!key) return;
-  if (/API key not valid|API_KEY_INVALID|permission|unauthor/i.test(String(message))) {
+  if (geminiKeyRejected(status, message)) {
     if (!geminiDeadKeys.has(key)) {
       geminiDeadKeys.add(key);
       console.warn(`Gemini key …${key.slice(-4)} 认证失败，已从轮询中移除：${String(message).slice(0, 90)}`);
@@ -357,52 +368,14 @@ const providerTimeout = (provider) => PROVIDER_TIMEOUT_MS[provider] ?? PAGE_CALL
 const PAGE_TIME_BUDGET_MS = Number(process.env.MOYE_PAGE_BUDGET_MS) || 150000;
 
 /**
- * 带退避的 POST。
- *
- * 429 单独处理：高并发下它是**常态而非异常**——实测 64 并发零 429，128 并发约
- * 10%，256 并发 60%。这类请求只是需要等一会儿再来，用固定 900ms×n 的线性退避
- * 会让一整批请求几乎同时重试、再一起被打回（惊群）。所以 429 走指数退避 + 随机
- * 抖动，并且给更多次机会；服务端给了 Retry-After 就听它的。
+ * 带退避的 POST（重试规则和测试在 server/fetch-timeout.mjs）。这里只多接一件事：
+ * Gemini 的 Key 被明确拒了就拉黑，之后不再轮到它。
  */
-async function postWithRetries(url, options, attempts = 3, timeoutMs = undefined, deadline = Infinity) {
-  let lastError;
-  let rateLimitRetries = 0;
-  const maxRateLimitRetries = 6;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    // 预算用完就别再开新一轮：重试的意义是「换一次运气」，而不是把等待叠起来
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) throw lastError || new Error("单页时间预算已用尽。");
-    let backoff = attempt * 900;
-    try {
-      const response = await fetchWithTimeout(url, options, Math.min(timeoutMs ?? 180000, remaining));
-      const text = await response.text();
-      if (response.ok) return JSON.parse(text);
-      const message = (() => {
-        try { return JSON.parse(text)?.error?.message || JSON.parse(text)?.error || text; } catch { return text; }
-      })();
-      const error = new Error(`模型请求失败（${response.status}）：${String(message).slice(0, 500)}`);
-      if (options?.headers?.["x-goog-api-key"]) markGeminiKeyDead(options.headers["x-goog-api-key"], message);
-      if (response.status === 429) {
-        // 限流不算掉一次正式 attempt，否则并发一高就会被 3 次用光直接判失败
-        rateLimitRetries += 1;
-        if (rateLimitRetries > maxRateLimitRetries) throw error;
-        attempt -= 1;
-        const retryAfter = Number(response.headers.get("retry-after"));
-        backoff = Number.isFinite(retryAfter) && retryAfter > 0
-          ? Math.min(retryAfter * 1000, 30000)
-          : Math.min(800 * 2 ** (rateLimitRetries - 1), 20000) * (0.5 + Math.random());
-        lastError = error;
-        await sleep(Math.min(backoff, Math.max(0, deadline - Date.now())));
-        continue;
-      }
-      if (response.status < 500) throw error;
-      lastError = error;
-    } catch (error) {
-      lastError = error;
-    }
-    if (attempt < attempts) await sleep(Math.min(backoff, Math.max(0, deadline - Date.now())));
-  }
-  throw lastError || new Error("模型请求失败。");
+function postWithRetries(url, options, attempts = 3, timeoutMs = undefined, deadline = Infinity) {
+  const geminiKey = options?.headers?.["x-goog-api-key"];
+  return postWithRetriesRaw(url, options, attempts, timeoutMs, deadline, {
+    onHttpError: geminiKey ? (status, message) => markGeminiKeyDead(geminiKey, status, message) : undefined,
+  });
 }
 
 async function callGemini(settings, imageBase64, mimeType, draft, testOnly = false, opts = {}) {
@@ -468,7 +441,8 @@ const forcedReasoningModels = new Set();
  *   Crusoe 4/8 挂死4 ｜ Phala 3/8 挂死4 ｜ SiliconFlow 5/8 挂死3
  *   Fireworks / BaseTen / DeepInfra / DigitalOcean / Decart / Sail Research：0/8（429/404）
  *
- * 四家合计 32 路、0.86 页/秒——比默认路由的 0.04 页/秒快 21 倍。
+ * 当时四家合计 32 路、0.86 页/秒——比默认路由的 0.04 页/秒快 21 倍。之后加进了 Inceptron，
+ * 默认白名单是五家，按每家 8 路算是 40 路（见 DIRECT_PROVIDER_WEIGHTS）。
  * 供应商健康度天天在变，跑 /tmp 里那个逐家压测脚本即可重新排名。
  */
 const OPENROUTER_PROVIDERS = (process.env.MOYE_OPENROUTER_PROVIDERS || "CoreWeave,Parasail,Inceptron,Baidu,Cloudflare")
@@ -526,12 +500,11 @@ function noteModelSuccess(model) {
 }
 
 /**
- * OpenRouter 调用：钉死单家，失败立刻换下一家，轮完一圈才算失败。
- *
- * 之前是把整个白名单交给 OpenRouter 自己挑（order + allow_fallbacks:false）。
- * 那样一旦它选中的那家挂住，请求就只能干等到超时——实测持续 64 路并发时
- * 有 49 次超时，某份 44 页文档主轮失败 33 页。换家的成本只有一次短超时，
- * 而换家之后往往立刻就成功，比在同一家上重试三次划算得多。
+ * OpenRouter 调用：第 0 次把整个白名单交给 OpenRouter 自己挑（order + allow_fallbacks:false），
+ * 它挑的那家失败了，才按白名单顺序逐家钉死重试，不轮转；一个模型试完再换兜底模型。
+ * 每家只给一次机会、整页共用一份总预算，401/402 这类账号级错误整条链立刻停。
+ * 顺序和预算的实测依据见 server/openrouter-failover.mjs 顶部（曾经是「一上来就逐家钉死轮转」，
+ * 实测把 80% 的请求发给了慢的四家，改掉了）。
  */
 async function callOpenRouterFailover(settings, input, opts = {}) {
   const base = directProviderConfig("openrouter", settings);
@@ -642,11 +615,12 @@ async function callOpenAiCompatible(config, imageBase64, mimeType, draft, testOn
 // 一页图像约 2–3k token，再加文字层初稿和提示词，会被**静默截掉前面的内容**，
 // 模型看不到提示词也不报错（仓库规矩第四条）。原生接口还能直接给 JSON Schema（format）。
 //
-// 下面这些数字是按 8B 级视觉模型 + 16GB 内存的 Mac 估的，**还没有实测**，
-// 跑过真实文档后按规矩改成实测值：
+// 下面这些数字起初是按 8B 级视觉模型 + 16GB 内存的 Mac 估的。2026-09-24 第一次实测
+// （48GB Mac、魔搭 Qwen3-VL-8B-Instruct Q4_K_M、一份 4 页 IB 物理作业）：正常页 5～15s、
+// 输出 200～500 token，首页另加约 20s 冷启动——下面的上限都宽得很，但样本只有一份，没据此收紧：
 //   num_ctx 16384      ≈ 图像 3k + 提示 1k + 初稿 ≤6k + 输出 ≤6k；8B 模型 KV 缓存约 2.4GB
 //   初稿截到 6000 字   云端给 60000 字，本机上下文装不下
-//   单次超时 180s      本机小模型一页几十秒，给足余量；云端那套 30s 会把每页都判超时
+//   单次超时 180s      留给慢机器和死循环重试的余量；云端那套 30s 会把冷启动那页判超时
 //   并发 1             Ollama 默认一个模型只并行跑 1 路（OLLAMA_NUM_PARALLEL），
 //                      多发只是在它那边排队，排队时间照样算进我们的超时
 const OLLAMA_NUM_CTX = Number(process.env.MOYE_OLLAMA_NUM_CTX) || 16384;
@@ -707,6 +681,9 @@ async function callOllama(settings, imageBase64, draft, testOnly = false, opts =
     throw new Error(`Ollama 模型 ${model} 是会「思考」的版本，Ollama 关不掉它的思考，结构化输出会坏掉。请换成 Instruct 版，例如 qwen3-vl:8b-instruct。`);
   }
   if (testOnly) return { ok: true, provider: "ollama", model };
+  // 整页一份截止时间，主请求和下面「撞上限换参数」的重试共用。以前每次 chat 各算一份，
+  // 2 次尝试 × 180s × 2 轮 ≈ 720s，单页预算在这条路径上形同虚设（docs 报告 C1）。
+  const deadline = Date.now() + (opts.budgetMs ?? PAGE_TIME_BUDGET_MS);
   const chat = async (sampling) => {
     try {
       return await postWithRetries(`${ollamaRoot(settings)}/api/chat`, {
@@ -723,7 +700,7 @@ async function callOllama(settings, imageBase64, draft, testOnly = false, opts =
             images: [imageBase64],
           }],
         }),
-      }, opts.attempts ?? 2, opts.timeoutMs ?? providerTimeout("ollama"), Date.now() + (opts.budgetMs ?? PAGE_TIME_BUDGET_MS));
+      }, opts.attempts ?? 2, opts.timeoutMs ?? providerTimeout("ollama"), deadline);
     } catch (error) {
       if (/fetch failed|ECONNREFUSED/i.test(String(error?.message)) || error?.cause?.code === "ECONNREFUSED") throw ollamaUnreachable(settings, error);
       throw error;
@@ -930,7 +907,8 @@ async function listConfiguredModels(settings) {
   }
   if (settings.provider === "gemini") {
     if (!settings.geminiKey) throw new Error("请先在设置中填写 Gemini API Key。");
-  settings = { ...settings, __key: settings.__key || nextGeminiKey(settings) };  // 指定 key 优先，否则轮询
+    // 列模型固定用主 Key：这里以前算了一个轮询的 __key 却没用上（死代码），
+    // 用户刚填的新 Key 列模型时也该测的是它，不是轮询到的另一把
     const response = await fetchWithTimeout(`${settings.geminiBaseUrl.replace(/\/$/, "")}/models`, {
       headers: { "x-goog-api-key": settings.geminiKey },
     }, 30000);
@@ -1209,8 +1187,23 @@ const imageBookRoot = resolve(root, "tmp/images2pdf");
 /** 会话 id 直接当目录名用，必须先挡住 ../ 之类的东西。 */
 function imageBookSession(value) {
   const id = cleanString(value);
-  if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) throw new Error("合成会话 id 不合法。");
+  if (!/^[A-Za-z0-9_-]{8,64}$/.test(id)) throw badRequest("合成会话 id 不合法。");
   return id;
+}
+
+/**
+ * 跳过清单编进响应头：几百张坏图的原因拼起来能有几十 KB，超过 Node / 浏览器的头部上限
+ * （Node 默认 16KB）整个响应就废了。每条截短、总长卡在 4000 字节，放不下的并成最后一条「另有 N 张」，
+ * 完整清单打进日志。encodeURIComponent 之后只剩 ASCII，是合法的头部值。
+ */
+function skippedHeader(skipped, maxBytes = 4000) {
+  const items = skipped.map((s) => ({ name: String(s.name).slice(0, 80), reason: String(s.reason).slice(0, 160) }));
+  const encode = (list) => encodeURIComponent(JSON.stringify(list));
+  let kept = items;
+  while (kept.length && encode(kept).length > maxBytes - 200) kept = kept.slice(0, -1);
+  if (kept.length === items.length) return encode(kept);
+  console.warn(`[图片合成PDF] 跳过 ${items.length} 张，响应头只放得下 ${kept.length} 条，完整清单：${JSON.stringify(skipped)}`);
+  return encode([...kept, { name: `另有 ${items.length - kept.length} 张`, reason: "原因太多放不下，完整清单在服务日志 logs/moye-ocr.err.log" }]);
 }
 
 /** 扫掉没走到 build 就被放弃的暂存目录（页面中途关了、上传到一半断了）。 */
@@ -1318,6 +1311,18 @@ async function runJob(job, onProgress, signal) {
 
 jobQueue.on("job", (job) => events.broadcast("job", job));
 
+// 重新精校的两个输入文件（previous.json 一整份结果的副本、refine.json 选项）用完就删：
+// 以前全仓库只写不删，每精校一次留一份（docs 报告 C9）。等任务彻底停下（成功、失败恢复、取消收尾，
+// 队列的 finally 广播时已不在 active 里）再删——早删的话，结果还没落盘时服务一重启，
+// 续跑会当成全新转换，把精校前的结果整份覆盖掉。
+jobQueue.on("job", (job) => {
+  if (!["done", "failed", "cancelled"].includes(job.status) || jobQueue.status().active.includes(job.id)) return;
+  for (const name of ["previous.json", "refine.json"]) {
+    rm(join(jobStore.dir(job.id), name), { force: true })
+      .catch((error) => console.warn(`[重新精校] 清理 ${job.id}/${name} 失败：${String(error?.message ?? error).slice(0, 160)}`));
+  }
+});
+
 // 转换完成后顺手打标签：不阻塞任务本身完成（fire-and-forget），失败按规则记日志，不静默吞掉。
 // "job" 事件里 done 只在 queue.mjs 的 finally 里广播一次，不会为同一份文档重复触发；
 // 但"重新精校"现在是原地重跑同一个 id，同一份文档会再走一次 done——已经打过
@@ -1378,6 +1383,7 @@ async function handleSettingsTest(settings, response) {
       pool.map(async (key, index) => {
         try {
           await callConfiguredModel({ ...settings, __key: key }, {}, true);
+          geminiDeadKeys.delete(key);   // 测通了就放回轮询
           return { index: index + 1, tail: key.slice(-4), ok: true };
         } catch (error) {
           return { index: index + 1, tail: key.slice(-4), ok: false,
@@ -1420,6 +1426,16 @@ const searchIndex = createSearchIndex({
   loadPages: async (id) => (await jobStore.readResult(id))?.pages ?? [],
 });
 
+/** 等被取消的任务真正停下再删目录（最多等 10 分钟，单页预算远小于这个）。 */
+function deleteAfterStop(id, startedAt = Date.now()) {
+  if (jobQueue.status().active.includes(id) && Date.now() - startedAt < 10 * 60 * 1000) {
+    setTimeout(() => deleteAfterStop(id, startedAt), 500);
+    return;
+  }
+  if (jobQueue.status().active.includes(id)) console.warn(`[删除] ${id} 取消后 10 分钟还没停下，照样删目录`);
+  jobStore.delete(id).catch((error) => console.warn(`[删除] ${id} 的目录删除失败：${String(error?.message ?? error).slice(0, 160)}`));
+}
+
 // 外来请求每种原因只记一条日志：被某个网页反复探测时不刷屏，但第一次一定看得到
 const loggedForeign = new Set();
 
@@ -1441,8 +1457,13 @@ const server = createServer(async (request, response) => {
     return;
   }
 
+  // 路由按 pathname 匹配：以前多数路由拿整个 request.url 做 ===，地址带个查询串（?t=缓存破坏）就 404；
+  // /api/reflect 又是前缀匹配，/api/reflectXXX 也会命中（docs 报告 C3）
+  const [path, queryString = ""] = String(request.url ?? "").split("?");
+  const query = new URLSearchParams(queryString);
+
   try {
-    if (request.method === "GET" && request.url === "/health") {
+    if (request.method === "GET" && path === "/health") {
       const settings = await loadSettings();
       sendJson(response, 200, { ready: true, engine: "surya-2", ai: publicSettings(settings) });
       return;
@@ -1450,7 +1471,7 @@ const server = createServer(async (request, response) => {
 
     // 实时诊断：闸的占用、队列、每份任务卡在哪一阶段。
     // 排查慢的时候第一个该看的就是这里，而不是去数 TCP 连接。
-    if (request.method === "GET" && request.url === "/api/debug") {
+    if (request.method === "GET" && path === "/api/debug") {
       const settings = await loadSettings();
       const jobs = jobStore.list({ limit: 200 }).filter((j) => j.status === "running");
       sendJson(response, 200, {
@@ -1474,7 +1495,7 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/setup") {
+    if (request.method === "GET" && path === "/api/setup") {
       const settings = await loadSettings();
       currentSettingsSnapshot = settings;
       const pub = publicSettings(settings);
@@ -1485,25 +1506,27 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/setup/install") {
+    if (request.method === "POST" && path === "/api/setup/install") {
       const body = await readJson(request, 16 * 1024);
       currentSettingsSnapshot = await loadSettings();
       sendJson(response, 200, setup.install(cleanString(body.component), { model: cleanString(body.model) }));
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/settings") {
+    if (request.method === "GET" && path === "/api/settings") {
       sendJson(response, 200, publicSettings(await loadSettings()));
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/settings") {
+    if (request.method === "POST" && path === "/api/settings") {
       const settings = await saveSettings(await readJson(request, 128 * 1024));
+      // 用户改过设置（可能刚换了 Key、刚开通 API），之前拉黑的 Key 给一次重新证明的机会
+      geminiDeadKeys.clear();
       sendJson(response, 200, publicSettings(settings));
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/settings/test") {
+    if (request.method === "POST" && path === "/api/settings/test") {
       const supplied = await readJson(request, 128 * 1024);
       const stored = await loadSettings();
       const settings = normalizeSettings(supplied, stored);
@@ -1511,19 +1534,19 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/usage") {
+    if (request.method === "GET" && path === "/api/usage") {
       sendJson(response, 200, usage.summary());
       return;
     }
 
     // 按模式的每页秒数中位数：首页模式说明里的「约 X 秒/页」和进度页的预计剩余时间都用它
-    if (request.method === "GET" && request.url === "/api/speed") {
+    if (request.method === "GET" && path === "/api/speed") {
       sendJson(response, 200, jobStore.speedTable());
       return;
     }
 
 
-    if (request.method === "POST" && request.url === "/api/models") {
+    if (request.method === "POST" && path === "/api/models") {
       const supplied = await readJson(request, 128 * 1024);
       const stored = await loadSettings();
       const settings = normalizeSettings(supplied, stored);
@@ -1531,15 +1554,17 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/ai-refine") {
+    if (request.method === "POST" && path === "/api/ai-refine") {
       const input = await readJson(request);
-      if (!cleanString(input.imageBase64)) throw new Error("缺少页面图像。");
-      const result = await callConfiguredModel(await loadSettings(), input, false);
+      if (!cleanString(input.imageBase64)) throw badRequest("缺少页面图像。");
+      // 记账归属：这条路不属于任何任务（ref 为空），但 purpose 得记上，否则这笔花费在用量面板里无处可归
+      const settings = await loadSettings();
+      const result = await usage.scope({ purpose: "refine", ref: null }, () => callConfiguredModel(settings, input, false));
       sendJson(response, 200, result);
       return;
     }
 
-    if (request.method === "POST" && request.url === "/api/surya") {
+    if (request.method === "POST" && path === "/api/surya") {
       const job = await mkdtemp(jobRoot);
       const input = join(job, "document.pdf");
       const output = join(job, "surya");
@@ -1561,7 +1586,7 @@ const server = createServer(async (request, response) => {
     // ---- 任务：提交 / 查询 / 取消 / SSE ----
     // 精确匹配：以前是 startsWith("/api/jobs")，排在取消路由前面，「取消」被当成一次提交——
     // 原任务照跑，库里多一条 0 字节的 document.pdf 失败记录
-    if (request.method === "POST" && request.url === "/api/jobs") {
+    if (request.method === "POST" && path === "/api/jobs") {
       // HTTP header 只能带 latin-1，中文文件名必须由前端 encodeURIComponent 后再解回来，
       // 否则「测试文档.pdf」会变成一堆乱码存进 Library。
       const rawName = cleanString(request.headers["x-filename"], "document.pdf");
@@ -1572,7 +1597,7 @@ const server = createServer(async (request, response) => {
         filename = rawName;
       }
       const mode = cleanString(request.headers["x-mode"], "fast");
-      if (!["fast", "balanced", "math", "ai"].includes(mode)) throw new Error("未知的转换模式。");
+      if (!["fast", "balanced", "math", "ai"].includes(mode)) throw badRequest("未知的转换模式。");
       // 同一次批量提交带同一个 batch-id：Library 里就能按「合集」归组、整包下载。
       // 单份转换不带这个头，batch_id 留空，照旧显示为独立文件。
       const batchId = cleanString(request.headers["x-batch-id"]) || null;
@@ -1594,7 +1619,7 @@ const server = createServer(async (request, response) => {
           for await (const chunk of request) {
             received += chunk.length;
             // 要整份收进内存才能交给 soffice / Pillow：没上限的话一个超大文件能把服务撑爆
-            if (received > MAX_PRECONVERT_BYTES) throw new Error(`文件超过 ${Math.round(MAX_PRECONVERT_BYTES / 1024 / 1024)}MB，先在 Office 或预览里导出成 PDF 再拖进来`);
+            if (received > MAX_PRECONVERT_BYTES) throw badRequest(`文件超过 ${Math.round(MAX_PRECONVERT_BYTES / 1024 / 1024)}MB，先在 Office 或预览里导出成 PDF 再拖进来`);
             chunks.push(chunk);
           }
           const pdfBuffer = await preConvert.converter.convertToPdf(Buffer.concat(chunks), filename);
@@ -1602,7 +1627,8 @@ const server = createServer(async (request, response) => {
         } catch (error) {
           const message = error instanceof Error ? error.message : `${preConvert.label}转 PDF 失败。`;
           jobStore.update(id, { status: "failed", error: `${preConvert.label}转 PDF 失败：${message}` });
-          throw new Error(`${preConvert.label}转 PDF 失败：${message}`);
+          // 超大是请求的问题（400），soffice / Pillow 转不动是这边的问题（500）
+          throw Object.assign(new Error(`${preConvert.label}转 PDF 失败：${message}`), { httpStatus: error?.httpStatus });
         }
       } else {
         try {
@@ -1613,13 +1639,13 @@ const server = createServer(async (request, response) => {
           await rm(jobStore.sourcePath(id), { force: true });
           const message = `上传没有完成：${String(error?.message ?? error).slice(0, 160)}`;
           jobStore.update(id, { status: "failed", error: message });
-          throw new Error(message);
+          throw badRequest(message);
         }
       }
       const { size } = await stat(jobStore.sourcePath(id));
       if (!size) {
         jobStore.update(id, { status: "failed", error: "上传的文件是空的（0 字节）。" });
-        throw new Error("上传的文件是空的（0 字节）。");
+        throw badRequest("上传的文件是空的（0 字节）。");
       }
       jobStore.db.prepare("UPDATE jobs SET file_size = ? WHERE id = ?").run(size, id);
       jobQueue.enqueue(id);
@@ -1627,17 +1653,17 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/jobs") {
+    if (request.method === "GET" && path === "/api/jobs") {
       sendJson(response, 200, { jobs: jobStore.list({ limit: 200 }), queue: jobQueue.status() });
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/events") {
+    if (request.method === "GET" && path === "/api/events") {
       events.attach(request, response);
       return;
     }
 
-    const cancelMatch = request.url?.match(/^\/api\/jobs\/([\w-]+)\/cancel$/);
+    const cancelMatch = path.match(/^\/api\/jobs\/([\w-]+)\/cancel$/);
     if (request.method === "POST" && cancelMatch) {
       sendJson(response, 200, { cancelled: jobQueue.cancel(cancelMatch[1]) });
       return;
@@ -1645,28 +1671,29 @@ const server = createServer(async (request, response) => {
 
     // ---- Library：列表 / 结果 / 原始 PDF / 删除 ----
     // GET /api/search?q=鲁迅 → [{ id, count, hits: [{ page, before, match, after }] }]，按命中次数排
-    if (request.method === "GET" && request.url?.startsWith("/api/search?")) {
-      const query = new URL(request.url, "http://127.0.0.1").searchParams.get("q") ?? "";
-      sendJson(response, 200, { query, results: await searchIndex.search(query.slice(0, 200)) });
+    if (request.method === "GET" && path === "/api/search") {
+      const q = query.get("q") ?? "";
+      sendJson(response, 200, { query: q, results: await searchIndex.search(q.slice(0, 200)) });
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/library") {
-      const jobs = jobStore.list({ limit: 500 }).filter((job) => job.status === "done");
+    if (request.method === "GET" && path === "/api/library") {
+      // 不能先 list(500) 再筛 done：总记录过 500 条后，较早的已完成文档会从 Library 里「消失」
+      // （数据还在）。上限放到和全文搜索一样，全库几百条的摘要行，一次查完不费事
+      const jobs = jobStore.list({ limit: 100000 }).filter((job) => job.status === "done");
       sendJson(response, 200, { items: jobs });
       return;
     }
 
     // ---- 回顾：这段时间在弄什么（叙事提前算好，缓存过期先给旧的） ----
-    if (request.method === "GET" && request.url?.startsWith("/api/reflect")) {
-      const query = new URL(request.url, "http://127.0.0.1").searchParams;
+    if (request.method === "GET" && path === "/api/reflect") {
       const payload = await reflect.build(query.get("range") || "1m", query.get("lang") || "zh", query.get("refresh") === "1");
       sendJson(response, 200, payload);
       return;
     }
 
     // ---- 个人数据统计面板：总量 / 每日时间线 / 标签占比 ----
-    if (request.method === "GET" && request.url === "/api/stats") {
+    if (request.method === "GET" && path === "/api/stats") {
       const totals = jobStore.statsTotals();
       const tagCounts = new Map();
       for (const row of jobStore.statsTagRows()) {
@@ -1700,7 +1727,7 @@ const server = createServer(async (request, response) => {
     }
 
     // 给旧记录批量补标签（新完成的任务已经会自动打标签，这个只是回填历史）
-    if (request.method === "POST" && request.url === "/api/tags/backfill") {
+    if (request.method === "POST" && path === "/api/tags/backfill") {
       if (tagBackfillState.running) {
         sendJson(response, 200, { ok: true, alreadyRunning: true, ...tagBackfillState });
         return;
@@ -1713,19 +1740,18 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    if (request.method === "GET" && request.url === "/api/tags/backfill/status") {
+    if (request.method === "GET" && path === "/api/tags/backfill/status") {
       sendJson(response, 200, tagBackfillState);
       return;
     }
 
     // ---- 批次（合集）：一次批量提交归成一组，可整包下载 ----
-    if (request.method === "GET" && request.url === "/api/batches") {
+    if (request.method === "GET" && path === "/api/batches") {
       sendJson(response, 200, { batches: jobStore.listBatches() });
       return;
     }
 
-    if (request.method === "GET" && request.url?.startsWith("/api/export/zip")) {
-      const query = new URL(request.url, "http://127.0.0.1").searchParams;
+    if (request.method === "GET" && path === "/api/export/zip") {
       const batchId = query.get("batch");
       const explicitIds = (query.get("ids") || "").split(",").map((s) => s.trim()).filter(Boolean);
 
@@ -1738,12 +1764,12 @@ const server = createServer(async (request, response) => {
         jobs = explicitIds.map((id) => jobStore.get(id)).filter(Boolean);
         archiveName = `墨页导出-${jobs.length}份`;
       } else {
-        jobs = jobStore.list({ limit: 500 });
+        jobs = jobStore.list({ limit: 100000 });   // 同 /api/library：别让「全部」只剩最近 500 条
         archiveName = "墨页全部文档";
       }
 
       const finished = jobs.filter((job) => job.status === "done");
-      if (!finished.length) throw new Error("这个批次还没有已完成的文档可以下载。");
+      if (!finished.length) throw badRequest("这个批次还没有已完成的文档可以下载。");
 
       // 同名文件在 ZIP 里会互相覆盖（实测导出时就撞过一次），按出现次数加序号
       const used = new Map();
@@ -1757,7 +1783,7 @@ const server = createServer(async (request, response) => {
         if (seen) base = `${base} (${seen + 1})`;
         entries.push({ name: `${base}.md`, content: result.markdown, date: new Date(job.updated_at) });
       }
-      if (!entries.length) throw new Error("这些文档都没有可导出的内容。");
+      if (!entries.length) throw badRequest("这些文档都没有可导出的内容。");
 
       const zip = createZip(entries);
       response.writeHead(200, {
@@ -1772,7 +1798,7 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const resultMatch = request.url?.match(/^\/api\/library\/([\w-]+)$/);
+    const resultMatch = path.match(/^\/api\/library\/([\w-]+)$/);
     if (request.method === "GET" && resultMatch) {
       const job = jobStore.get(resultMatch[1]);
       if (!job) return sendJson(response, 404, { error: "记录不存在。" });
@@ -1786,7 +1812,7 @@ const server = createServer(async (request, response) => {
     //   GET  /api/library/<id>/document.pdf  把 Library 里这份的 document.md 打成 PDF 下载
     //   POST /api/md2pdf {markdown, title}   任意 Markdown 文本 → PDF（首页拖入 .md 走这里）
     // 不落盘、不建任务：几秒就完，没必要进队列；出错直接把 Chrome 的原因回给页面。
-    const docPdfMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/document\.pdf$/);
+    const docPdfMatch = path.match(/^\/api\/library\/([\w-]+)\/document\.pdf$/);
     if (request.method === "GET" && docPdfMatch) {
       const job = jobStore.get(docPdfMatch[1]);
       if (!job) return sendJson(response, 404, { error: "记录不存在。" });
@@ -1797,7 +1823,7 @@ const server = createServer(async (request, response) => {
       sendPdf(response, pdf, `${stripSourceExtension(job.filename)}.pdf`);
       return;
     }
-    if (request.method === "POST" && request.url === "/api/md2pdf") {
+    if (request.method === "POST" && path === "/api/md2pdf") {
       const body = await readJson(request);
       const markdown = typeof body?.markdown === "string" ? body.markdown : "";
       if (!markdown.trim()) return sendJson(response, 400, { error: "缺少 Markdown 内容。" });
@@ -1814,14 +1840,14 @@ const server = createServer(async (request, response) => {
     // Pillow/soffice 需要完整文件，这里每张各自落盘就够）：
     //   POST /api/images2pdf/part   头 x-session / x-index / x-filename，body 是原始字节，边收边写
     //   POST /api/images2pdf/build  {session, title} → 按 x-index 排序合成，回 PDF，然后删掉暂存
-    if (request.method === "POST" && request.url === "/api/images2pdf/part") {
+    if (request.method === "POST" && path === "/api/images2pdf/part") {
       const session = imageBookSession(request.headers["x-session"]);
       const index = Math.min(Math.max(Number(request.headers["x-index"]) || 0, 0), 9999);
       const name = decodeHeader(request.headers["x-filename"], "image");
-      if (!isImageFile(name)) throw new Error(`${name} 不是支持的图片格式。`);
+      if (!isImageFile(name)) throw badRequest(`${name} 不是支持的图片格式。`);
       const dir = join(imageBookRoot, session);
       await mkdir(dir, { recursive: true });
-      if ((await readdir(dir)).length >= 500) throw new Error("一次最多合成 500 张图片。");
+      if ((await readdir(dir)).length >= 500) throw badRequest("一次最多合成 500 张图片。");
       // 文件名 = 4 位页序 + "-" + encodeURIComponent(原名)：排序和报错都只靠它，
       // 不额外维护一份清单（清单和目录一旦不同步，排查起来最烦）
       const part = join(dir, `${String(index).padStart(4, "0")}-${encodeURIComponent(name).replace(/\//g, "%2F")}`);
@@ -1829,7 +1855,7 @@ const server = createServer(async (request, response) => {
       sendJson(response, 200, { ok: true });
       return;
     }
-    if (request.method === "POST" && request.url === "/api/images2pdf/build") {
+    if (request.method === "POST" && path === "/api/images2pdf/build") {
       const body = await readJson(request);
       const session = imageBookSession(body?.session);
       const dir = join(imageBookRoot, session);
@@ -1845,7 +1871,7 @@ const server = createServer(async (request, response) => {
           // 跳过的图片必须回到页面上（规矩四：任何失败路径都要留下原因）。
           // PDF 响应体里塞不下 JSON，就走一个头；latin-1 限制所以整体编码过。
           "X-Moye-Pages": String(pages),
-          "X-Moye-Skipped": encodeURIComponent(JSON.stringify(skipped)),
+          "X-Moye-Skipped": skippedHeader(skipped),
           "Access-Control-Expose-Headers": "X-Moye-Pages, X-Moye-Skipped",
         });
       } finally {
@@ -1856,7 +1882,7 @@ const server = createServer(async (request, response) => {
     }
 
     // 逐页核对的原图。图片不需要 CORS（<img> 直接加载），id 和页码都按正则卡死
-    const pageImageMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/page\/(\d+)\.jpg$/);
+    const pageImageMatch = path.match(/^\/api\/library\/([\w-]+)\/page\/(\d+)\.jpg$/);
     if (request.method === "GET" && pageImageMatch) {
       const job = jobStore.get(pageImageMatch[1]);
       const page = Number(pageImageMatch[2]);
@@ -1875,7 +1901,7 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const pdfMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/pdf$/);
+    const pdfMatch = path.match(/^\/api\/library\/([\w-]+)\/pdf$/);
     if (request.method === "GET" && pdfMatch) {
       const job = jobStore.get(pdfMatch[1]);
       if (!job) return sendJson(response, 404, { error: "记录不存在。" });
@@ -1899,10 +1925,19 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    const deleteMatch = request.url?.match(/^\/api\/library\/([\w-]+)$/);
+    const deleteMatch = path.match(/^\/api\/library\/([\w-]+)$/);
     if (request.method === "DELETE" && deleteMatch) {
-      jobQueue.cancel(deleteMatch[1]);
-      await jobStore.delete(deleteMatch[1]);
+      const id = deleteMatch[1];
+      jobQueue.cancel(id);
+      if (jobQueue.status().active.includes(id)) {
+        // 还在跑：取消只是协作式的，在途的几页回来还会写 pages.jsonl / 收尾。马上删目录的话，
+        // 那些写入要么报错、要么把目录又建出来留成孤儿。先删记录（Library 里立刻消失），
+        // 等任务真的停下再删目录（docs 报告 B3）
+        jobStore.db.prepare("DELETE FROM jobs WHERE id = ?").run(id);
+        deleteAfterStop(id);
+      } else {
+        await jobStore.delete(id);
+      }
       sendJson(response, 200, { deleted: true });
       return;
     }
@@ -1910,7 +1945,7 @@ const server = createServer(async (request, response) => {
     // 重跑 AI 精校：原地覆盖同一条 Library 记录，不再新建——
     // 新建会让 Library 无限增殖，还会丢掉原有的 batch_id（新记录变成孤儿，
     // 从合集里"消失"，实测找不到）。原地重跑顺带保住了 batch_id。
-    const refineMatch = request.url?.match(/^\/api\/library\/([\w-]+)\/refine$/);
+    const refineMatch = path.match(/^\/api\/library\/([\w-]+)\/refine$/);
     if (request.method === "POST" && refineMatch) {
       const job = jobStore.get(refineMatch[1]);
       if (!job) return sendJson(response, 404, { error: "记录不存在。" });
@@ -1942,8 +1977,9 @@ const server = createServer(async (request, response) => {
     sendJson(response, 404, { error: "Not found" });
   } catch (error) {
     const message = error instanceof Error ? error.message : "服务处理失败。";
-    // 4xx = 请求本身有问题（缺字段、空文件、超大），5xx = 服务这边出了错
-    const status = /API Key|缺少|有效的 JSON|过大|未知的转换模式|是空的|超过 \d+MB/.test(message) ? 400 : 500;
+    // 4xx = 请求本身有问题（badRequest 标好的），5xx = 服务这边出了错。
+    // 「请先填写 API Key」是从模型调用深处抛上来的（测试连接、同步模型），那几处不改签名，仍按文字认
+    const status = Number.isInteger(error?.httpStatus) ? error.httpStatus : /API Key/.test(message) ? 400 : 500;
     sendJson(response, status, { error: message });
   }
 });

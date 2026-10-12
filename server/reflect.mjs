@@ -211,9 +211,10 @@ ${items}
  "en": {"headline": "...", "narrative": "..."},
  "topics": [{"tag": "原标签", "name_zh": "...", "desc_zh": "...", "name_en": "...", "desc_en": "..."}]}`;
 
+// 标题和标签也算进去：补完标签 / AI 标题后 touch 一下，叙事要能跟着重写，只看 id 的话永远「没变」
 function fingerprint(items) {
   const h = createHash("sha1");
-  for (const it of items) h.update(String(it.id));
+  for (const it of items) h.update(`${it.id}\u0000${it.title}\u0000${it.tags.join("\u0001")}\n`);
   return h.digest("hex").slice(0, 16);
 }
 

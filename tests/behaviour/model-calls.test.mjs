@@ -2,7 +2,7 @@
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
 import test from "node:test";
-import { fetchWithTimeout } from "../../server/fetch-timeout.mjs";
+import { fetchWithTimeout, postWithRetries } from "../../server/fetch-timeout.mjs";
 import { failoverChain } from "../../server/openrouter-failover.mjs";
 
 /** 本机起一个假上游，handler 决定怎么回。 */
@@ -79,4 +79,56 @@ test("已熔断的模型直接跳过；全都熔断了就还用它们，不至�
   assert.equal((await failoverChain({ models: ["kimi", "glm"], providers, perTryMs: 30000, budgetMs: 150000, call: r.call, health: r.health, now: r.now })).model, "glm");
   r.health.down.add("glm");
   assert.equal((await failoverChain({ models: ["kimi", "glm"], providers, perTryMs: 30000, budgetMs: 150000, call: r.call, health: r.health, now: r.now })).model, "kimi");
+});
+
+test("OpenRouter 回 401 / 402（账号级）：整条链立刻停，不再试别的供应商和模型，也不记模型熔断", async () => {
+  for (const status of [401, 402]) {
+    const r = rig({ behave: (attempt, clock) => { clock.t += 500; throw Object.assign(new Error(`（${status}）`), { status }); } });
+    await assert.rejects(failoverChain({ models: ["kimi", "glm"], providers, perTryMs: 30000, budgetMs: 150000, call: r.call, health: r.health, now: r.now }), (e) => e.status === status);
+    assert.equal(r.calls.length, 1);
+    assert.deepEqual(r.health.failures, []);
+  }
+});
+
+/** 假上游：按顺序回 statuses 里的状态码，记下被打了几次。 */
+function countingUpstream(statuses) {
+  const hits = { n: 0 };
+  const handler = (req, res) => {
+    const status = statuses[Math.min(hits.n, statuses.length - 1)];
+    hits.n += 1;
+    res.writeHead(status, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(status === 200 ? { ok: true } : { error: { message: `boom ${status}` } }));
+  };
+  return { hits, handler };
+}
+
+test("4xx（Key 错、参数错）不重试：只打一次，错误带上游状态码", async () => {
+  for (const status of [400, 401, 403, 404]) {
+    const { hits, handler } = countingUpstream([status]);
+    await withServer(handler, async (url) => {
+      const seen = [];
+      await assert.rejects(
+        postWithRetries(url, { method: "POST" }, 3, 2000, Infinity, { onHttpError: (s) => seen.push(s) }),
+        (e) => e.status === status,
+      );
+      assert.equal(hits.n, 1, `${status} 被重试了 ${hits.n - 1} 次`);
+      assert.deepEqual(seen, [status]);
+    });
+  }
+});
+
+test("5xx 照常重试，重试成功就返回", async () => {
+  const { hits, handler } = countingUpstream([502, 200]);
+  await withServer(handler, async (url) => {
+    assert.deepEqual(await postWithRetries(url, { method: "POST" }, 3, 2000), { ok: true });
+    assert.equal(hits.n, 2);
+  });
+});
+
+test("429 超过上限就停，不再拿普通重试次数接着打", async () => {
+  const { hits, handler } = countingUpstream([429]);
+  await withServer((req, res) => { res.setHeader("retry-after", "0.01"); handler(req, res); }, async (url) => {
+    await assert.rejects(postWithRetries(url, { method: "POST" }, 3, 2000, Infinity, { maxRateLimitRetries: 2 }), (e) => e.status === 429);
+    assert.equal(hits.n, 3);   // 第一次 + 2 次限流重试
+  });
 });

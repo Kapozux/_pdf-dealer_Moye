@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import { existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { delimiter, join } from "node:path";
+import { pause as gatePause, pausedUntil as gatePausedUntil, record as gateRecord, withSlot } from "./claude-gate.mjs";
 
 export const CLAUDE_MODEL = "claude-opus-5-5";
 const SYSTEM = "你是墨页（一个本机 PDF 转 Markdown 工具）里的文字程序。只按用户消息里的要求输出，不寒暄、不加说明。";
@@ -45,12 +46,22 @@ export function findClaude(env = process.env) {
 }
 
 export function claudeEnabled(env = process.env) {
-  return String(env.REFLECT_ENGINE || "").trim().toLowerCase() === "claude" && Date.now() >= pausedUntil && !!findClaude(env);
+  return String(env.REFLECT_ENGINE || "").trim().toLowerCase() === "claude" && Date.now() >= pausedUntil && !gatePausedUntil() && !!findClaude(env);
 }
 
-function run(bin, args, input, { timeoutMs, record, purpose, model, page }) {
+// 三个应用共用额度的分配器（claude-gate.mjs）：精校一页、打标签 = batch，测试连接 = live，其余（回顾）normal
+const GATE_APP = "moye";
+const prioOf = (purpose) => (purpose === "test" ? "live" : purpose === "refine" || purpose === "card" ? "batch" : "normal");
+
+function run(bin, args, input, opts) {
+  const prio = prioOf(opts.purpose);
+  return withSlot(GATE_APP, opts.purpose, prio, () => runOnce(bin, args, input, { ...opts, prio }));
+}
+
+function runOnce(bin, args, input, { timeoutMs, record, purpose, model, page, prio }) {
   const cwd = join(homedir(), ".moye-claude");            // 会话存在这个目录名下，不混进用户自己的 Claude Code 项目
   mkdirSync(cwd, { recursive: true });
+  const t0 = Date.now();
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { cwd, env: { ...process.env, DISABLE_PROMPT_CACHING: "1" } });
     let out = "";
@@ -76,6 +87,7 @@ function run(bin, args, input, { timeoutMs, record, purpose, model, page }) {
         reject(new Error(`Claude Code 输出看不懂：${(out || err).slice(0, 200)}`));
         return;
       }
+      gateRecord(GATE_APP, purpose, prio, model, d, (Date.now() - t0) / 1000);
       const u = d.usage || {};
       const used = record({ provider: "claude-code", model, purpose, ...(Number.isFinite(page) ? { page } : {}),
         inputTokens: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0), outputTokens: u.output_tokens || 0,
@@ -85,6 +97,7 @@ function run(bin, args, input, { timeoutMs, record, purpose, model, page }) {
         if (LIMIT.test(text)) {
           const m = text.match(/\|(\d{10})/);
           pausedUntil = Math.max(m ? Number(m[1]) * 1000 : Date.now() + PAUSE_MS, Date.now() + 60000);
+          gatePause(pausedUntil / 1000, text, GATE_APP);
         }
         reject(new Error(`Claude Code：${text.slice(0, 200) || "返回空"}`));
         return;

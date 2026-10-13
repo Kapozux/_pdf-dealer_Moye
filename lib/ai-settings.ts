@@ -1,6 +1,6 @@
 const serviceBase = "http://127.0.0.1:8765";
 
-export type AiProvider = "gemini" | "kimi" | "qwen" | "openrouter" | "ollama";
+export type AiProvider = "gemini" | "kimi" | "qwen" | "openrouter" | "ollama" | "claude";
 export type AiScope = "all" | "review";
 export type AiModelOption = { id: string; label: string };
 
@@ -52,6 +52,10 @@ export type AiSettings = {
   ollamaConfigured: boolean;
   ollamaModel: string;
   ollamaBaseUrl: string;
+  // 本机 Claude Code（2026-10-13）：没有 Key，选了模型就算配置好；claudeInstalled = 这台电脑找得到 claude 命令
+  claudeConfigured: boolean;
+  claudeModel: string;
+  claudeInstalled: boolean;
   aiScope: AiScope;
   aiConfigured: boolean;
   /**
@@ -94,6 +98,9 @@ export const defaultAiSettings: AiSettings = {
   ollamaConfigured: false,
   ollamaModel: "",
   ollamaBaseUrl: "http://127.0.0.1:11434",
+  claudeConfigured: false,
+  claudeModel: "",
+  claudeInstalled: false,
   aiScope: "all",
   aiConfigured: false,
   autoTag: true,

@@ -6,7 +6,7 @@ import { chmod, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
-import { claudeEnabled, claudeText, findClaude, CLAUDE_MODEL, _resetPause } from "../../server/claude-text.mjs";
+import { claudeEnabled, claudeText, claudeVision, findClaude, CLAUDE_MODEL, _resetPause } from "../../server/claude-text.mjs";
 
 async function fakeClaude(reply) {
   const dir = await mkdtemp(join(tmpdir(), "moye-claude-"));
@@ -59,4 +59,30 @@ test("撞上限：报错、停到重置时间，期间 claudeEnabled 为假（�
 test("找 claude：CLAUDE_BIN 优先；launchd 的 PATH 里没有也去 ~/.local/bin 等常见位置找", () => {
   assert.equal(findClaude({ CLAUDE_BIN: process.execPath, PATH: "" }), process.execPath);
   assert.equal(findClaude({ CLAUDE_BIN: "/nonexistent/claude", PATH: "/nonexistent", HOME: "/nonexistent" }), null);
+});
+
+test("看图（AI 精校一页）：图片 + 提示词作为一条消息从标准输入进去，默认 Haiku，记账带页码", async () => {
+  _resetPause();
+  const dir = await mkdtemp(join(tmpdir(), "moye-claude-v-"));
+  const bin = join(dir, "claude");
+  const result = { type: "result", result: "{\"markdown\":\"# 第一题\"}", is_error: false, usage: { input_tokens: 3900, output_tokens: 500 } };
+  // stream-json：一行一个事件，最后一行是 result
+  await writeFile(bin, `#!/bin/sh\necho "$@" > "${dir}/args"\ncat > "${dir}/stdin"\necho '{"type":"system","subtype":"init"}'\necho '${JSON.stringify(result)}'\n`);
+  await chmod(bin, 0o755);
+  try {
+    const records = [];
+    const { text } = await claudeVision("把这页转成 Markdown", "QUJD", "image/jpeg", { bin, page: 7, record: (r) => { records.push(r); return r; } });
+    assert.equal(text, "{\"markdown\":\"# 第一题\"}");
+    const args = await readFile(join(dir, "args"), "utf8");
+    assert.match(args, /--model claude-haiku-5-5/);
+    assert.match(args, /--input-format stream-json/);
+    const msg = JSON.parse(await readFile(join(dir, "stdin"), "utf8"));
+    assert.deepEqual(msg.message.content.map((b) => b.type), ["image", "text"]);
+    assert.equal(msg.message.content[0].source.data, "QUJD");
+    assert.equal(records[0].purpose, "refine");
+    assert.equal(records[0].page, 7);
+    assert.equal(records[0].costUsd, 0);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
 });

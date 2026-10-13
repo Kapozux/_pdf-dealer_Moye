@@ -168,6 +168,7 @@ const providerNames: Record<AiProvider, string> = {
   qwen: "Qwen",
   openrouter: "OpenRouter",
   ollama: "Ollama",
+  claude: "Claude Code",
 };
 
 const modelPresets: Record<AiProvider, { value: string; label: string }[]> = {
@@ -203,6 +204,13 @@ const modelPresets: Record<AiProvider, { value: string; label: string }[]> = {
     { value: "z-ai/glm-5v-turbo", label: "GLM-5V Turbo · 备选" },
     { value: "google/gemini-2.5-flash", label: "Gemini 2.5 Flash · 与直连同配额，不建议" },
     { value: "qwen/qwen2.5-vl-72b-instruct", label: "Qwen 2.5 VL 72B" },
+  ],
+  // 本机 Claude Code（走用户自己的订阅）。2026-10-13 实测 4 页手机拍的作业：Haiku 手写、批改颜色都对，Kimi 有一页整页没出、一页丢了手写；
+  // 40 页并发实测见 server/claude-text.mjs 的 claudeVision
+  claude: [
+    { value: "claude-haiku-5-5", label: "Claude Haiku 5.5 · 推荐 · 每页约 18 秒、额度很省" },
+    { value: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+    { value: "claude-opus-5-5", label: "Claude Opus 5.5 · 最准 · 额度贵 15 倍" },
   ],
   // 本机模型：大小是 Ollama 库里的下载体积。都还没在墨页上实测过质量和速度，
   // 跑过真实文档后把实测数字补进标签（跟上面云端那几家一样）。
@@ -1036,7 +1044,7 @@ export default function Home() {
   // 哪些渠道已经有 Key（多渠道分流时实际参与的就是这几家）。
   // 用已保存的 settings 而不是 draft：draft 里的 Key 输入框是空的（留空=保留原值）。
   const configuredProviders = useMemo(
-    () => (["gemini", "kimi", "qwen", "openrouter", "ollama"] as AiProvider[]).filter(
+    () => (["gemini", "kimi", "qwen", "openrouter", "ollama", "claude"] as AiProvider[]).filter(
       (p) => settings[`${p}Configured` as const]
     ),
     [settings]
@@ -1497,6 +1505,7 @@ export default function Home() {
       ...value,
       provider,
       ...(provider === "ollama" && !value.ollamaModel ? { ollamaModel: setupData?.components.ollama.recommended ?? "qwen3-vl:8b-instruct" } : {}),
+      ...(provider === "claude" && !value.claudeModel ? { claudeModel: "claude-haiku-5-5" } : {}),
     }));
     setRemoteModels(null);
     setSettingsStatus("");
@@ -2791,6 +2800,7 @@ export default function Home() {
                   <button type="button" className={settingsDraft.provider === "qwen" ? "active" : ""} onClick={() => selectProvider("qwen")}>{t("Qwen 百炼")}</button>
                   <button type="button" className={settingsDraft.provider === "openrouter" ? "active" : ""} onClick={() => selectProvider("openrouter")}>OpenRouter</button>
                   <button type="button" className={settingsDraft.provider === "ollama" ? "active" : ""} onClick={() => selectProvider("ollama")}>{t("本机 Ollama")}</button>
+                  <button type="button" className={settingsDraft.provider === "claude" ? "active" : ""} onClick={() => selectProvider("claude")}>{t("本机 Claude Code")}</button>
                 </div>
                 <div className="multichannel">
                   <label className="multichannel-main" aria-label={t("多渠道并行")}>
@@ -2909,6 +2919,10 @@ export default function Home() {
                     <label className="wide" htmlFor="qwen-model"><span>{t("Qwen 视觉 / OCR 模型")}</span><ModelPicker id="qwen-model" provider="qwen" value={settingsDraft.qwenModel} extra={remoteModels?.provider === "qwen" ? remoteModels.models : []} onChange={(qwenModel) => setSettingsDraft((value) => ({ ...value, qwenModel }))} /></label>
                     <label className="wide"><span>API Base URL</span><input value={settingsDraft.qwenBaseUrl} onChange={(event) => setSettingsDraft((value) => ({ ...value, qwenBaseUrl: event.target.value }))} /><small>{t("默认使用北京公共兼容地址；也可替换成百炼业务空间专属 compatible-mode/v1 地址。")}</small></label>
                   </div>
+                ) : settingsDraft.provider === "claude" ? (
+                  <div className="settings-fields">
+                    <label className="wide" htmlFor="claude-model"><span>{t("Claude 模型")}</span><ModelPicker id="claude-model" provider="claude" value={settingsDraft.claudeModel} extra={remoteModels?.provider === "claude" ? remoteModels.models : []} onChange={(claudeModel) => setSettingsDraft((value) => ({ ...value, claudeModel }))} /><small>{settingsDraft.claudeInstalled ? t("走你自己的 Claude 订阅（这台电脑上的 Claude Code），不用 API Key、不另收费；页面图片会发给 Anthropic。") : t("这台电脑上没找到 claude 命令：先安装 Claude Code 并登录。")}</small></label>
+                  </div>
                 ) : settingsDraft.provider === "ollama" ? (
                   <div className="settings-fields">
                     <label className="wide" htmlFor="ollama-model"><span>{t("本机视觉模型")}</span><ModelPicker id="ollama-model" provider="ollama" value={settingsDraft.ollamaModel} extra={remoteModels?.provider === "ollama" ? remoteModels.models : []} onChange={(ollamaModel) => setSettingsDraft((value) => ({ ...value, ollamaModel }))} /><small>{t("必须是能看图的模型，并且已经下载到本机。还没有就去")} <button type="button" className="inline-link" onClick={() => openPanel("setup")}>{t("「环境」一键下载")}</button>{t("。本机比云端慢得多，一次只跑一页。")}</small></label>
@@ -2921,7 +2935,7 @@ export default function Home() {
                     <label className="wide"><span>API Base URL</span><input value={settingsDraft.openrouterBaseUrl} onChange={(event) => setSettingsDraft((value) => ({ ...value, openrouterBaseUrl: event.target.value }))} /></label>
                   </div>
                 )}
-                <div className="model-sync-row"><button type="button" className="secondary-button" disabled={settingsBusy} onClick={() => void syncModels()}>{settingsDraft.provider === "ollama" ? t("↻ 读取本机模型") : t("↻ 从服务商同步模型")}</button><span>{settingsDraft.provider === "ollama" ? t("列出本机已下载、能看图的模型。") : t("需要先填写 API Key；只显示可用于图片输入的模型。")}</span></div>
+                <div className="model-sync-row"><button type="button" className="secondary-button" disabled={settingsBusy} onClick={() => void syncModels()}>{settingsDraft.provider === "ollama" ? t("↻ 读取本机模型") : t("↻ 从服务商同步模型")}</button><span>{settingsDraft.provider === "ollama" ? t("列出本机已下载、能看图的模型。") : settingsDraft.provider === "claude" ? t("Claude Code 能用的模型都能看图，不用 API Key。") : t("需要先填写 API Key；只显示可用于图片输入的模型。")}</span></div>
                 <fieldset className="scope-field"><legend>{t("精校范围")}</legend><label><input type="radio" checked={settingsDraft.aiScope === "all"} onChange={() => setSettingsDraft((value) => ({ ...value, aiScope: "all" }))} />{t("全部页面（质量最佳）")}</label><label><input type="radio" checked={settingsDraft.aiScope === "review"} onChange={() => setSettingsDraft((value) => ({ ...value, aiScope: "review" }))} />{t("只精校公式、选项与可疑页面（更省费用）")}</label></fieldset>
                 <fieldset className="scope-field">
                   <legend>{t("自动打标签")}</legend>

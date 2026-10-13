@@ -48,16 +48,9 @@ export function claudeEnabled(env = process.env) {
   return String(env.REFLECT_ENGINE || "").trim().toLowerCase() === "claude" && Date.now() >= pausedUntil && !!findClaude(env);
 }
 
-/**
- * 调一次，返回全文。record(行) 记账（usage.record 的参数形状）。失败抛错（原因写在错误里，规矩四：不静默吞）。
- */
-export function claudeText(prompt, { bin = findClaude(), effort = "medium", timeoutMs = 180000, record = () => {}, purpose = "reflect" } = {}) {
-  if (!bin) return Promise.reject(new Error("找不到 claude 命令（Claude Code 没装？）"));
+function run(bin, args, input, { timeoutMs, record, purpose, model, page }) {
   const cwd = join(homedir(), ".moye-claude");            // 会话存在这个目录名下，不混进用户自己的 Claude Code 项目
   mkdirSync(cwd, { recursive: true });
-  const args = ["-p", "--model", CLAUDE_MODEL, "--effort", effort, "--system-prompt", SYSTEM, "--tools", "",
-    "--disable-slash-commands", "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence",
-    "--output-format", "json"];
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { cwd, env: { ...process.env, DISABLE_PROMPT_CACHING: "1" } });
     let out = "";
@@ -71,15 +64,20 @@ export function claudeText(prompt, { bin = findClaude(), effort = "medium", time
     child.on("error", (e) => { clearTimeout(timer); reject(e); });
     child.on("close", () => {
       clearTimeout(timer);
-      let d;
+      // --output-format json 是一个对象；stream-json 是一行一个事件，要的是最后那个 result
+      let d = null;
       try {
         d = JSON.parse(out);
       } catch {
+        const last = out.split("\n").filter((l) => l.includes('"type":"result"')).pop();
+        try { d = last ? JSON.parse(last) : null; } catch { d = null; }
+      }
+      if (!d) {
         reject(new Error(`Claude Code 输出看不懂：${(out || err).slice(0, 200)}`));
         return;
       }
       const u = d.usage || {};
-      record({ provider: "claude-code", model: CLAUDE_MODEL, purpose,
+      const used = record({ provider: "claude-code", model, purpose, ...(Number.isFinite(page) ? { page } : {}),
         inputTokens: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0), outputTokens: u.output_tokens || 0,
         cachedTokens: u.cache_read_input_tokens || 0, costUsd: 0 });
       const text = String(d.result || "").trim();
@@ -91,8 +89,37 @@ export function claudeText(prompt, { bin = findClaude(), effort = "medium", time
         reject(new Error(`Claude Code：${text.slice(0, 200) || "返回空"}`));
         return;
       }
-      resolve(text);
+      resolve({ text, used });
     });
-    child.stdin.end(prompt);
+    child.stdin.end(input);
   });
+}
+
+const BASE_ARGS = (model, effort) => ["-p", "--model", model, "--effort", effort, "--system-prompt", SYSTEM, "--tools", "",
+  "--disable-slash-commands", "--strict-mcp-config", "--setting-sources", "", "--no-session-persistence"];
+
+/**
+ * 调一次，返回全文。record(行) 记账（usage.record 的参数形状）。失败抛错（原因写在错误里，规矩四：不静默吞）。
+ */
+export async function claudeText(prompt, { bin = findClaude(), model = CLAUDE_MODEL, effort = "medium", timeoutMs = 180000,
+  record = () => {}, purpose = "reflect" } = {}) {
+  if (!bin) throw new Error("找不到 claude 命令（Claude Code 没装？）");
+  const { text } = await run(bin, [...BASE_ARGS(model, effort), "--output-format", "json"], prompt, { timeoutMs, record, purpose, model });
+  return text;
+}
+
+/**
+ * 看图（AI 精校的一页）：图片和提示词作为一条用户消息从标准输入进去（--input-format stream-json），不用给它读文件的工具。
+ * 返回 { text, used }（used = record 的返回值，结果页逐页显示用量用）。
+ * 2026-10-13 实测（Haiku 5.5、40 页手机拍的作业）：每页中位 18s、最慢 35s；5 / 10 / 20 / 40 路并发全部成功、没有限流，
+ * 吞吐随并发线性涨（40 路 80 页/分钟），每个进程约 230MB 内存。
+ */
+export async function claudeVision(prompt, imageBase64, mimeType, { bin = findClaude(), model = "claude-haiku-5-5", effort = "low",
+  timeoutMs = 90000, record = () => {}, purpose = "refine", page } = {}) {
+  if (!bin) throw new Error("找不到 claude 命令（Claude Code 没装？）");
+  const msg = { type: "user", message: { role: "user", content: [
+    { type: "image", source: { type: "base64", media_type: mimeType || "image/jpeg", data: imageBase64 } },
+    { type: "text", text: prompt }] } };
+  const args = [...BASE_ARGS(model, effort), "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"];
+  return run(bin, args, JSON.stringify(msg) + "\n", { timeoutMs, record, purpose, model, page });
 }

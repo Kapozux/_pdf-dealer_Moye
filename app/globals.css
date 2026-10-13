@@ -378,7 +378,7 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 .settings-warning strong { color:var(--c-814a31-fg); font-size:12px; }
 .settings-warning p { margin:5px 0 0; color:rgba(var(--warm-ink-rgb),.74); font-size:12px; line-height:1.65; }
 .settings-warning code { font-family:var(--mono); }
-.settings-provider { display:grid; grid-template-columns:repeat(5,1fr); margin:20px 28px 0; padding:3px; border:1px solid var(--line); border-radius:10px; background:rgba(var(--surface-rgb),.42); }
+.settings-provider { display:grid; grid-template-columns:repeat(6,1fr); margin:20px 28px 0; padding:3px; border:1px solid var(--line); border-radius:10px; background:rgba(var(--surface-rgb),.42); }
 .settings-provider button { padding:10px; border:0; border-radius:7px; background:transparent; font-size:12px; cursor:pointer; }
 .settings-provider button.active { color:var(--on-fill); background:var(--green-fill); }
 .settings-fields { display:grid; grid-template-columns:1fr 1fr; gap:14px; padding:20px 28px 0; }

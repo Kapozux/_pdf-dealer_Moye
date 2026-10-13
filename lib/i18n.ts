@@ -533,6 +533,13 @@ export const en: Record<string, string> = {
 
   // ---- 本机 Ollama ----
   "本机 Ollama": "Local Ollama",
+  "本机 Claude Code": "Local Claude Code",
+  "Claude Code 能用的模型都能看图，不用 API Key。": "Every model Claude Code offers can read images; no API key needed.",
+  "Claude 模型": "Claude model",
+  "走你自己的 Claude 订阅（这台电脑上的 Claude Code），不用 API Key、不另收费；页面图片会发给 Anthropic。": "Uses your own Claude subscription (Claude Code on this computer): no API key, no extra charge. Page images are sent to Anthropic.",
+  "这台电脑上没找到 claude 命令：先安装 Claude Code 并登录。": "No claude command found on this computer: install Claude Code and sign in first.",
+  "Claude Haiku 5.5 · 推荐 · 每页约 18 秒、额度很省": "Claude Haiku 5.5 · recommended · ~18 s a page, light on your plan",
+  "Claude Opus 5.5 · 最准 · 额度贵 15 倍": "Claude Opus 5.5 · most accurate · 15× the plan usage",
   "本机 Ollama：页面图像只发给这台电脑上的 Ollama（127.0.0.1），不经过任何云端服务，也不需要 API Key。": "Local Ollama: page images only go to Ollama on this computer (127.0.0.1). No cloud service, no API key.",
   "没有 API Key？用本机模型": "No API key? Use a local model",
   "Ollama 在这台电脑上运行视觉模型：免费、不上传，一键下载。": "Ollama runs a vision model on this computer: free, nothing uploaded, one-click download.",

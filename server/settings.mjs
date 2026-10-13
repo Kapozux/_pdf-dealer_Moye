@@ -17,7 +17,7 @@ import { randomUUID } from "node:crypto";
 import { readFile, rename, rm, writeFile } from "node:fs/promises";
 import { mergeExtraKeys } from "../lib/key-pool.mjs";
 
-export const ALL_PROVIDERS = ["gemini", "kimi", "qwen", "openrouter", "ollama"];
+export const ALL_PROVIDERS = ["gemini", "kimi", "qwen", "openrouter", "ollama", "claude"];
 
 export const defaultSettings = {
   provider: "gemini",
@@ -44,6 +44,9 @@ export const defaultSettings = {
   // 地址是 Ollama 的根地址（走它的原生 /api/chat，不走 /v1 兼容层，理由见 callOllama）。
   ollamaModel: "",
   ollamaBaseUrl: "http://127.0.0.1:11434",
+  // 本机 Claude Code（2026-10-13）：不要 Key，走用户自己的 Claude 订阅（`claude -p`）。模型为空 = 没配置。
+  // 推荐 claude-haiku-5-5：实测 4 页作业比 Kimi 准（手写、颜色都对），订阅额度每页约 $0.002 等值。
+  claudeModel: "",
   aiScope: "all",
   // 转换完成后自动打标签（会把文档开头约 3000 字发给模型，本地模式也一样）。
   // 用户可关：顶栏的隐私标签按这个值说话，关了才能诚实地写"文件不上传"。
@@ -67,6 +70,7 @@ export function providerConfigured(settings, provider) {
     qwen: settings.qwenKey,
     openrouter: settings.openrouterKey,
     ollama: settings.ollamaModel,
+    claude: settings.claudeModel,
   }[provider];
   return Boolean(credential);
 }
@@ -118,6 +122,7 @@ export function normalizeSettings(input, previous = defaultSettings) {
     // 模型名跟 Key 一样「没传就沿用」：partial 请求不能把已选的模型冲掉
     ollamaModel: cleanString(input.ollamaModel) || previous.ollamaModel || "",
     ollamaBaseUrl: cleanString(input.ollamaBaseUrl) || previous.ollamaBaseUrl || defaultSettings.ollamaBaseUrl,
+    claudeModel: cleanString(input.claudeModel) || previous.claudeModel || "",
     aiScope,
     autoTag: input.autoTag === undefined ? previous.autoTag !== false : Boolean(input.autoTag),
     multiChannel: Boolean(input.multiChannel ?? previous.multiChannel ?? defaultSettings.multiChannel),

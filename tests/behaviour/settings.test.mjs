@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
 import { maskedKey, mergeExtraKeys, newRow, rowsFromSaved, rowsToPayload, splitKeys } from "../../lib/key-pool.mjs";
-import { createSettingsStore, defaultSettings, geminiKeyRejected, providerConfigured } from "../../server/settings.mjs";
+import { createSettingsStore, defaultSettings, geminiKeyRejected, normalizeSettings, providerConfigured } from "../../server/settings.mjs";
 
 const A = "AIzaSy-aaaa-1111";
 const B = "AIzaSy-bbbb-2222";
@@ -143,4 +143,14 @@ test("Gemini Key 拉黑只认明确的拒绝：401/403、400 + API_KEY_INVALID�
   assert.equal(geminiKeyRejected(400, "Invalid JSON payload"), false);
   assert.equal(geminiKeyRejected(429, "Quota exceeded; check permission and billing"), false);
   assert.equal(geminiKeyRejected(500, "unauthorized upstream hiccup"), false);
+});
+
+test("本机 Claude Code：选了模型就算配置好（没有 Key），部分保存不会把选好的模型冲掉", () => {
+  const saved = normalizeSettings({ provider: "claude", claudeModel: "claude-haiku-5-5" });
+  assert.equal(saved.provider, "claude");
+  assert.equal(providerConfigured(saved, "claude"), true);
+  assert.equal(providerConfigured(normalizeSettings({ provider: "claude" }), "claude"), false);
+  const partial = normalizeSettings({ autoTag: false }, saved);
+  assert.equal(partial.claudeModel, "claude-haiku-5-5");
+  assert.equal(partial.provider, "claude");
 });

@@ -29,7 +29,7 @@ import { bundledHeadlessShell, forgetChromePath, markdownToPdf, markdownTitle, p
 import { createSetup, findSoffice } from "./server/setup.mjs";
 import { AdaptivePacer } from "./server/pacer.mjs";
 import { createReflect } from "./server/reflect.mjs";
-import { claudeEnabled, claudeText } from "./server/claude-text.mjs";
+import { claudeEnabled, claudeText, claudeVision, findClaude } from "./server/claude-text.mjs";
 import { createUsage } from "./server/usage.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -193,6 +193,10 @@ function publicSettings(settings) {
     ollamaConfigured: Boolean(settings.ollamaModel),
     ollamaModel: settings.ollamaModel,
     ollamaBaseUrl: settings.ollamaBaseUrl,
+    // 本机 Claude Code 也没有 Key：「已配置」= 选了模型；找不找得到 claude 命令另外报
+    claudeConfigured: Boolean(settings.claudeModel),
+    claudeModel: settings.claudeModel,
+    claudeInstalled: Boolean(findClaude()),
     aiScope: settings.aiScope,
     autoTag: settings.autoTag !== false,
     aiConfigured: activeConfigured,
@@ -355,6 +359,8 @@ const PROVIDER_TIMEOUT_MS = {
   gemini: Number(process.env.MOYE_TIMEOUT_GEMINI) || 75000,
   // 本机小模型：实测正常页 5～15s（2026-09-24，只测过一份 4 页文档），180s 是留给慢机器和死循环重试的余量
   ollama: Number(process.env.MOYE_TIMEOUT_OLLAMA) || 180000,
+  // 本机 Claude Code（Haiku）：2026-10-13 实测 40 页作业每页中位 18s、最慢 35s；每次还要起一个 claude 进程
+  claude: Number(process.env.MOYE_TIMEOUT_CLAUDE) || 90000,
 };
 const providerTimeout = (provider) => PROVIDER_TIMEOUT_MS[provider] ?? PAGE_CALL_TIMEOUT_MS;
 
@@ -731,6 +737,25 @@ async function callOllama(settings, imageBase64, draft, testOnly = false, opts =
   return normalizeAiResult(extractJson(String(payload?.message?.content || "")), "ollama", payload?.model || model, used);
 }
 
+/**
+ * 本机 Claude Code 精校一页（2026-10-13）：一页起一个 `claude -p`，图和提示词一起从标准输入进去（server/claude-text.mjs）。
+ * 用户的订阅额度，记 claude-code / $0。撞上限时 claude-text 会停着，这里照常抛错，节流器 / 回退文字层照旧接手。
+ */
+async function callClaudeCode(settings, imageBase64, mimeType, draft, testOnly = false, opts = {}) {
+  const model = settings.claudeModel;
+  if (!model) throw new Error("请先在设置里选一个 Claude 模型（推荐 claude-haiku-5-5）。");
+  if (!findClaude()) throw new Error("找不到 claude 命令：这台电脑没装 Claude Code，或者装在了不常见的位置（可用 CLAUDE_BIN 指定）。");
+  if (testOnly) {
+    // 「测试连接」真的问一次（几分钱都不到）：没登录 / 订阅到期在这里就能看出来
+    await claudeText("只回答 OK", { model, effort: "low", timeoutMs: 60000, record: usage.record, purpose: "test" });
+    return { ok: true, provider: "claude", model };
+  }
+  const { text, used } = await claudeVision(`${refinementPrompt}${draft.slice(0, 60000)}`, imageBase64, mimeType, {
+    model, timeoutMs: opts.timeoutMs ?? providerTimeout("claude"), record: usage.record, page: opts.page,
+  });
+  return normalizeAiResult(extractJson(text), "claude", model, used);
+}
+
 /** 纯文本调用（打标签 / 回顾叙事）。 */
 async function callOllamaText(settings, prompt, { model = null, maxTokens = 200, timeoutMs = 30000 } = {}) {
   const name = model || settings.ollamaModel;
@@ -804,6 +829,10 @@ const DIRECT_PROVIDER_WEIGHTS = {
   // 本机 Ollama 默认一次只算一路（OLLAMA_NUM_PARALLEL），多发只会在它那边排队、吃掉超时。
   // 用户若给 Ollama 调大了并行数，这里跟着调 MOYE_OLLAMA_CONCURRENCY。
   ollama: Number(process.env.MOYE_OLLAMA_CONCURRENCY) || 1,
+  // 本机 Claude Code：一页一个 claude 进程（约 230MB）。2026-10-13 实测 5 / 10 / 20 / 40 路都全部成功、没被订阅限流，
+  // 吞吐随并发线性涨（20 路 45 页/分钟、40 路 80 页/分钟）。默认 20 是给内存留余地（20 路约 4.6GB）；
+  // 只测过 40 页的突发，持续几百页会不会被限流还没测——见 CLAUDE.md「突发 ≠ 持续」
+  claude: Number(process.env.MOYE_CLAUDE_CONCURRENCY) || 20,
 };
 
 function geminiWeight(settings) {
@@ -875,6 +904,9 @@ async function callProvider(provider, settings, input, testOnly) {
   if (provider === "ollama") {
     return callOllama(settings, input.imageBase64 || "", input.draft || "", testOnly, opts);
   }
+  if (provider === "claude") {
+    return callClaudeCode(settings, input.imageBase64 || "", input.mimeType || "image/jpeg", input.draft || "", testOnly, opts);
+  }
   // OpenRouter 走换家逻辑；测试连接除外（那时要的是「这个 Key 通不通」）
   if (provider === "openrouter" && !testOnly) {
     return callOpenRouterFailover(settings, input, opts);
@@ -900,6 +932,14 @@ async function callConfiguredModel(settings, input, testOnly = false) {
 }
 
 async function listConfiguredModels(settings) {
+  if (settings.provider === "claude") {
+    // 不用联网列：Claude Code 能用的就这几个，都能看图
+    return { provider: "claude", models: [
+      { id: "claude-haiku-5-5", label: "Claude Haiku 5.5（推荐：准、订阅额度很省）" },
+      { id: "claude-sonnet-5-5", label: "Claude Sonnet 5.5" },
+      { id: "claude-opus-5-5", label: "Claude Opus 5.5（最准，额度贵 15 倍）" },
+    ] };
+  }
   if (settings.provider === "ollama") {
     // 只列能看图的：纯文本模型选了也跑不了精校
     // 只列能看图、且不是思考版的（思考版在精校里用不了，见 callOllama）
@@ -1005,6 +1045,7 @@ async function callTextModel(settings, prompt, { provider = settings.provider, m
     return payload?.candidates?.[0]?.content?.parts?.map((part) => part.text || "").join("") || "";
   }
   if (provider === "ollama") return callOllamaText(settings, prompt, { model, maxTokens, timeoutMs });
+  if (provider === "claude") return claudeText(prompt, { model: model || settings.claudeModel, effort: "low", timeoutMs: Math.max(timeoutMs, 60000), record: usage.record, purpose: usage.current().purpose || "card" });
   const config = directProviderConfig(provider, settings);
   if (!config?.key) throw new Error(`${config?.label ?? provider} 未配置 Key。`);
   const payload = await postWithRetries(`${config.baseUrl.replace(/\/$/, "")}/chat/completions`, {

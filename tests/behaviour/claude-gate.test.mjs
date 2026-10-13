@@ -81,3 +81,29 @@ test("一起停：别的应用撞上限这边也停；这边撞了写进共用�
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test("给人自己留额度：5 小时合计（应用 + 人自己用 Claude Code）到了 LIMIT - KEEP，批量等着、交互照常；不算应用自己起的会话", async () => {
+  const dir = await setup();
+  const { mkdir } = await import("node:fs/promises");
+  const proj = join(dir, "cc", "-Users-me-proj");
+  const app = join(dir, "cc", "-Users-me--moye-claude");
+  await mkdir(proj, { recursive: true });
+  await mkdir(app, { recursive: true });
+  const line = (id) => JSON.stringify({ timestamp: new Date().toISOString(), requestId: id,
+    message: { id, model: "claude-opus-5-5", usage: { input_tokens: 10_000_000, output_tokens: 0 } } }) + "\n";
+  await writeFile(join(proj, "s.jsonl"), line("m1"));         // $40
+  await writeFile(join(app, "a.jsonl"), line("m2"));          // 应用自己的：不算
+  process.env.CLAUDE_GATE_CC_DIR = join(dir, "cc");
+  process.env.CLAUDE_GATE_LIMIT_5H = "140";
+  process.env.CLAUDE_GATE_KEEP = "100";
+  try {
+    await assert.rejects(withSlot("t", "refine", "batch", async () => {}, { waitMs: 0 }), /busy/);
+    await withSlot("t", "test", "live", async () => {}, { waitMs: 0 });
+    process.env.CLAUDE_GATE_LIMIT_5H = "200";
+    await withSlot("t", "refine", "batch", async () => {}, { waitMs: 0 });
+  } finally {
+    for (const k of ["CLAUDE_GATE_CC_DIR", "CLAUDE_GATE_LIMIT_5H", "CLAUDE_GATE_KEEP"]) delete process.env[k];
+    process.env.CLAUDE_GATE = "";
+    await rm(dir, { recursive: true, force: true });
+  }
+});

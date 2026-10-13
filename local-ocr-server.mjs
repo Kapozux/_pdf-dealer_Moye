@@ -29,6 +29,7 @@ import { bundledHeadlessShell, forgetChromePath, markdownToPdf, markdownTitle, p
 import { createSetup, findSoffice } from "./server/setup.mjs";
 import { AdaptivePacer } from "./server/pacer.mjs";
 import { createReflect } from "./server/reflect.mjs";
+import { claudeEnabled, claudeText } from "./server/claude-text.mjs";
 import { createUsage } from "./server/usage.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -1073,6 +1074,14 @@ async function generateReflectText(prompt) {
 }
 async function generateReflectTextInner(prompt) {
   const settings = await loadSettings();
+  // REFLECT_ENGINE=claude：本机 Claude Code 写（订阅额度，记 $0）；用不了 / 失败照旧往下走（server/claude-text.mjs）
+  if (claudeEnabled()) {
+    try {
+      return await claudeText(prompt, { effort: "medium", timeoutMs: 180000, record: usage.record });
+    } catch (error) {
+      console.warn(`[回顾] Claude Code 失败，改用下面的模型：${String(error?.message ?? error).slice(0, 120)}`);
+    }
+  }
   if (REFLECT_OPENROUTER_MODEL && settings.openrouterKey) {
     try {
       return await callTextModel(settings, prompt, { provider: "openrouter", model: REFLECT_OPENROUTER_MODEL, maxTokens: REFLECT_MAX_TOKENS, timeoutMs: 120000 });

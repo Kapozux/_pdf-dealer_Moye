@@ -831,7 +831,7 @@ const DIRECT_PROVIDER_WEIGHTS = {
   ollama: Number(process.env.MOYE_OLLAMA_CONCURRENCY) || 1,
   // 本机 Claude Code：一页一个 claude 进程（约 230MB）。2026-10-13 实测 5 / 10 / 20 / 40 路都全部成功、没被订阅限流，
   // 吞吐随并发线性涨（20 路 45 页/分钟、40 路 80 页/分钟）。默认 20 是给内存留余地（20 路约 4.6GB）；
-  // 只测过 40 页的突发，持续几百页会不会被限流还没测——见 CLAUDE.md「突发 ≠ 持续」
+  // 持续也测了：两份课件 355 页连跑 6 分钟，355/355 成功、没被限流、内存峰值 5.6GB（CLAUDE.md 代码地图 claude-text 那行）
   claude: Number(process.env.MOYE_CLAUDE_CONCURRENCY) || 20,
 };
 

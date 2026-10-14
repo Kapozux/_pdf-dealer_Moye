@@ -45,6 +45,26 @@ export function findClaude(env = process.env) {
   return cands.find((p) => p && existsSync(p)) ?? null;
 }
 
+/** Claude 现在停着吗（本进程撞了上限，或三个应用共用的额度停了）。 */
+export function claudePaused() {
+  return Date.now() < pausedUntil || !!gatePausedUntil();
+}
+
+// Claude 停着时精校换哪家（2026-10-14 用户：别整页退回文字层）：Kimi 公式最全排第一，其次 OpenRouter、Gemini、Qwen
+export const CLAUDE_STANDINS = ["kimi", "openrouter", "gemini", "qwen"];
+
+/**
+ * 精校的渠道列表（provider 名字）→ Claude 停着时实际该用的。多渠道就去掉 Claude；只剩它一路就换第一家配了 Key 的；
+ * 一家都没配就原样（让 Claude 照常报错、回退文字层）。
+ */
+export function claudeStandIn(providers, isConfigured, paused = claudePaused()) {
+  if (!paused || !providers.includes("claude")) return providers;
+  const rest = providers.filter((p) => p !== "claude");
+  if (rest.length) return rest;
+  const sub = CLAUDE_STANDINS.find((p) => isConfigured(p));
+  return sub ? [sub] : providers;
+}
+
 export function claudeEnabled(env = process.env) {
   return String(env.REFLECT_ENGINE || "").trim().toLowerCase() === "claude" && Date.now() >= pausedUntil && !gatePausedUntil() && !!findClaude(env);
 }

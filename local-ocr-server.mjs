@@ -29,7 +29,7 @@ import { bundledHeadlessShell, forgetChromePath, markdownToPdf, markdownTitle, p
 import { createSetup, findSoffice } from "./server/setup.mjs";
 import { AdaptivePacer } from "./server/pacer.mjs";
 import { createReflect } from "./server/reflect.mjs";
-import { claudeEnabled, claudeText, claudeVision, findClaude } from "./server/claude-text.mjs";
+import { claudeEnabled, claudeStandIn, claudeText, claudeVision, findClaude } from "./server/claude-text.mjs";
 import { createUsage } from "./server/usage.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -921,9 +921,11 @@ async function callConfiguredModel(settings, input, testOnly = false) {
   // 真正精校页面：交给自适应节流器。它按渠道各开一条车道，
   // 成功就慢慢提速、超时就砍半，并总是把活派给空位最多的那条——
   // 于是某个平台崩了，流量会自动流向其他平台，不需要人工切换。
-  const channels = (settings.multiChannel
-    ? configuredChannels(settings)
-    : [{ provider: settings.provider, weight: channelWeight(settings.provider, settings) }])
+  // Claude 停着（撞上限 / 共用额度停了）就换别家，不让整批页退回文字层（server/claude-text.mjs 的 claudeStandIn）
+  const providers = claudeStandIn(settings.multiChannel
+    ? configuredChannels(settings).map((c) => c.provider)
+    : [settings.provider], (p) => providerConfigured(settings, p));
+  const channels = providers.map((provider) => ({ provider, weight: channelWeight(provider, settings) }))
     // slowMs = 该渠道一次尝试的超时。超过它才回来，说明底下必然重试或换过家，
     // 那就是拥塞信号；用统一阈值会把慢渠道的正常响应误杀。
     .map((c) => ({ ...c, slowMs: Math.round(providerTimeout(c.provider) * 1.5) }));

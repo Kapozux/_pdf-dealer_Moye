@@ -1,12 +1,27 @@
-# Moye (墨页) — PDF/PPT/Word/image → Markdown that survives scanned pages, math, and 700-page books
+# Moye (墨页)
 
-Kerwin
+Turn textbooks, homework and PowerPoints into clean, editable Markdown.
 
-Most "PDF to Markdown" tools read the PDF's text layer and stop there. That works on a clean
-export from Word and falls apart on everything you actually need converted: scanned textbooks,
-exam papers full of formulas, tables, slides. Moye is a local tool that runs on your Mac and
-picks the right engine per document — text layer for the easy ones, [Surya](https://github.com/VikParuchuri/surya)
-layout/OCR for the hard ones, and optionally a vision model to proofread each page against its image.
+## Why I made it
+
+I'm Kerwin, a student. Most of my IB textbooks are PDFs with a lot of formulas and tables. The PDF converters
+I tried could only read the text layer the PDF has (which turns formulas into unreadable text), and they were
+really slow, which drove me mad.
+
+So I made Moye in August 2026. It decides what to do based on each page: if there's a text layer, it reads it,
+and if not, OCR ([Surya](https://github.com/VikParuchuri/surya)) does the job. It can also have a vision LLM read
+the pages image by image, with formulas output as LaTeX.
+
+## I actually use it
+
+Moye isn't a project decorated for presentation; it's the tool I use to process my study materials. As of
+October 17, 2026:
+
+- 419 documents, 7,845 pages in total, converted in two months
+- The biggest document it has processed is a 912-page book
+- In one single run of 355 pages of class slides, every page was read by the AI, with no fallbacks to the text layer
+
+Built with Claude Code as a development tool.
 
 [中文说明 / Chinese README](./README.zh.md)
 
@@ -28,7 +43,8 @@ layout/OCR for the hard ones, and optionally a vision model to proofread each pa
 | 700-page, 400 MB book                  | browser dies (~10 MB limit) | ✓ tested |
 | Close the tab mid-conversion           | job lost | job keeps running on the server |
 | Per-page quality report                | ✗ | ✓ which pages to double-check, and why |
-| Vision-model refinement with validation | ✗ | ✓ local Ollama, or Gemini / Kimi / Qwen / OpenRouter, auto-fallback |
+| Vision-model refinement with validation | ✗ | ✓ local Ollama or Claude Code, or Gemini / Kimi / Qwen / OpenRouter, auto-fallback |
+| The other way: Markdown → PDF, many photos → one PDF | ✗ | ✓ |
 
 ## Three modes
 
@@ -77,7 +93,9 @@ Install output goes to `logs/setup.log`. `./uninstall.sh` removes the login serv
 folder removes everything else.
 
 **AI refine** works with a local model through [Ollama](https://ollama.com) (free, page images stay on
-this Mac, much slower than the cloud, one page at a time; not yet benchmarked here) or with an API key for Gemini, Kimi (Moonshot),
+this Mac, one page at a time; measured once so far: 5–15 s per page on a 48 GB Mac), with the local
+[Claude Code](https://claude.com/claude-code) if you have it (one `claude -p` per page on your own subscription, no API key;
+Haiku 5.5 recommended), or with an API key for Gemini, Kimi (Moonshot),
 Qwen (DashScope) or OpenRouter. Keys are stored in `settings.local.json` (mode 0600, gitignored)
 and never sent to the browser in clear text. The recommended local model is picked by RAM:
 `qwen3-vl:8b-instruct` with 16 GB or more, `qwen3-vl:4b-instruct` below that. The Ollama registry can be nearly
@@ -157,7 +175,7 @@ npm run lint
 ## Privacy
 
 Fast and High-accuracy modes never make a network request with your document. AI refine with Ollama
-stays on this machine too. AI refine with a cloud provider sends page images and the text-layer hint to
+stays on this machine too. AI refine with Claude Code (to Anthropic) or a cloud provider sends page images and the text-layer hint to
 the provider you chose, nothing else. Nothing is uploaded to us — there is no "us".
 
 ## License

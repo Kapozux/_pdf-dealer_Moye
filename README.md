@@ -17,7 +17,7 @@ the pages image by image, with formulas output as LaTeX.
 Moye isn't a project decorated for presentation; it's the tool I use to process my study materials. As of
 October 17, 2026:
 
-- 419 documents, 7,845 pages in total, converted in two months
+- 225 documents, about 6,500 pages in total, converted in two months (re-runs and test files not counted)
 - The biggest document it has processed is a 912-page book
 - In one single run of 355 pages of class slides, every page was read by the AI, with no fallbacks to the text layer
 
@@ -25,7 +25,9 @@ Built with Claude Code as a development tool.
 
 [中文说明 / Chinese README](./README.zh.md)
 
-![Moye home: drop PDF / PPT / Word / image files, pick a mode, recent conversions below](./docs/screenshot-home.png)
+![Drop an exam page, pick AI refine, get Markdown with LaTeX (the wait is sped up; the real run took 13 s)](./docs/demo.gif)
+
+![Page check: the original page on the left, the Markdown with rendered LaTeX on the right](./docs/page-check-en.png)
 
 ## What it does that text-layer converters don't
 
@@ -141,6 +143,8 @@ Code map: `local-ocr-server.mjs` (HTTP + provider calls) · `server/queue.mjs` (
 `server/jobstore.mjs` (SQLite + checkpoints) · `app/page.tsx` (the entire UI).
 
 ## Output
+
+![Moye home: drop files, pick a mode, recent conversions on the right](./docs/home-en.png)
 
 - Markdown preview, copy, download; batch drops become a "collection" you can download as one `.md` or a `.zip`.
 - Side-by-side view of the model's final text vs. the local draft, per page.

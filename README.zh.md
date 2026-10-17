@@ -12,7 +12,7 @@
 
 墨页不是为了展示而包装的项目，是我处理学习资料用的工具。截至 2026 年 10 月 17 日：
 
-- 两个月转换了 419 份文档，共 7,845 页
+- 两个月转换了 225 份文档，共约 6,500 页（重复转换和测试文件不算）
 - 处理过的最大文档是一本 912 页的书
 - 一次连续处理 355 页课件，每一页都由 AI 识别完成，没有一页回退到文字层
 
@@ -20,7 +20,9 @@
 
 [English README](./README.md)
 
-![墨页首页：拖入 PDF / PPT / Word / 图片，选模式，下方是最近的转换记录](./docs/screenshot-home.png)
+![拖入一页试卷，选 AI 精校，得到带 LaTeX 公式的 Markdown（等待部分加速了，实际用时 13 秒）](./docs/demo.gif)
+
+![逐页核对：左边是原页面，右边是转出来的 Markdown，公式已渲染](./docs/page-check-zh.png)
 
 ## 只读文字层的工具做不到的
 
@@ -108,6 +110,8 @@ React，不含逻辑                             队列 · 管线 · SQLite
 代码地图：`local-ocr-server.mjs`（HTTP + 服务商调用）· `server/queue.mjs`（按模式分车道、SSE）· `server/convert.mjs`（管线、校验、闸门）· `server/pacer.mjs`（自适应节流）· `server/jobstore.mjs`（SQLite + 存档）· `app/page.tsx`（整个界面）。
 
 ## 输出
+
+![墨页首页：拖入文件、选模式，右边是最近的转换记录](./docs/home-zh.png)
 
 - Markdown 预览、复制、下载；一次拖入多份会变成一个「合集」，可以下载成一份 `.md` 或一个 `.zip`。
 - 逐页对照模型最终稿和本地初稿。

@@ -101,7 +101,8 @@ grep '\[AI失败\]\|\[换供应商\]\|\[换模型\]\|\[模型熔断\]\|\[补救\
 ```
 
 - **浏览器只是观察者**，转换全在服务端。关页面任务照跑。
-- `server/queue.mjs` 按模式限流：fast 4 / balanced 1 / math 1 / ai 1（同时跑几份文档；`MOYE_CONCURRENCY` 调 balanced/math，`MOYE_AI_JOB_CONCURRENCY` 调 ai）
+- `server/queue.mjs` 按模式限流：fast 4 / balanced 1 / math 1 / ai 最多 8（同时跑几份文档；`MOYE_CONCURRENCY` 调 balanced/math，`MOYE_AI_JOB_CONCURRENCY` 调 ai 的硬上限）。AI 车道**按页补满**（`_admits`）：已有文档在跑时，只有它们剩下的页（总页数 − 已完成）填不满 aiGate 上限才再开一份，页数还没报出来的当作填满——大书一份独占，几十份小文件一起跑到填满。2026-10-17 加：Claude 20 路下一次只跑一份 1～2 页的截图 = 20 个名额只用 1 个
+- 重新精校一份**一个字都没识别出来**的记录（例：照片用了本地快速）时，会先清掉它的标签和 AI 标题，跑完由自动打标签照新内容重写；有内容的记录重跑不动标题
 - **取消是真的**：队列给每个任务一个 token，convert.mjs 每领一页之前看一眼，取消后只把在途的几页跑完（`JobCancelled`）。重新精校被取消时记录退回 done、旧结果原样保留（`_settleCancelled`），不会从 Library 消失
 - `server/convert.mjs` 的 `aiGate` 是**全局**闸，限制「此刻打向模型的请求总数」。
   job 级并发只是喂料口，真正的天花板是 aiGate。上限不是固定数，按设置算（local-ocr-server.mjs 的 `aiPageConcurrency` / `channelWeight`）：
@@ -244,7 +245,7 @@ launchctl kickstart -k gui/$(id -u)/com.kapozux.moye-web   # 重启网页服务
 
 | 变量 | 默认 | 含义 |
 |---|---|---|
-| `MOYE_AI_JOB_CONCURRENCY` | 1（2026-08-18 起，原为 48） | 同时跑几份文档（喂料口，非上限）。默认改回 1 是实测结论：全局并发预算（aiGate，按渠道算，单 OpenRouter 默认 40 路，见「架构要点」）是所有文档共享的，开太多份文档只会把预算摊薄，谁都吃不满、谁都不交付；一份文档独占预算跑完最快。只有「一次转很多小文档（每份一两页）」时才该调大，调到「预算 ÷ 平均页数」左右——见 `server/queue.mjs` 里这行的注释 |
+| `MOYE_AI_JOB_CONCURRENCY` | 8（2026-10-17 起；08-18～10-16 是固定 1，更早是 48） | AI 模式最多同时几份文档。实际开几份由「按页补满」决定（见「架构要点」的 queue.mjs）：大书一份就填满全局预算、照旧独占（08-18 改成 1 的那条实测结论——预算摊薄谁都不交付——仍然成立）；小文档才会多份同跑。这个数只是防止一次开太多份的硬上限 |
 | `MOYE_AI_PAGE_CONCURRENCY` | 按渠道权重 | 覆盖全局 aiGate 上限 |
 | `MOYE_PAGE_TIMEOUT_MS` | 30000 | 单次模型调用超时（实测 p50 约 13s）；下面按渠道单独设了的以渠道为准 |
 | `MOYE_TIMEOUT_OPENROUTER` | 30000 | OpenRouter 单次调用超时 |

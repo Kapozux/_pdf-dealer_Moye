@@ -301,6 +301,11 @@ export class JobStore {
         filenameMeaningful === null || filenameMeaningful === undefined ? null : (filenameMeaningful ? 1 : 0), id);
   }
 
+  /** 清掉标签和 AI 标题，下次完成时自动打标签会重写（见 local-ocr-server 的 jobQueue.on("job")） */
+  clearCardMeta(id) {
+    this.db.prepare("UPDATE jobs SET tags = NULL, ai_title = NULL, ai_one_line = NULL, filename_meaningful = NULL WHERE id = ?").run(id);
+  }
+
   /** 回顾 / 资料库统计用的精简行：不带 preview 这种大字段。 */
   reflectRows() {
     return this.db

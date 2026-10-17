@@ -2247,6 +2247,14 @@ export default function Home() {
                     );
                   })}
                 </ul>
+                {mode === "fast" && stagedHasImage && (
+                  // 本地快速只读 PDF 文字层，图片没有文字层：照样跑每张都是「未检测到文字」
+                  //（2026-10-17 一次 34 张截图全空）。不拦着，只说清楚并给一键改模式
+                  <p className="staged-warning">
+                    {t("图片没有文字层，本地快速只会得到空结果。")}
+                    <button type="button" className="staged-dup" onClick={() => { setMode("ai"); if (!settings.aiConfigured) openSettings(); }}>{t("改用 AI 精校")}</button>
+                  </p>
+                )}
                 <button
                   className="primary-button staged-start"
                   type="button"

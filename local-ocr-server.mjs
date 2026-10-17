@@ -1305,6 +1305,8 @@ const jobQueue = new JobQueue({
   // 本机跑 Surya 很吃资源，默认串行（MOYE_CONCURRENCY 只调本机识别）。
   // AI 模式不受它影响：那边限的是文档并发，见 queue.mjs 的 MOYE_AI_JOB_CONCURRENCY。
   concurrency: Number(process.env.MOYE_CONCURRENCY) || 1,
+  // AI 车道按页补满：全局闸此刻的上限（每份 AI 文档开跑时按设置算好写进去）
+  aiPageBudget: () => gateStats().ai.limit,
   // 整份任务包在 usage.scope 里：底下每一次模型调用都记到这个 job.id 名下。
   // 跑完把费用摘要抄进 jobs 表（明细在 usage.db），Library 列表和结果页直接读。
   run: async (job, onProgress, signal) => usage.scope({ ref: job.id, purpose: "refine" }, async () => {
@@ -2013,6 +2015,9 @@ const server = createServer(async (request, response) => {
       await jobStore.backupResult(job.id);   // 留一份 .prev 备份，万一这次结果更差还能手动捞回来
       await writeFile(join(jobStore.dir(job.id), "previous.json"), JSON.stringify(previous), "utf8");
       await writeFile(join(jobStore.dir(job.id), "refine.json"), JSON.stringify({ only }), "utf8");
+      // 上次一个字都没识别出来（例：照片用了本地快速），标题标签是照着空结果写的「无文字图片」；
+      // 清掉，这次跑完由自动打标签照新内容重写。有内容的不动：重跑精校主题大概率不变
+      if (!job.char_count) jobStore.clearCardMeta(job.id);
       jobStore.update(job.id, {
         status: "queued",
         detail: only === "fallback"

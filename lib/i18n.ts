@@ -292,6 +292,8 @@ export const en: Record<string, string> = {
   "浅色": "Light",
   "深色": "Dark",
   "{n} 页": "{n} pages",
+  "图片没有文字层，本地快速只会得到空结果。": "Images have no text layer, so Fast mode will come back empty.",
+  "改用 AI 精校": "Use AI refine",
   "搜索文件名、标签或正文…": "Search names, tags or text…",
   "按质量筛选": "Filter by quality",
   "有回退页 {n}": "With fallback pages {n}",

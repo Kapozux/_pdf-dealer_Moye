@@ -273,6 +273,7 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 .library-hits mark { padding:0 1px; border-radius:3px; background:var(--mark); color:inherit; }
 /* 待转区预检 */
 .staged-dup { flex:none; padding:2px 8px; border:1px solid rgba(var(--warm-rgb),.3); border-radius:999px; background:var(--c-f6ece3-bg); color:var(--c-874b31-fg); font-size:12px; cursor:pointer; white-space:nowrap; }
+.staged-warning { margin:8px 0 0; display:flex; flex-wrap:wrap; align-items:center; justify-content:center; gap:8px; font-size:12px; color:var(--c-874b31-fg); }
 .staged-estimate { margin:6px 0 0; font-size:12px; opacity:.7; text-align:center; font-variant-numeric:tabular-nums; }
 /* 顶栏「进行中」弹层 */
 .running-list { min-width:300px; max-width:min(420px, calc(100vw - 32px)); }

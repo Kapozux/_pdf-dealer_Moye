@@ -103,7 +103,7 @@ test("重新精校跑到一半被取消：记录退回完成，旧结果原样�
 test("重新精校还在排队就被取消：同样退回完成", () =>
   withDir(async (dir) => {
     const store = new JobStore(dir);
-    const queue = new JobQueue({ store, run: fakeRun });   // AI 模式默认一次只跑一份
+    const queue = new JobQueue({ store, run: fakeRun, concurrency: { ai: 1 } });   // 一次只跑一份，第二份才会排着
     store.create({ id: "first", filename: "first.pdf", fileSize: 1, mode: "ai" });
     await doneJob(store, "waiting");
     queue.enqueue("first");

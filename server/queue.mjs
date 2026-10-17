@@ -17,8 +17,10 @@ export class JobQueue extends EventEmitter {
    * @param {(job: object, onProgress: Function, signal: {cancelled: boolean}) => Promise<object>} opts.run
    * @param {Record<string, number>|number} opts.concurrency 每种模式各自的上限；
    *        传数字只覆盖本机模式（balanced/math），AI 不跟着变——见下面 ai 的说明。
+   * @param {() => number} [opts.aiPageBudget] 此刻全局能同时打向模型几页（aiGate 的上限）；
+   *        给了它，AI 车道就按页补满，见 _admits。
    */
-  constructor({ store, run, concurrency = {} }) {
+  constructor({ store, run, concurrency = {}, aiPageBudget }) {
     super();
     this.store = store;
     this.run = run;
@@ -48,11 +50,14 @@ export class JobQueue extends EventEmitter {
       // 几十页的文档一份就能吃满 60 路（92 页 = 2 轮 ≈ 30-60 秒），开第二份
       // 只会把两份都拖慢，而产物要整份跑完才落盘，等于两份都晚交付。
       //
-      // 什么时候该调大：一次转很多**小**文档（每份一两页）。那时单份填不满预算，
-      // 并发会闲置，用 MOYE_AI_JOB_CONCURRENCY 调到「预算 ÷ 平均页数」左右。
-      ai: Number(process.env.MOYE_AI_JOB_CONCURRENCY) || 1,
+      // 但一次转很多**小**文档（每份一两页）时，单份填不满预算：2026-10-17 用 Claude
+      // （20 路）转几十张截图，一次只跑一份 = 20 个名额只用 1 个。所以现在按页补满
+      // （_admits）：在跑的 AI 文档剩下的页填不满预算，才再开下一份。大书一份就填满，
+      // 照旧独占；小文档会一起跑到填满为止。这里的数字只是「最多同时几份」的硬上限。
+      ai: Number(process.env.MOYE_AI_JOB_CONCURRENCY) || 8,
       ...overrides,
     };
+    this.aiPageBudget = aiPageBudget;
     this.pending = [];        // 等待中的 job id
     this.active = new Map();  // job id → { cancelled }
   }
@@ -120,7 +125,7 @@ export class JobQueue extends EventEmitter {
     while (this.pending.length) {
       const jobId = this.pending.shift();
       const mode = this.store.get(jobId)?.mode ?? "fast";
-      if ((running[mode] ?? 0) >= this._limitFor(mode)) {
+      if (!this._admits(mode, running)) {
         skipped.push(jobId);       // 这个模式满了，留在队列里等
         continue;
       }
@@ -130,6 +135,25 @@ export class JobQueue extends EventEmitter {
       this._start(jobId).catch((error) => console.error(`[队列] 任务 ${jobId} 收尾失败：${String(error?.message ?? error).slice(0, 200)}`));
     }
     this.pending = skipped.concat(this.pending);
+  }
+
+  /**
+   * 这个模式还能不能再开一份。AI 车道多一条：已经有文档在跑时，只有它们剩下的页
+   * （总页数 - 已完成，在途的也算）填不满全局预算，才再开。页数还不知道的（刚开始、
+   * 还在读 PDF）当作填满——等它报出页数，_start 里的进度回调会再叫一次 _pump。
+   */
+  _admits(mode, running) {
+    const count = running[mode] ?? 0;
+    if (count >= this._limitFor(mode)) return false;
+    if (mode !== "ai" || count === 0 || !this.aiPageBudget) return true;
+    let remaining = 0;
+    for (const id of this.active.keys()) {
+      const job = this.store.get(id);
+      if (job?.mode !== "ai") continue;
+      if (!(job.total > 0)) return false;
+      remaining += Math.max(0, job.total - job.page);
+    }
+    return remaining < this.aiPageBudget();
   }
 
   /**
@@ -171,6 +195,8 @@ export class JobQueue extends EventEmitter {
         detail: String(detail).slice(0, 200),
       });
       this._emitJob(jobId);
+      // AI 车道按剩余页数放行：页数刚报出来、或又跑完几页，排队的文档可能就能进来了
+      if (this.pending.length) this._pump();
     };
 
     try {

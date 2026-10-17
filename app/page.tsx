@@ -1912,7 +1912,7 @@ export default function Home() {
           </div>
         )}
         <div className="library-card-footer">
-          <span>{record.page_count} {t("页")}</span>
+          <span>{t("{n} 页", { n: record.page_count })}</span>
           <span>{formatSize(record.file_size)}</span>
           <span>{record.ai_pages ? t("{n} 页 AI 精校", { n: record.ai_pages }) : t(modeNames[record.mode]) || t("旧版转换")}</span>
           {(() => { const q = qualityBadge(record); return <span className={`quality ${q.tone}`}><i />{q.text}</span>; })()}
@@ -2292,7 +2292,7 @@ export default function Home() {
                       <span className="recent-name">{recordTitle(record)}</span>
                       {record.ai_one_line ? <span className="recent-line">{record.ai_one_line}</span> : null}
                       <span className="recent-meta">
-                        {record.page_count} {t("页")} · {record.ai_pages ? t("AI 精校") : t(modeNames[record.mode]) || t("旧版")} · {formatDate(new Date(record.updated_at).getTime())}
+                        {t("{n} 页", { n: record.page_count })} · {record.ai_pages ? t("AI 精校") : t(modeNames[record.mode]) || t("旧版")} · {formatDate(new Date(record.updated_at).getTime())}
                         {(() => { const q = qualityBadge(record); return <em className={`quality ${q.tone}`}><i />{q.text}</em>; })()}
                       </span>
                     </button>

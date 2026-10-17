@@ -61,7 +61,7 @@ button { color:inherit; }
 .profile-head small { font-size:12px; line-height:1.45; color:rgba(var(--ink-rgb),.55); text-align:right; }
 .field-label { font-size:12px; letter-spacing:.12em; opacity:.46; text-transform:uppercase; }
 .profile-row strong { font-size:13px; }
-.profile-options { display:grid; grid-template-columns:repeat(3,1fr); gap:3px; border:1px solid var(--line); border-radius:10px; padding:3px; background:rgba(var(--surface-rgb),.46); }
+.profile-options { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:3px; border:1px solid var(--line); border-radius:10px; padding:3px; background:rgba(var(--surface-rgb),.46); }
 .profile-options button { padding:8px 13px; border:0; border-radius:7px; background:transparent; font-size:12px; cursor:pointer; }
 .profile-options button.active { color:var(--on-fill); background:var(--green-fill); }
 /* 最近转换：首页直接能点开刚转完的那几份 */
@@ -84,7 +84,7 @@ button { color:inherit; }
 .quality.good { color:var(--c-3b8a61-fg); }
 /* 模式按钮下面一行小字：多快、花不花钱、上不上传 */
 .profile-options button { display:flex; flex-direction:column; align-items:center; gap:2px; }
-.profile-options button small { font-size:12px; opacity:.6; letter-spacing:.02em; white-space:nowrap; }
+.profile-options button small { font-size:12px; opacity:.6; letter-spacing:.02em; text-align:center; }
 .profile-options button.active small { opacity:.85; }
 /* 精校范围放在模式旁边（选了 AI 才出现） */
 .scope-inline { display:flex; align-items:center; gap:14px; flex-wrap:wrap; margin:0 10px 6px 16px; padding:9px 12px; border:1px dashed rgba(var(--green-rgb),.3); border-radius:10px; font-size:12px; }

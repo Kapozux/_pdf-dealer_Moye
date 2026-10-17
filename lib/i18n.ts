@@ -630,7 +630,12 @@ export function t(key: string, vars?: Record<string, string | number>): string {
       text = text.split(`{${name}}`).join(String(value));
     }
   }
-  return text;
+  return activeLang === "en" ? singularPages(text) : text;
+}
+
+/** 英文单数：「1 pages」→「1 page」（「21 pages」「1/1 pages」不动） */
+function singularPages(text: string): string {
+  return text.replace(/(^|[^\d./])1 pages\b/g, "$11 page");
 }
 
 /**
@@ -716,7 +721,7 @@ export function tServer(text: string | null | undefined): string {
   if (activeLang !== "en") return text;
   for (const [pattern, replacement] of serverPatterns) {
     const m = text.match(pattern);
-    if (m) return replacement.replace(/\$(\d)/g, (_, i) => m[Number(i)] ?? "");
+    if (m) return singularPages(replacement.replace(/\$(\d)/g, (_, i) => m[Number(i)] ?? ""));
   }
   return text;
 }

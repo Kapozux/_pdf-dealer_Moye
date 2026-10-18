@@ -1090,7 +1090,7 @@ async function generateCardMeta(job) {
     callTextModel(settings, CARD_PROMPT(stripSourceExtension(job.filename), content), { maxTokens: 400 }));
   const parsed = extractJson(raw);
   const tags = Array.isArray(parsed?.tags)
-    ? parsed.tags.map((t) => String(t).trim().slice(0, 10)).filter(Boolean).slice(0, 4)
+    ? parsed.tags.map((t) => String(t).trim().slice(0, 24)).filter(Boolean).slice(0, 4)
     : [];
   if (!tags.length) return null;
   return {

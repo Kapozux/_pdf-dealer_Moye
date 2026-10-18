@@ -58,7 +58,6 @@ export const en: Record<string, string> = {
   "页": "pages",
   "字": "chars",
   "份文件": "files",
-  "份文件 ·": "files ·",
   "份文档": "documents",
   "旧版": "legacy",
   "旧版转换": "legacy conversion",

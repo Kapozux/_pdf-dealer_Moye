@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { Fragment, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { aiStaysLocal, defaultAiSettings, draftFromSaved, fetchAiModels, fetchSetup, getAiSettings, installComponent, patchAiSettings, saveAiSettings, testAiSettings, type AiModelOption, type AiProvider, type AiSettings, type ModelSource, type SetupComponent, type SetupStatus } from "../lib/ai-settings";
 import { type ConversionMode, type ConversionResult, type PageResult } from "../lib/pdf-to-markdown";
 import { fallbackCause, isFallback, outcome, parseAiReason } from "../lib/page-result.mjs";
@@ -465,7 +465,8 @@ function stripExt(name: string) {
 /** 列表里显示的名字：原文件名不像标题（AI 判定）就用 AI 起的标题，规则同 docDownloadName。 */
 function recordTitle(record: Pick<Job, "filename" | "ai_title" | "filename_meaningful">) {
   const aiTitle = (record.ai_title || "").trim();
-  return record.filename_meaningful === 0 && aiTitle ? aiTitle : stripExt(record.filename);
+  // 下载来的书名常是 Physics_for_the_IB___London__…：只在显示时把下划线当空格
+  return record.filename_meaningful === 0 && aiTitle ? aiTitle : stripExt(record.filename).replace(/_+/g, " ").replace(/\s+/g, " ").trim();
 }
 
 /**
@@ -1899,7 +1900,7 @@ export default function Home() {
     const tags = parseTags(record.tags).slice(0, 3);
     const hits = textHits.get(record.id);
     return (
-      <article className="library-row" key={record.id}>
+      <article className={`library-row ${why ? "found" : ""}`} key={record.id}>
         <label className="library-select" title={t("选中用于合并下载")}>
           <input
             type="checkbox"
@@ -1911,16 +1912,17 @@ export default function Home() {
         <button className="library-row-open" type="button" onClick={() => openRecord(record)} aria-label={t("打开 {name}", { name: record.filename })}>
           <span className="library-row-title">
             <strong title={record.filename}>{recordTitle(record)}</strong>
-            {tags.length > 0 && <span className="card-tags">{tags.map((tag) => <i key={tag}>{tag}</i>)}</span>}
+            {tags.length > 0 && <span className="library-row-tags">{tags.join(" · ")}</span>}
           </span>
           <span className="library-row-sub">
-            {why ? <><b>{t("AI：")}</b>{why}</> : record.ai_one_line || record.preview || t("没有可预览的文字")}
+            {why ? <><b aria-label={t("AI：")}>✦</b>{why}</> : record.ai_one_line || record.preview || t("没有可预览的文字")}
           </span>
         </button>
         <span className="library-row-meta">
+          {/* 全过的不标：一屏十几个绿点等于没标，只留要处理的 */}
+          <span className={`quality ${quality.tone}`}>{quality.tone !== "good" && <><i />{quality.text}</>}</span>
           <span>{t("{n} 页", { n: record.page_count })}</span>
           <span title={formatDate(new Date(record.updated_at).getTime())}>{fmtShortDate(record.updated_at)}</span>
-          <span className={`quality ${quality.tone}`}><i />{quality.text}</span>
         </span>
         <MoreMenu label={t("{name} 的更多操作", { name: recordTitle(record) })}>
           {(close) => (
@@ -2106,14 +2108,18 @@ export default function Home() {
         <section className="library-view">
           {/* 顶上原来的大标题（LOCAL DOCUMENT LIBRARY / 你的分析资料库）占半屏，去掉了；「新转换」在顶栏 */}
           <h1 className="visually-hidden">{t("你的分析资料库")}</h1>
+          {/* 搜索框是这页唯一的主角：打字即筛，回车 / 「问 AI」让 AI 按描述找；数量、筛选、整包下载退到下面一行小字 */}
           <form className="library-toolbar" role="search" onSubmit={(event) => { event.preventDefault(); void askLibrary(); }}>
             <label className="library-search">
               <span aria-hidden="true">⌕</span>
               <input value={query} onChange={(event) => { setQuery(event.target.value); if (event.target.value.trim().length < 2) setTextHits(new Map()); }} placeholder={t("搜文件名、标签、正文；或写一句话，按「问」让 AI 找")} aria-label={t("搜索资料库")} />
             </label>
-            <button className="secondary-button library-ask-button" type="submit" disabled={!query.trim() || ask.status === "loading"} title={t("让 AI 按你的描述找文件")}>
-              {ask.status === "loading" ? t("找…") : t("问")}
+            <button className="library-ask-button" type="submit" disabled={!query.trim() || ask.status === "loading"} title={t("让 AI 按你的描述找文件")}>
+              <span aria-hidden="true">✦</span>{ask.status === "loading" ? t("找…") : t("问")}<kbd aria-hidden="true">↵</kbd>
             </button>
+          </form>
+          <div className="library-subbar">
+            <span className="library-count">{t("{n} 份 · {pages} 页", { n: library.length, pages: library.reduce((sum, item) => sum + item.page_count, 0) })}</span>
             {(qualityCounts.fallback > 0 || qualityCounts.review > 0) && (
               // 只放两个、带数字、为 0 的不出现（Verbatim 每个引擎一颗筛选，手机上折成 5 行——不学）
               <div className="quality-filters" role="group" aria-label={t("按质量筛选")}>
@@ -2121,7 +2127,6 @@ export default function Home() {
                 {qualityCounts.review > 0 && <button type="button" className={qualityFilter === "review" ? "active" : ""} aria-pressed={qualityFilter === "review"} onClick={() => setQualityFilter((f) => (f === "review" ? "all" : "review"))}>{t("建议复核 {n}", { n: qualityCounts.review })}</button>}
               </div>
             )}
-            <span className="library-count"><strong>{library.length}</strong> {t("份文件 ·")} <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> {t("页")}</span>
             {library.length > 0 && (
               <MoreMenu label={t("资料库操作")}>
                 {(close) => (
@@ -2130,12 +2135,12 @@ export default function Home() {
                 )}
               </MoreMenu>
             )}
-          </form>
+          </div>
           {ask.status !== "idle" && (
             <section className={`library-ask ${ask.status}`} aria-live="polite" aria-label={t("「问」的结果")}>
               <div className="library-ask-head">
                 <span>
-                  {ask.status === "loading" && t("在 {n} 份文档的目录里找「{q}」… {time}", { n: ask.considered, q: ask.q, time: formatElapsed(now - ask.startedAt) })}
+                  {ask.status === "loading" && <><i className="library-ask-spinner" aria-hidden="true" />{t("在 {n} 份文档的目录里找「{q}」… {time}", { n: ask.considered, q: ask.q, time: formatElapsed(now - ask.startedAt) })}</>}
                   {ask.status === "done" && (ask.results.length
                     ? t("AI 找到 {k} 份像「{q}」的", { k: ask.results.length, q: ask.q })
                     : t("AI 在 {n} 份里没找到像「{q}」的，换个说法试试", { n: ask.considered, q: ask.q }))}
@@ -2173,9 +2178,10 @@ export default function Home() {
           {libraryLoading ? (
             <div className="library-empty"><span className="library-empty-mark">{t("墨")}</span><h2>{t("正在读取资料库…")}</h2></div>
           ) : filteredLibrary.length ? (
-            <>
+            // 整个资料库是一张连续的表；合集是表里的一行，点开在下面缩进展开
+            <div className={`library-list ${selectedLibraryIds.size ? "selecting" : ""}`}>
               {libraryTimeline.map((row) => {
-                if (!row.batch) return <div className="library-list" key={row.key}>{row.items.map((record) => renderLibraryRow(record))}</div>;
+                if (!row.batch) return <Fragment key={row.key}>{row.items.map((record) => renderLibraryRow(record))}</Fragment>;
                 const batch = row.batch;
                 const open = Boolean(query.trim()) || qualityFilter !== "all" || openBatches.has(batch.id);
                 return (
@@ -2184,7 +2190,7 @@ export default function Home() {
                       <button type="button" className="library-batch-toggle" aria-expanded={open} onClick={() => setOpenBatches((prev) => { const next = new Set(prev); if (next.has(batch.id)) next.delete(batch.id); else next.add(batch.id); return next; })}>
                         <i aria-hidden="true">{open ? "▾" : "▸"}</i>
                         <strong>{batch.label || t("批量转换")}</strong>
-                        <span>{t("{n} 份 · {pages} 页", { n: batch.total, pages: batch.pages })}{batch.failed ? ` ${t("· {n} 份失败", { n: batch.failed })}` : ""}{batch.active ? ` ${t("· {n} 份进行中", { n: batch.active })}` : ""}</span>
+                        <span>{/* 自动起的名字本来就是「34 份 · 10/17 22:15」，不再重复份数 */}{batch.label?.startsWith(`${batch.total} `) ? t("{n} 页", { n: batch.pages }) : t("{n} 份 · {pages} 页", { n: batch.total, pages: batch.pages })}{batch.failed ? ` ${t("· {n} 份失败", { n: batch.failed })}` : ""}{batch.active ? ` ${t("· {n} 份进行中", { n: batch.active })}` : ""}</span>
                       </button>
                       <MoreMenu label={t("合集操作")}>
                         {(close) => (
@@ -2195,11 +2201,11 @@ export default function Home() {
                         )}
                       </MoreMenu>
                     </div>
-                    {open && <div className="library-list nested">{row.items.map((record) => renderLibraryRow(record))}</div>}
+                    {open && <div className="library-nested">{row.items.map((record) => renderLibraryRow(record))}</div>}
                   </section>
                 );
               })}
-            </>
+            </div>
           ) : (
             // 「问」的结果摆着时，下面的即时筛选拿整句话当关键词，十有八九是空的——不再说「没有匹配的文件」
             ask.status !== "idle" ? null : <div className="library-empty"><span className="library-empty-mark">{t("墨")}</span><h2>{query ? t("没有匹配的文件") : t("资料库还是空的")}</h2><p>{query ? t("换个关键词试试。") : t("完成第一次转换后，文件会自动出现在这里。")}</p>{!query && <button className="primary-button" type="button" onClick={reset}>{t("开始第一次转换")}</button>}</div>

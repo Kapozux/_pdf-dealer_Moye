@@ -294,6 +294,20 @@ export const en: Record<string, string> = {
   "{n} 页": "{n} pages",
   "图片没有文字层，本地快速只会得到空结果。": "Images have no text layer, so Fast mode will come back empty.",
   "改用 AI 精校": "Use AI refine",
+  "{name} 的更多操作": "More for {name}",
+  "搜文件名、标签、正文；或写一句话，按「问」让 AI 找": "Search names, tags, text, or describe it and press Ask",
+  "让 AI 按你的描述找文件": "Let AI find files from your description",
+  "找…": "Finding…",
+  "问": "Ask",
+  "资料库操作": "Library actions",
+  "「问」的结果": "Ask results",
+  "在 {n} 份文档的目录里找「{q}」… {time}": "Looking through {n} documents for “{q}”… {time}",
+  "AI 找到 {k} 份像「{q}」的": "AI found {k} that look like “{q}”",
+  "AI 在 {n} 份里没找到像「{q}」的，换个说法试试": "Nothing among {n} looks like “{q}”. Try saying it differently",
+  "没找成：{reason}": "Couldn't search: {reason}",
+  "收起": "Close",
+  "合集操作": "Collection actions",
+  "AI：": "AI: ",
   "搜索文件名、标签或正文…": "Search names, tags or text…",
   "按质量筛选": "Filter by quality",
   "有回退页 {n}": "With fallback pages {n}",
@@ -645,6 +659,9 @@ function singularPages(text: string): string {
  * 常见的几十种；对不上的原样返回。模式按出现频率排，先匹配先用。
  */
 const serverPatterns: [RegExp, string][] = [
+  // 「问」（local-ocr-server.mjs /api/library/find、server/find.mjs）
+  [/^「问」要用 AI：先在设置里配好一家服务商。$/, "Ask needs AI: set up a provider in Settings first."],
+  [/^先写一句你要找什么。$/, "Write what you're looking for first."],
   // 进度（server/convert.mjs、queue.mjs、jobstore.mjs）
   [/^已完成 (\d+)\/(\d+) 页$/, "Done $1/$2 pages"],
   [/^读取文字层作为提示 (\d+)\/(\d+) 页，随后交给视觉模型$/, "Reading text layer $1/$2 pages as hints, then the vision model"],

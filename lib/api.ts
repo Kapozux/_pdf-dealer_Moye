@@ -305,6 +305,18 @@ export async function searchLibrary(query: string): Promise<SearchResult[]> {
   return results ?? [];
 }
 
+/** 「问」找到的一份：哪份文档、为什么是它。 */
+export type FoundDoc = { id: string; why: string };
+
+/** 「问」：一句话描述要找的文件，服务端把整库目录交给 AI 挑（server/find.mjs）。约 10～30 秒。 */
+export async function findInLibrary(q: string): Promise<{ results: FoundDoc[]; considered: number }> {
+  return asJson(await fetch(`${SERVICE_BASE}/api/library/find`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ q }),
+  }));
+}
+
 export function libraryPdfUrl(id: string): string {
   return `${SERVICE_BASE}/api/library/${id}/pdf`;
 }

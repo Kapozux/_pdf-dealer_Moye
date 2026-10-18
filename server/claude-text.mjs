@@ -71,7 +71,8 @@ export function claudeEnabled(env = process.env) {
 
 // 三个应用共用额度的分配器（claude-gate.mjs）：精校一页、打标签 = batch，测试连接 = live，其余（回顾）normal
 const GATE_APP = "moye";
-const prioOf = (purpose) => (purpose === "test" ? "live" : purpose === "refine" || purpose === "card" ? "batch" : "normal");
+// 「问」（find）是用户在页面上等着的，跟测试连接一样算交互
+const prioOf = (purpose) => (purpose === "test" || purpose === "find" ? "live" : purpose === "refine" || purpose === "card" ? "batch" : "normal");
 
 function run(bin, args, input, opts) {
   const prio = prioOf(opts.purpose);

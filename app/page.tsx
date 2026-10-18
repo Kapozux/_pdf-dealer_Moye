@@ -7,7 +7,7 @@ import { fallbackCause, isFallback, outcome, parseAiReason } from "../lib/page-r
 import { explainError, summarizeCauses, type ErrorKind } from "../lib/explain-error.mjs";
 import { newRow, rowsFromSaved, rowsToPayload, type KeyRow } from "../lib/key-pool.mjs";
 import {
-  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPageImageUrl, libraryPdfUrl, listJobs, searchLibrary, type SearchResult,
+  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPageImageUrl, libraryPdfUrl, listJobs, searchLibrary, findInLibrary, type FoundDoc, type SearchResult,
   exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineCostPerPage, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
   type Batch, type Job, type Reflect, type ReflectRange, type SpeedTable, type Stats, type TagBackfillState, type Usage, type UsageRow,
 } from "../lib/api";
@@ -341,6 +341,13 @@ function niceCeil(v: number) {
   const p = Math.pow(10, Math.floor(Math.log10(v)));
   for (const k of [1, 2, 3, 4, 5, 6, 8, 10]) if (k * p >= v) return k * p;
   return 10 * p;
+}
+
+/** 列表里的短日期：今年的只写月/日，往年的带年份 */
+function fmtShortDate(iso: string) {
+  const date = new Date(iso);
+  const md = `${date.getMonth() + 1}/${date.getDate()}`;
+  return date.getFullYear() === new Date().getFullYear() ? md : `${date.getFullYear()}/${md}`;
 }
 
 function fmtDay(iso: string) {
@@ -724,6 +731,11 @@ export default function Home() {
   const [libraryLoading, setLibraryLoading] = useState(true);
   const [libraryError, setLibraryError] = useState("");
   const [query, setQuery] = useState("");
+  // 「问」：一句话找文件。结果摆在列表上方，清掉就回到普通列表
+  const [ask, setAsk] = useState<{ status: "idle" | "loading" | "done" | "error"; q: string; results: FoundDoc[]; considered: number; error: string; startedAt: number }>(
+    { status: "idle", q: "", results: [], considered: 0, error: "", startedAt: 0 });
+  // 合集默认折起来；搜索 / 筛选时全部展开（不然命中的那份藏在折叠里看不到）
+  const [openBatches, setOpenBatches] = useState<Set<string>>(new Set());
   // 正文全文搜索的结果（id → 命中），和文件名 / 标签过滤合在一起用；quality 是「有回退页 / 建议复核」筛选
   const [textHits, setTextHits] = useState<Map<string, SearchResult>>(new Map());
   const [qualityFilter, setQualityFilter] = useState<"all" | "fallback" | "review">("all");
@@ -840,12 +852,12 @@ export default function Home() {
   useEffect(() => () => { if (sourceUrl) URL.revokeObjectURL(sourceUrl); }, [sourceUrl]);
   // 计时器只在真的有东西在跑时才转；跑完（runEndedAt 有值）立刻停，避免空转重渲染
   useEffect(() => {
-    const live = activeJobs.length > 0 || batchRunning || status === "processing"
+    const live = activeJobs.length > 0 || batchRunning || status === "processing" || ask.status === "loading"
       || (runStartedAt !== null && runEndedAt === null && status === "batch");
     if (!live) return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, [activeJobs.length, batchRunning, status, runStartedAt, runEndedAt]);
+  }, [activeJobs.length, batchRunning, status, runStartedAt, runEndedAt, ask.status]);
   // 开页拉一次 + 订阅 SSE：关掉页面再回来，也能看到还在跑的任务
   /**
    * 订阅服务端任务进度。
@@ -1061,6 +1073,8 @@ export default function Home() {
     // 文件名、AI 打的标签、正文（服务端全文搜索）都搜；正文命中的按命中次数排在前面
     const nameOrTag = (item: Job) =>
       item.filename.toLocaleLowerCase().includes(normalized)
+      || (item.ai_title ?? "").toLocaleLowerCase().includes(normalized)
+      || (item.ai_one_line ?? "").toLocaleLowerCase().includes(normalized)
       || parseTags(item.tags).some((tag) => tag.toLocaleLowerCase().includes(normalized));
     return byQuality
       .filter((item) => nameOrTag(item) || textHits.has(item.id))
@@ -1879,9 +1893,13 @@ export default function Home() {
     }
   }
 
-  function renderLibraryCard(record: Job) {
+  /** Library 一行：标题 + 标签、一句话（「问」的结果换成 AI 说的理由）、页数 · 日期 · 质量、⋯ */
+  function renderLibraryRow(record: Job, why?: string) {
+    const quality = qualityBadge(record);
+    const tags = parseTags(record.tags).slice(0, 3);
+    const hits = textHits.get(record.id);
     return (
-      <article className="library-card" key={record.id}>
+      <article className="library-row" key={record.id}>
         <label className="library-select" title={t("选中用于合并下载")}>
           <input
             type="checkbox"
@@ -1890,37 +1908,56 @@ export default function Home() {
             aria-label={t("选中 {name} 用于合并下载", { name: record.filename })}
           />
         </label>
-        <button className="library-open" type="button" onClick={() => openRecord(record)} aria-label={t("打开 {name}", { name: record.filename })}>
-          <span className="library-file-icon">MD<i>PDF</i></span>
-          <span className="library-card-body">
-            <span className="library-card-meta">{formatDate(new Date(record.updated_at).getTime())}</span>
+        <button className="library-row-open" type="button" onClick={() => openRecord(record)} aria-label={t("打开 {name}", { name: record.filename })}>
+          <span className="library-row-title">
             <strong title={record.filename}>{recordTitle(record)}</strong>
-            <span className="library-card-preview">{record.ai_one_line || record.preview || t("没有可预览的文字")}</span>
-            {parseTags(record.tags).length > 0 && (
-              <span className="card-tags">{parseTags(record.tags).map((tag) => <i key={tag}>{tag}</i>)}</span>
-            )}
+            {tags.length > 0 && <span className="card-tags">{tags.map((tag) => <i key={tag}>{tag}</i>)}</span>}
+          </span>
+          <span className="library-row-sub">
+            {why ? <><b>{t("AI：")}</b>{why}</> : record.ai_one_line || record.preview || t("没有可预览的文字")}
           </span>
         </button>
-        {textHits.get(record.id) && (
+        <span className="library-row-meta">
+          <span>{t("{n} 页", { n: record.page_count })}</span>
+          <span title={formatDate(new Date(record.updated_at).getTime())}>{fmtShortDate(record.updated_at)}</span>
+          <span className={`quality ${quality.tone}`}><i />{quality.text}</span>
+        </span>
+        <MoreMenu label={t("{name} 的更多操作", { name: recordTitle(record) })}>
+          {(close) => (
+            <>
+              <button type="button" role="menuitem" onClick={() => { close(); window.location.href = exportZipUrl({ ids: [record.id] }); }}>{t("下载")}</button>
+              <button type="button" role="menuitem" onClick={() => { close(); void removeRecord(record); }}>{t("删除")}</button>
+            </>
+          )}
+        </MoreMenu>
+        {hits && (
           <div className="library-hits">
-            <span>{t("正文命中 {n} 处", { n: textHits.get(record.id)!.count })}</span>
-            {textHits.get(record.id)!.hits.slice(0, 2).map((hit, index) => (
+            <span>{t("正文命中 {n} 处", { n: hits.count })}</span>
+            {hits.hits.slice(0, 2).map((hit, index) => (
               <button key={`${hit.page}:${index}`} type="button" onClick={() => { setCameFrom("library"); navigate({ name: "doc", id: record.id, page: hit.page }); }}>
                 <b>{t("第 {n} 页", { n: hit.page })}</b> {hit.before}<mark>{hit.match}</mark>{hit.after}
               </button>
             ))}
           </div>
         )}
-        <div className="library-card-footer">
-          <span>{t("{n} 页", { n: record.page_count })}</span>
-          <span>{formatSize(record.file_size)}</span>
-          <span>{record.ai_pages ? t("{n} 页 AI 精校", { n: record.ai_pages }) : t(modeNames[record.mode]) || t("旧版转换")}</span>
-          {(() => { const q = qualityBadge(record); return <span className={`quality ${q.tone}`}><i />{q.text}</span>; })()}
-          <a href={exportZipUrl({ ids: [record.id] })} download aria-label={t("下载 {name}", { name: record.filename })}>{t("下载")}</a>
-          <button type="button" onClick={() => void removeRecord(record)} aria-label={t("删除 {name}", { name: record.filename })}>{t("删除")}</button>
-        </div>
       </article>
     );
+  }
+
+  /** 「问」：把搜索框里的这句话交给 AI，在整库目录里挑 */
+  async function askLibrary() {
+    const q = query.trim();
+    if (!q || ask.status === "loading") return;
+    setNow(Date.now());
+    setAsk({ status: "loading", q, results: [], considered: library.length, error: "", startedAt: Date.now() });
+    try {
+      const found = await findInLibrary(q);
+      setAsk((prev) => (prev.q === q ? { ...prev, status: "done", results: found.results, considered: found.considered } : prev));
+    } catch (caught) {
+      const message = caught instanceof Error ? tServer(caught.message) : String(caught);
+      console.warn("[问] 失败：", caught);
+      setAsk((prev) => (prev.q === q ? { ...prev, status: "error", error: message } : prev));
+    }
   }
 
   function openRecord(record: Job) {
@@ -2050,7 +2087,7 @@ export default function Home() {
           <button className="lang-toggle theme-toggle" type="button" onClick={cycleTheme} aria-label={t("外观：{mode}", { mode: t(themeNames[theme]) })} title={t("外观：{mode}（点一下切换）", { mode: t(themeNames[theme]) })}>{themeIcons[theme]}</button>
           <button className="lang-toggle" type="button" onClick={toggleLang} aria-label="Switch language" title={lang === "en" ? "切换到中文 / Switch to Chinese" : "Switch to English"}>{lang === "en" ? "中文" : "EN"}</button>
           <button className="settings-button" type="button" onClick={openSettings}>{t("⚙ 设置")}</button>
-          {status !== "idle" && !batchRunning && <button className="quiet-button" type="button" onClick={reset}>{t("＋ 新转换")}</button>}
+          {(status !== "idle" || screen === "library") && !batchRunning && <button className="quiet-button" type="button" onClick={reset}>{t("＋ 新转换")}</button>}
           {/* 这颗标签必须说实话：本地模式的正文不上传，但打标签会把开头一小段发给模型——以前这里一律写"文件不上传"。
               文案压短到一行放得下（长句在窄窗口会被截断，隐私提示截了一半等于没说），完整说明放 title。 */}
           {aiWasUsed && aiStaysLocal(settings) ? (
@@ -2067,12 +2104,16 @@ export default function Home() {
 
       {screen === "library" ? (
         <section className="library-view">
-          <header className="library-header">
-            <div><div className="eyebrow">LOCAL DOCUMENT LIBRARY</div><h1>{t("你的分析资料库")}</h1><p>{t("PDF、Markdown、原始初稿与逐页质量记录都保留在这台设备。")}</p></div>
-            <button className="primary-button" type="button" onClick={reset}>{t("＋ 新转换")}</button>
-          </header>
-          <div className="library-toolbar">
-            <label><span aria-hidden="true">⌕</span><input value={query} onChange={(event) => { setQuery(event.target.value); if (event.target.value.trim().length < 2) setTextHits(new Map()); }} placeholder={t("搜索文件名、标签或正文…")} aria-label={t("搜索资料库")} /></label>
+          {/* 顶上原来的大标题（LOCAL DOCUMENT LIBRARY / 你的分析资料库）占半屏，去掉了；「新转换」在顶栏 */}
+          <h1 className="visually-hidden">{t("你的分析资料库")}</h1>
+          <form className="library-toolbar" role="search" onSubmit={(event) => { event.preventDefault(); void askLibrary(); }}>
+            <label className="library-search">
+              <span aria-hidden="true">⌕</span>
+              <input value={query} onChange={(event) => { setQuery(event.target.value); if (event.target.value.trim().length < 2) setTextHits(new Map()); }} placeholder={t("搜文件名、标签、正文；或写一句话，按「问」让 AI 找")} aria-label={t("搜索资料库")} />
+            </label>
+            <button className="secondary-button library-ask-button" type="submit" disabled={!query.trim() || ask.status === "loading"} title={t("让 AI 按你的描述找文件")}>
+              {ask.status === "loading" ? t("找…") : t("问")}
+            </button>
             {(qualityCounts.fallback > 0 || qualityCounts.review > 0) && (
               // 只放两个、带数字、为 0 的不出现（Verbatim 每个引擎一颗筛选，手机上折成 5 行——不学）
               <div className="quality-filters" role="group" aria-label={t("按质量筛选")}>
@@ -2080,12 +2121,38 @@ export default function Home() {
                 {qualityCounts.review > 0 && <button type="button" className={qualityFilter === "review" ? "active" : ""} aria-pressed={qualityFilter === "review"} onClick={() => setQualityFilter((f) => (f === "review" ? "all" : "review"))}>{t("建议复核 {n}", { n: qualityCounts.review })}</button>}
               </div>
             )}
-            <div><strong>{library.length}</strong> {t("份文件 ·")} <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> {t("页")}</div>
+            <span className="library-count"><strong>{library.length}</strong> {t("份文件 ·")} <strong>{library.reduce((sum, item) => sum + item.page_count, 0)}</strong> {t("页")}</span>
             {library.length > 0 && (
-              // 直接用 <a download>：整包由服务端生成并流式下载，不经过 JS 内存
-              <a className="secondary-button" href={exportZipUrl()} download>{t("⭳ 全部打包下载")}</a>
+              <MoreMenu label={t("资料库操作")}>
+                {(close) => (
+                  // 整包由服务端生成并流式下载，不经过 JS 内存
+                  <button type="button" role="menuitem" onClick={() => { close(); window.location.href = exportZipUrl(); }}>{t("⭳ 全部打包下载")}</button>
+                )}
+              </MoreMenu>
             )}
-          </div>
+          </form>
+          {ask.status !== "idle" && (
+            <section className={`library-ask ${ask.status}`} aria-live="polite" aria-label={t("「问」的结果")}>
+              <div className="library-ask-head">
+                <span>
+                  {ask.status === "loading" && t("在 {n} 份文档的目录里找「{q}」… {time}", { n: ask.considered, q: ask.q, time: formatElapsed(now - ask.startedAt) })}
+                  {ask.status === "done" && (ask.results.length
+                    ? t("AI 找到 {k} 份像「{q}」的", { k: ask.results.length, q: ask.q })
+                    : t("AI 在 {n} 份里没找到像「{q}」的，换个说法试试", { n: ask.considered, q: ask.q }))}
+                  {ask.status === "error" && t("没找成：{reason}", { reason: ask.error })}
+                </span>
+                <button type="button" className="quiet-button" onClick={() => setAsk((prev) => ({ ...prev, status: "idle" }))}>{t("收起")}</button>
+              </div>
+              {ask.status === "done" && ask.results.length > 0 && (
+                <div className="library-list">
+                  {ask.results.map((found) => {
+                    const record = library.find((item) => item.id === found.id);
+                    return record ? renderLibraryRow(record, found.why) : null;
+                  })}
+                </div>
+              )}
+            </section>
+          )}
           {selectedLibraryIds.size > 0 && (
             <div className="library-selection-bar">
               <span>{t("已选 {n} 份", { n: selectedLibraryIds.size })}</span>
@@ -2107,35 +2174,35 @@ export default function Home() {
             <div className="library-empty"><span className="library-empty-mark">{t("墨")}</span><h2>{t("正在读取资料库…")}</h2></div>
           ) : filteredLibrary.length ? (
             <>
-              {libraryTimeline.map((row) => (
-                <section className="library-batch" key={row.key}>
-                  {row.batch && (
+              {libraryTimeline.map((row) => {
+                if (!row.batch) return <div className="library-list" key={row.key}>{row.items.map((record) => renderLibraryRow(record))}</div>;
+                const batch = row.batch;
+                const open = Boolean(query.trim()) || qualityFilter !== "all" || openBatches.has(batch.id);
+                return (
+                  <section className="library-batch" key={row.key}>
                     <div className="library-batch-head">
-                      <div>
-                        <strong>{row.batch.label || t("批量转换")}</strong>
-                        <span>{t("{n} 份 · {pages} 页", { n: row.batch.total, pages: row.batch.pages })}{row.batch.failed ? ` ${t("· {n} 份失败", { n: row.batch.failed })}` : ""}{row.batch.active ? ` ${t("· {n} 份进行中", { n: row.batch.active })}` : ""}</span>
-                      </div>
-                      <div className="library-batch-actions">
-                        <button
-                          className="secondary-button"
-                          type="button"
-                          disabled={mergingLibrary}
-                          onClick={() => void downloadMergedMarkdown(row.items.map((item) => item.id), row.batch!.label || t("墨页合集"))}
-                        >
-                          {mergingLibrary ? t("合并中…") : t("⭳ 下载合并 .md")}
-                        </button>
-                        <a className="secondary-button" href={exportZipUrl({ batchId: row.batch.id })} download>{t("⭳ 下载这个合集")}</a>
-                      </div>
+                      <button type="button" className="library-batch-toggle" aria-expanded={open} onClick={() => setOpenBatches((prev) => { const next = new Set(prev); if (next.has(batch.id)) next.delete(batch.id); else next.add(batch.id); return next; })}>
+                        <i aria-hidden="true">{open ? "▾" : "▸"}</i>
+                        <strong>{batch.label || t("批量转换")}</strong>
+                        <span>{t("{n} 份 · {pages} 页", { n: batch.total, pages: batch.pages })}{batch.failed ? ` ${t("· {n} 份失败", { n: batch.failed })}` : ""}{batch.active ? ` ${t("· {n} 份进行中", { n: batch.active })}` : ""}</span>
+                      </button>
+                      <MoreMenu label={t("合集操作")}>
+                        {(close) => (
+                          <>
+                            <button type="button" role="menuitem" disabled={mergingLibrary} onClick={() => { close(); void downloadMergedMarkdown(row.items.map((item) => item.id), batch.label || t("墨页合集")); }}>{mergingLibrary ? t("合并中…") : t("⭳ 下载合并 .md")}</button>
+                            <button type="button" role="menuitem" onClick={() => { close(); window.location.href = exportZipUrl({ batchId: batch.id }); }}>{t("⭳ 下载这个合集")}</button>
+                          </>
+                        )}
+                      </MoreMenu>
                     </div>
-                  )}
-                  <div className="library-grid">
-                    {row.items.map((record) => renderLibraryCard(record))}
-                  </div>
-                </section>
-              ))}
+                    {open && <div className="library-list nested">{row.items.map((record) => renderLibraryRow(record))}</div>}
+                  </section>
+                );
+              })}
             </>
           ) : (
-            <div className="library-empty"><span className="library-empty-mark">{t("墨")}</span><h2>{query ? t("没有匹配的文件") : t("资料库还是空的")}</h2><p>{query ? t("换个关键词试试。") : t("完成第一次转换后，文件会自动出现在这里。")}</p>{!query && <button className="primary-button" type="button" onClick={reset}>{t("开始第一次转换")}</button>}</div>
+            // 「问」的结果摆着时，下面的即时筛选拿整句话当关键词，十有八九是空的——不再说「没有匹配的文件」
+            ask.status !== "idle" ? null : <div className="library-empty"><span className="library-empty-mark">{t("墨")}</span><h2>{query ? t("没有匹配的文件") : t("资料库还是空的")}</h2><p>{query ? t("换个关键词试试。") : t("完成第一次转换后，文件会自动出现在这里。")}</p>{!query && <button className="primary-button" type="button" onClick={reset}>{t("开始第一次转换")}</button>}</div>
           )}
         </section>
       ) : status === "idle" ? (

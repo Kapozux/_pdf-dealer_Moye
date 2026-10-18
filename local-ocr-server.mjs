@@ -31,6 +31,7 @@ import { AdaptivePacer } from "./server/pacer.mjs";
 import { createReflect } from "./server/reflect.mjs";
 import { claudeEnabled, claudeStandIn, claudeText, claudeVision, findClaude } from "./server/claude-text.mjs";
 import { createUsage } from "./server/usage.mjs";
+import { findDocuments } from "./server/find.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 // Python 环境（pypdfium2 渲染页面、Pillow 处理图片、可选的 Surya）。
@@ -1728,6 +1729,28 @@ const server = createServer(async (request, response) => {
     if (request.method === "GET" && path === "/api/search") {
       const q = query.get("q") ?? "";
       sendJson(response, 200, { query: q, results: await searchIndex.search(q.slice(0, 200)) });
+      return;
+    }
+
+    // POST /api/library/find { q: "上学期那份热学作业" } → { results: [{ id, why }], considered }
+    // 「问」：整库目录（AI 标题 / 一句话 / 标签）交给当前服务商挑，见 server/find.mjs
+    if (request.method === "POST" && path === "/api/library/find") {
+      const body = await readJson(request);
+      const settings = await loadSettings();
+      if (!providerConfigured(settings, settings.provider)) throw badRequest("「问」要用 AI：先在设置里配好一家服务商。");
+      const started = Date.now();
+      try {
+        const found = await findDocuments(body?.q, {
+          listJobs: () => jobStore.list({ limit: 100000 }),
+          ask: (prompt) => usage.scope({ ref: null, purpose: "find" }, () =>
+            callTextModel(settings, prompt, { maxTokens: 800, timeoutMs: 90000 })),
+        });
+        console.log(`[问] ${found.results.length}/${found.considered} 份 · ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        sendJson(response, 200, found);
+      } catch (error) {
+        console.warn(`[问失败] ${String(error?.message ?? error).slice(0, 200)}`);
+        throw error;
+      }
       return;
     }
 

@@ -321,10 +321,12 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 /* 手机上结果面板高度是固定的：原图和结果上下排、整块一起滚，原图按原比例显示（不再两栏分一个面板的高度） */
 @media (max-width:700px) { .page-check{overflow:auto}.page-check-body{display:block;flex:none}.page-check-image{overflow:visible;padding:10px}.page-check-text{border-left:0;border-top:1px solid var(--line);overflow:visible}.page-check-bar .quiet-button{margin-left:0}.result-actions .more-menu,.result-actions .more-menu>button{width:100%} }
 /* Library 是一份一行的列表：一屏十几份。合集默认折成一行，点开才展开 */
-.library-list { position:relative; margin-top:8px; border:1px solid var(--line); border-radius:14px; background:var(--panel); }
-.library-row { position:relative; display:grid; grid-template-columns:22px minmax(0,1fr) auto auto; align-items:center; gap:2px 12px; padding:11px 8px 11px 12px; border-top:1px solid rgba(var(--ink-rgb),.08); }
-.library-list>.library-row:first-child, .library-list>.library-batch:first-child { border-top:0; }
-.library-row:hover { background:rgba(var(--green-rgb),.035); }
+/* 参考浏览历史类插件：没有外框、行间没有分隔线，按天分段，悬停才出一块浅底 */
+.library-list { position:relative; margin-top:6px; }
+.library-day { margin:22px 0 4px; padding:0 12px; color:rgba(var(--ink-rgb),.5); font-size:12px; font-weight:600; letter-spacing:.02em; }
+.library-list>.library-day:first-child { margin-top:8px; }
+.library-row { position:relative; display:grid; grid-template-columns:22px minmax(0,1fr) auto auto; align-items:center; gap:2px 12px; padding:9px 6px 9px 10px; border-radius:10px; }
+.library-row:hover { background:rgba(var(--ink-rgb),.045); }
 /* 勾选框平时不占眼：悬停、聚焦、已勾、或已经在选的时候才出现 */
 .library-select { display:grid; place-items:center; width:22px; height:22px; cursor:pointer; opacity:0; transition:opacity .12s; }
 .library-row:hover .library-select, .library-select:focus-within, .library-select:has(input:checked), .library-list.selecting .library-select { opacity:1; }
@@ -337,29 +339,27 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 .library-row-sub { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:rgba(var(--ink-rgb),.55); font-size:12px; }
 .library-row-sub b { margin-right:6px; color:var(--green); font-weight:400; }
 .library-row.found .library-row-sub { color:var(--ink); opacity:.78; }
-.library-row-meta { display:grid; grid-template-columns:auto 58px 40px; align-items:center; gap:14px; color:rgba(var(--ink-rgb),.5); font-size:12px; white-space:nowrap; font-variant-numeric:tabular-nums; text-align:right; }
+.library-row-meta { display:grid; grid-template-columns:auto 58px 42px; align-items:center; gap:14px; color:rgba(var(--ink-rgb),.5); font-size:12px; white-space:nowrap; font-variant-numeric:tabular-nums; text-align:right; }
 .library-row-meta .quality { justify-content:flex-end; }
 .library-row .more-menu>button { min-width:30px; padding:4px 6px; border-color:transparent; background:transparent; opacity:.55; }
 .library-row:hover .more-menu>button { opacity:1; }
 .library-row .library-hits { grid-column:2 / -1; padding:4px 0 2px; }
-.library-batch { border-top:1px solid rgba(var(--ink-rgb),.08); }
-.library-batch-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:5px 8px 5px 6px; }
-.library-batch-head:hover { background:rgba(var(--green-rgb),.035); }
+.library-batch-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:3px 6px 3px 4px; border-radius:10px; }
+.library-batch-head:hover { background:rgba(var(--ink-rgb),.045); }
 .library-batch-head .more-menu>button { min-width:30px; padding:4px 6px; border-color:transparent; background:transparent; opacity:.55; }
 .library-batch-toggle { min-width:0; flex:1; display:flex; align-items:center; gap:10px; padding:7px 6px; border:0; background:transparent; color:inherit; text-align:left; cursor:pointer; }
 .library-batch-toggle i { width:22px; text-align:center; font-style:normal; font-size:12px; color:rgba(var(--ink-rgb),.45); }
 .library-batch-toggle strong { font-size:14px; font-weight:600; white-space:nowrap; }
 .library-batch-toggle span { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:rgba(var(--ink-rgb),.45); font-size:12px; }
-.library-nested { margin:0 0 6px 34px; border-left:2px solid rgba(var(--green-rgb),.18); }
-.library-nested .library-row { border-top:0; }
+.library-nested { margin:0 0 6px 21px; padding-left:12px; border-left:2px solid rgba(var(--green-rgb),.18); }
 /* 「问」的结果：同一种行，左边一道绿线标出是 AI 挑的，不再套一层绿底框 */
 .library-ask { margin-top:8px; }
 .library-ask-head { display:flex; align-items:center; justify-content:space-between; gap:12px; min-height:34px; padding:0 4px 0 6px; color:var(--green); font-size:13px; font-weight:600; }
 .library-ask-head>span { display:flex; align-items:center; gap:8px; min-width:0; }
 .library-ask.error .library-ask-head { color:var(--c-874b31-fg); font-weight:500; }
 .library-ask.done:not(:has(.library-row)) .library-ask-head { color:rgba(var(--ink-rgb),.6); font-weight:500; }
-.library-ask .library-list { margin-top:4px; border-color:rgba(var(--green-rgb),.35); box-shadow:inset 3px 0 0 var(--green); overflow:hidden; }
-.library-ask + .library-selection-bar, .library-ask + .library-list, .library-ask ~ .library-list { margin-top:18px; }
+.library-ask .library-list { margin:2px 0 0 4px; padding-left:8px; border-left:2px solid var(--green); }
+.library-ask { padding-bottom:10px; border-bottom:1px solid var(--line); }
 .library-ask-spinner { width:12px; height:12px; border:2px solid rgba(var(--green-rgb),.25); border-top-color:var(--green); border-radius:50%; animation:spin .8s linear infinite; }
 .library-selection-bar { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:14px; padding:10px 10px 10px 16px; border:1px solid var(--green); border-radius:13px; background:var(--green-soft); font-size:12px; }
 .library-selection-bar>span { color:var(--green); font-weight:650; }

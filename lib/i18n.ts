@@ -298,6 +298,8 @@ export const en: Record<string, string> = {
   "让 AI 按你的描述找文件": "Let AI find files from your description",
   "找…": "Finding…",
   "问": "Ask",
+  "今天": "Today",
+  "昨天": "Yesterday",
   "资料库操作": "Library actions",
   "「问」的结果": "Ask results",
   "在 {n} 份文档的目录里找「{q}」… {time}": "Looking through {n} documents for “{q}”… {time}",

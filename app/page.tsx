@@ -350,6 +350,26 @@ function fmtShortDate(iso: string) {
   return date.getFullYear() === new Date().getFullYear() ? md : `${date.getFullYear()}/${md}`;
 }
 
+/** Library 的日期分组标题：今天 / 昨天 / 一周内写星期 / 更早写日期（参考浏览历史那种按天分段） */
+function fmtDayGroup(iso: string) {
+  const date = new Date(iso);
+  const start = (d: Date) => new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime();
+  const days = Math.round((start(new Date()) - start(date)) / 86400000);
+  if (days === 0) return t("今天");
+  if (days === 1) return t("昨天");
+  const sameYear = date.getFullYear() === new Date().getFullYear();
+  const recent = days > 1 && days < 7;
+  if (getActiveLang() === "en") return date.toLocaleDateString("en-US", { weekday: recent ? "long" : undefined, year: sameYear ? undefined : "numeric", month: "short", day: "numeric" });
+  // zh-CN 的 toLocaleDateString 给的是「10/17星期六」，自己拼
+  const md = `${sameYear ? "" : `${date.getFullYear()}年`}${date.getMonth() + 1}月${date.getDate()}日`;
+  return recent ? `${md} 周${"日一二三四五六"[date.getDay()]}` : md;
+}
+
+function fmtClock(iso: string) {
+  const date = new Date(iso);
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+}
+
 function fmtDay(iso: string) {
   const [y, m, d] = iso.split("-").map(Number);
   if (getActiveLang() === "zh") return `${y}年${m}月${d}日`;
@@ -1120,15 +1140,17 @@ export default function Home() {
       if (byBatch.has(batch.id)) entries.push({ key: batch.id, sortKey: new Date(batch.updated_at).getTime(), batch });
     }
     entries.sort((a, b) => b.sortKey - a.sortKey);
-    const rows: { key: string; batch?: Batch; items: Job[] }[] = [];
+    const rows: { key: string; day: string; batch?: Batch; items: Job[] }[] = [];
     for (const entry of entries) {
+      const at = new Date(entry.sortKey);
+      const day = `${at.getFullYear()}-${at.getMonth() + 1}-${at.getDate()}`;
       if (entry.batch) {
-        rows.push({ key: entry.key, batch: entry.batch, items: byBatch.get(entry.batch.id)! });
+        rows.push({ key: entry.key, day, batch: entry.batch, items: byBatch.get(entry.batch.id)! });
         continue;
       }
       const prevRow = rows.at(-1);
-      if (prevRow && !prevRow.batch) prevRow.items.push(entry.item!);
-      else rows.push({ key: entry.key, items: [entry.item!] });
+      if (prevRow && !prevRow.batch && prevRow.day === day) prevRow.items.push(entry.item!);
+      else rows.push({ key: entry.key, day, items: [entry.item!] });
     }
     return rows;
   }, [filteredLibrary, batches]);
@@ -1922,7 +1944,8 @@ export default function Home() {
           {/* 全过的不标：一屏十几个绿点等于没标，只留要处理的 */}
           <span className={`quality ${quality.tone}`}>{quality.tone !== "good" && <><i />{quality.text}</>}</span>
           <span>{t("{n} 页", { n: record.page_count })}</span>
-          <span title={formatDate(new Date(record.updated_at).getTime())}>{fmtShortDate(record.updated_at)}</span>
+          {/* 列表按天分了组，行里只写几点；「问」的结果不分组，照旧写日期 */}
+          <span title={formatDate(new Date(record.updated_at).getTime())}>{why ? fmtShortDate(record.updated_at) : fmtClock(record.updated_at)}</span>
         </span>
         <MoreMenu label={t("{name} 的更多操作", { name: recordTitle(record) })}>
           {(close) => (
@@ -2180,12 +2203,16 @@ export default function Home() {
           ) : filteredLibrary.length ? (
             // 整个资料库是一张连续的表；合集是表里的一行，点开在下面缩进展开
             <div className={`library-list ${selectedLibraryIds.size ? "selecting" : ""}`}>
-              {libraryTimeline.map((row) => {
-                if (!row.batch) return <Fragment key={row.key}>{row.items.map((record) => renderLibraryRow(record))}</Fragment>;
+              {libraryTimeline.map((row, index) => {
+                const heading = index === 0 || libraryTimeline[index - 1].day !== row.day
+                  ? <h2 className="library-day">{fmtDayGroup((row.batch?.updated_at ?? row.items[0].updated_at))}</h2>
+                  : null;
+                if (!row.batch) return <Fragment key={row.key}>{heading}{row.items.map((record) => renderLibraryRow(record))}</Fragment>;
                 const batch = row.batch;
                 const open = Boolean(query.trim()) || qualityFilter !== "all" || openBatches.has(batch.id);
                 return (
-                  <section className="library-batch" key={row.key}>
+                  <Fragment key={row.key}>{heading}
+                  <section className="library-batch">
                     <div className="library-batch-head">
                       <button type="button" className="library-batch-toggle" aria-expanded={open} onClick={() => setOpenBatches((prev) => { const next = new Set(prev); if (next.has(batch.id)) next.delete(batch.id); else next.add(batch.id); return next; })}>
                         <i aria-hidden="true">{open ? "▾" : "▸"}</i>
@@ -2203,6 +2230,7 @@ export default function Home() {
                     </div>
                     {open && <div className="library-nested">{row.items.map((record) => renderLibraryRow(record))}</div>}
                   </section>
+                  </Fragment>
                 );
               })}
             </div>

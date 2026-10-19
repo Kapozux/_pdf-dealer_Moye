@@ -4,6 +4,7 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "墨页 · PDF/PPT/Word/图片 转 Markdown",
   description: "在本地将 PDF、PPT、Word、图片转换为干净、可检查的 Markdown。",
+  icons: { icon: "/favicon.svg" },
 };
 
 /**

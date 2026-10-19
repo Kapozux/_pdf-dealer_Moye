@@ -2102,7 +2102,8 @@ export default function Home() {
     <main className={`app-shell ${status !== "idle" || screen === "library" ? "workspace-open" : ""}`}>
       <nav className="topbar" aria-label={t("主导航")}>
         <button className="brand brand-button" type="button" onClick={reset} aria-label={t("回到首页")} disabled={batchRunning}>
-          <span className="brand-mark">{t("墨")}</span><span>{t("墨页")}</span>
+          {/* 一滴墨：跟语言无关的图标（英文界面原来是一个「M」），同 public/favicon.svg；照 Verbatim 的做法，名字用普通无衬线 */}
+          <svg className="brand-mark" viewBox="0 0 64 64" aria-hidden="true"><rect width="64" height="64" rx="15" fill="#D97757" /><path fill="#FAF9F5" d="M32 12.5c-1.2 0-14.5 16-14.5 26.2C17.5 46.8 24 53 32 53s14.5-6.2 14.5-14.3C46.5 28.5 33.2 12.5 32 12.5z" /></svg><span>{t("墨页")}</span>
         </button>
         <div className="top-actions">
           {activeJobs.length > 0 && (

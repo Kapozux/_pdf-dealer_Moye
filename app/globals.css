@@ -326,14 +326,17 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 /* Library 是一份一行的列表：一屏十几份。合集默认折成一行，点开才展开 */
 /* 一份一张卡，照 Verbatim 的 .history-item：17px 标题 + 小徽记 / 15px 一句话 / 13px 灰色元信息一行；按天分段 */
 .library-list { position:relative; margin-top:6px; display:flex; flex-direction:column; gap:10px; }
-.library-day { margin:18px 0 0; padding:0 4px; color:rgba(var(--ink-rgb),.55); font-size:13px; font-weight:600; }
+.library-day { margin:14px 0 0; padding:0 4px; color:rgba(var(--ink-rgb),.55); font-size:13px; font-weight:600; }
 .library-list>.library-day:first-child { margin-top:6px; }
-.library-row { position:relative; display:grid; grid-template-columns:minmax(0,1fr) auto; align-items:start; gap:2px 12px; padding:15px 12px 15px 19px; border:1px solid var(--line); border-radius:12px; background:var(--panel); transition:border-color .15s, box-shadow .15s; }
+.library-row { position:relative; display:grid; grid-template-columns:18px minmax(0,1fr) auto; align-items:start; gap:2px 14px; padding:15px 12px 15px 16px; border:1px solid var(--line); border-radius:12px; background:var(--panel); transition:border-color .15s, box-shadow .15s; }
 .library-row:hover { box-shadow:0 6px 20px rgba(60,50,30,.06), 0 1px 3px rgba(50,42,28,.04); }
-/* 勾选框平时不占位：悬停、聚焦、已勾、或已经在选的时候才出现在卡片左上角 */
-.library-select { position:absolute; left:-9px; top:16px; display:grid; place-items:center; width:20px; height:20px; border-radius:6px; background:var(--panel); cursor:pointer; opacity:0; transition:opacity .12s; }
-.library-row:hover .library-select, .library-select:focus-within, .library-select:has(input:checked), .library-list.selecting .library-select { opacity:1; }
-.library-select input { width:14px; height:14px; margin:0; accent-color:var(--ink); cursor:pointer; }
+/* 勾选框在卡片里有自己的一列，每张都有、都对齐（像浏览历史插件那样）；自己画，原生的在暗色下是一块灰方块 */
+.library-select { display:grid; place-items:center; width:18px; height:26px; cursor:pointer; }
+.library-select input { appearance:none; -webkit-appearance:none; width:16px; height:16px; margin:0; border:1.5px solid rgba(var(--ink-rgb),.28); border-radius:4px; background:transparent; cursor:pointer; display:grid; place-items:center; transition:border-color .12s, background .12s; }
+.library-row:hover .library-select input { border-color:rgba(var(--ink-rgb),.5); }
+.library-select input:checked { border-color:var(--ink); background:var(--ink); }
+.library-select input:checked::after { content:""; width:4px; height:8px; margin-top:-2px; border:solid var(--paper); border-width:0 2px 2px 0; transform:rotate(45deg); }
+.library-select input:focus-visible { outline:2px solid var(--seal); outline-offset:2px; }
 .library-row-open { min-width:0; display:flex; flex-direction:column; gap:4px; padding:0; border:0; background:transparent; color:inherit; text-align:left; cursor:pointer; }
 .library-row-title { min-width:0; display:flex; align-items:center; gap:8px; }
 .library-row-title strong { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:17px; font-weight:600; letter-spacing:-.01em; }
@@ -343,12 +346,12 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 .library-row-sub { display:-webkit-box; overflow:hidden; -webkit-line-clamp:2; -webkit-box-orient:vertical; color:var(--text-body); font-size:15px; line-height:1.55; }
 .library-row-sub b { margin-right:6px; color:var(--seal); font-weight:400; }
 .library-row-meta { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; color:rgba(var(--ink-rgb),.5); font-size:13px; font-variant-numeric:tabular-nums; }
-.library-row .more-menu { grid-column:2; grid-row:1; }
+.library-row .more-menu { grid-column:3; grid-row:1; }
 .library-row .more-menu>button { min-width:34px; padding:4px 8px; border-color:transparent; background:transparent; opacity:.6; }
 .library-row:hover .more-menu>button { opacity:1; }
-.library-row .library-hits { grid-column:1 / -1; padding:6px 0 0; }
+.library-row .library-hits { grid-column:2 / -1; padding:6px 0 0; }
 .library-batch { border:1px solid var(--line); border-radius:12px; background:var(--panel); }
-.library-batch-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 12px 8px 10px; border-radius:12px; }
+.library-batch-head { display:flex; align-items:center; justify-content:space-between; gap:12px; padding:8px 12px 8px 8px; border-radius:12px; }
 .library-batch-head:hover { background:rgba(var(--ink-rgb),.045); }
 .library-batch-head .more-menu>button { min-width:30px; padding:4px 6px; border-color:transparent; background:transparent; opacity:.55; }
 .library-batch-toggle { min-width:0; flex:1; display:flex; align-items:center; gap:10px; padding:7px 6px; border:0; background:transparent; color:inherit; text-align:left; cursor:pointer; }
@@ -367,8 +370,8 @@ footer { width:100%; max-width:var(--shell-w); margin:auto auto 0; padding:24px 
 .library-ask .library-row { border-color:rgba(217,119,87,.45); }
 .library-ask { padding-bottom:10px; border-bottom:1px solid var(--line); }
 .library-ask-spinner { width:12px; height:12px; border:2px solid rgba(var(--green-rgb),.25); border-top-color:var(--green); border-radius:50%; animation:spin .8s linear infinite; }
-.library-selection-bar { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:14px; padding:10px 10px 10px 16px; border:1px solid var(--green); border-radius:13px; background:var(--green-soft); font-size:12px; }
-.library-selection-bar>span { color:var(--green); font-weight:650; }
+.library-selection-bar { position:sticky; top:12px; z-index:5; display:flex; align-items:center; justify-content:space-between; gap:16px; margin-top:12px; padding:8px 8px 8px 16px; border:1px solid var(--line); border-radius:12px; background:var(--panel); box-shadow:0 6px 20px rgba(60,50,30,.08); font-size:13px; }
+.library-selection-bar>span { color:var(--ink); font-weight:600; }
 .library-selection-bar>div { display:flex; align-items:center; gap:6px; }
 /* 下载是 <a download>（整包由服务端生成），要和相邻的删除按钮长得一样 */
 .library-empty { min-height:350px; display:flex; flex-direction:column; align-items:center; justify-content:center; margin-top:20px; border:1px dashed rgba(var(--green-rgb),.24); border-radius:16px; text-align:center; }

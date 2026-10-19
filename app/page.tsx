@@ -2534,7 +2534,7 @@ export default function Home() {
       })() : result ? (
         <section className="result-workspace">
           <header className="result-header">
-            <div><span className="success-kicker"><i />{t("转换完成 · 已存入 Library")}</span><h1>{activeFilename}</h1><p>{t("{pages} 页 · {mode} · {seconds} 秒", { pages: result.pageCount, mode: t(modeNames[result.mode]) || t("旧版转换"), seconds: (result.durationMs / 1000).toFixed(1) })}{pageTimeSummary ? ` · ${pageTimeSummary}` : ""}{(() => { const job = activeJob?.id === activeJobId ? activeJob : library.find((j) => j.id === activeJobId); const c = job ? costLabel(job) : null; return c ? ` · ${t("花费 {c}", { c })}` : ""; })()}</p></div>
+            <div><span className="success-kicker"><i />{t("转换完成 · 已存入 Library")}</span>{(() => { const record = library.find((j) => j.id === activeJobId); return <h1 title={activeFilename}>{record ? recordTitle(record) : activeFilename}</h1>; })()}<p>{t("{pages} 页 · {mode} · {seconds} 秒", { pages: result.pageCount, mode: t(modeNames[result.mode]) || t("旧版转换"), seconds: (result.durationMs / 1000).toFixed(1) })}{pageTimeSummary ? ` · ${pageTimeSummary}` : ""}{(() => { const job = activeJob?.id === activeJobId ? activeJob : library.find((j) => j.id === activeJobId); const c = job ? costLabel(job) : null; return c ? ` · ${t("花费 {c}", { c })}` : ""; })()}</p></div>
             <div className="result-actions">
               {cameFrom === "library" ? (
                 <button type="button" className="secondary-button" onClick={() => { setCameFrom(null); showLibrary(); }}>{t("← 返回 Library")}</button>

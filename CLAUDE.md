@@ -158,7 +158,8 @@ server/filenames.mjs   源文件名 → 标题的唯一一份扩展名正则（�
 server/zip.mjs         手写最小 ZIP 打包器，只为 Library 整包下载存在
 server/fetch-timeout.mjs  带超时的 fetch，超时一直覆盖到**读完响应体**（以前收到响应头就清计时器，上游迟迟不发完正文时一页能一直挂着、占着 aiGate 名额）。超时报「请求超时（Ns 未返回）」而不是 "This operation was aborted"。带退避重试的 `postWithRetries` 也在这里（从 local-ocr-server.mjs 搬来，有行为测试）：4xx 和超过次数的 429 直接抛、不重试，抛出的错误带上游 `status`；local-ocr-server 只包一层接 Gemini Key 拉黑（`geminiKeyRejected`）
 server/openrouter-failover.mjs  OpenRouter 兜底链的顺序和预算（外层换模型、内层换供应商）：第 0 次不钉供应商让 OpenRouter 自己挑，失败才按白名单顺序逐家钉死，**不轮转**（实测轮转平均每页 236s）；整页一份总预算；熔断只在至少两条线路真试过且全挂时才记。真正的调用和熔断记账由 local-ocr-server 注入，有行为测试
-server/find.mjs        「问」（Library 搜索框的回车 / 「问」按钮）：一句话找文件，不是聊天。整库目录（AI 标题 / 一句话 / 标签 / 文件名 / 日期 / 页数，编号 1..N）一次交给当前服务商挑最多 8 份 + 一句理由，编出来的编号丢掉；目录超 6 万字先去简介和标签。`POST /api/library/find`，purpose=find（共用额度里算 live）。参考 Ephemeris 的「问」找资料那一步，没学它的检索和写回答。2026-10-18 实测 319 份、Claude Haiku 7～12s
+server/find.mjs        「问」（Library 搜索框的回车 / 「✦ 问」）：一句话找文件，不是聊天。两条路：**本机有 Claude Code**（且没停着）就 `findDeep`——Claude（`MOYE_FIND_MODEL` 默认 Sonnet 5.5、`MOYE_FIND_EFFORT` medium，`claudeAgent`）只被放行一条只读命令 `node server/look.mjs`，自己搜正文、看某页再挑最多 8 份 + 一句理由 + 页码（点开直接到那页的逐页核对），跑的每一步实时流回页面；**没有 / 失败了**退回 `findDocuments`：整库目录（AI 标题 / 一句话 / 标签 / 文件名 / 日期 / 页数）一次交给当前服务商挑，界面写明「只看了标题、简介和标签」。编出来的编号 / 短号、有歧义的短号丢掉，页码越界当没说。`POST /api/library/find` 回的是一行一个 JSON（step… → done / error），页面断开（停止按钮）就掐 claude 进程。purpose=find（共用额度里算 live）。照 Verbatim 的 libask.py（10-19，它照墨页的界面 + Ephemeris 的查法）。实测 320 份：查正文 11～16 秒、3～4 步；只看目录 Haiku 7～12 秒
+server/look.mjs        「问」给 Claude 跑的只读查询命令：search / hits / read / info / list / stats，出处记号 `[[d:短号@p页]]`（短号 = id 前 8 位）。moye.db 用 readOnly 打开，正文读 data/jobs/<id>/result.json（document.md 有 92 份没有「PDF 第 N 页」分页标题，不能拿它分页）；整库搜一次约 0.1 秒。`MOYE_DATA_DIR` 换数据目录（测试用）。改命令要同步改 find.mjs 里 DEEP_PROMPT 的命令说明和 stepOf
 server/search.mjs      资料库全文搜索 + 卡片预览。不用 SQLite FTS5（默认分词不切中文，trigram 搜不了两个字的词），全库 Markdown 放内存逐页子串查找；首次搜索时载入，之后按 jobs 表的 updated_at 增量同步
 server/office2pdf.mjs  PPT/PPTX/DOC/DOCX → PDF（LibreOffice headless，每次独立 -env:UserInstallation 临时 profile，免得并发时互相锁死），转完复用 PDF 管线。先查文件头签名再交给 soffice——它对认不出的输入会退出码 0、吐一页乱码 PDF
 server/images2pdf.mjs  很多图片 → 一份成品 PDF（反方向的旁路，跟 md2pdf 同一类：不进队列、不进 Library、不识别）。**和上面的 image2pdf.mjs 是两条路，别改错**：那条是为了喂识别管线（resolution=144、长边压到 4000px），这条的 PDF 本身就是交付物，所以一个像素都不缩，JPEG/PNG 原字节用 pdf-lib 直接 embed——Pillow 存 PDF 会把每张重新编码成 JPEG，成品会比原图糊一档；只有 webp/heic/tiff/bmp/gif、多帧、带 EXIF 旋转的才过一道 Pillow 转 JPEG(q95)/PNG，HEIC 照旧先走 sips。页面尺寸不影响存进去的像素（PDF 里是矢量坐标），按「图片自身比例、长边 = A4 长边 842pt」排版，每页被填满无白边，比原图小的不放大。上传分两步（`POST /api/images2pdf/part` 逐张流式落到 `tmp/images2pdf/<session>/`，`POST /api/images2pdf/build` 按页序合成后回 PDF 并删暂存，另有 2 小时的残留扫除），是为了不把几十张照片一次性堆进内存；坏图逐张跳过、原因走 `X-Moye-Skipped` 响应头回到页面（规矩四：不静默吞错误）
@@ -268,6 +269,8 @@ launchctl kickstart -k gui/$(id -u)/com.kapozux.moye-web   # 重启网页服务
 | `MOYE_PORT` | 8765 | 识别服务端口（页面和各脚本都写死了 8765，改了要一起改） |
 | `MOYE_CONCURRENCY` | 1 | 本机识别（balanced / math 车道）同时几份；不影响 AI 模式 |
 | `REFLECT_MODEL` | gemini-3.5-flash-lite | 「回顾」叙事用的 Gemini 模型 |
+| `MOYE_FIND_MODEL` | claude-sonnet-5-5 | 「问」查正文用的 Claude 模型（照 Verbatim 的选择；墨页 10-19 实测 Sonnet 11～16 秒） |
+| `MOYE_FIND_EFFORT` | medium | 同上的思考力度 |
 | `MOYE_CLAUDE_CONCURRENCY` | 20 | 本机 Claude Code 同时几页（一页一个 claude 进程，约 230MB；实测 40 路也没被订阅限流，默认 20 是给内存留余地） |
 | `MOYE_TIMEOUT_CLAUDE` | 90000 | 本机 Claude Code 单页超时（实测中位 18s、最慢 35s） |
 | `REFLECT_ENGINE` | 空 | 设成 `claude`（且找得到 `claude` 命令）就先让本机 Claude Code 写回顾叙事（Opus 5.5，订阅额度，记 $0；失败回落下面的）。作者电脑上写在 launchd 的 plist 里（2026-10-13）。`server/claude-text.mjs` |

@@ -1934,19 +1934,22 @@ export default function Home() {
         <button className="library-row-open" type="button" onClick={() => openRecord(record)} aria-label={t("打开 {name}", { name: record.filename })}>
           <span className="library-row-title">
             <strong title={record.filename}>{recordTitle(record)}</strong>
-            {tags.length > 0 && <span className="library-row-tags">{tags.join(" · ")}</span>}
+            {/* 全过的不标：只给要处理的一个小徽记（Verbatim 那里放引擎名的位置） */}
+            {quality.tone !== "good" && <span className={`library-badge ${quality.tone}`}>{quality.text}</span>}
           </span>
           <span className="library-row-sub">
             {why ? <><b aria-label={t("AI：")}>✦</b>{why}</> : record.ai_one_line || record.preview || t("没有可预览的文字")}
           </span>
+          <span className="library-row-meta">
+            {[
+              ...tags.map((tag) => `#${tag}`),
+              why ? `${fmtShortDate(record.updated_at)} ${fmtClock(record.updated_at)}` : fmtClock(record.updated_at),   // 列表已按天分段，只写几点
+              t("{n} 页", { n: record.page_count }),
+              // 显示的是整理过的标题时，原文件名放在最后，免得认不出是哪个文件
+              recordTitle(record) !== stripExt(record.filename) ? record.filename : "",
+            ].filter(Boolean).join(" · ")}
+          </span>
         </button>
-        <span className="library-row-meta">
-          {/* 全过的不标：一屏十几个绿点等于没标，只留要处理的 */}
-          <span className={`quality ${quality.tone}`}>{quality.tone !== "good" && <><i />{quality.text}</>}</span>
-          <span>{t("{n} 页", { n: record.page_count })}</span>
-          {/* 列表按天分了组，行里只写几点；「问」的结果不分组，照旧写日期 */}
-          <span title={formatDate(new Date(record.updated_at).getTime())}>{why ? fmtShortDate(record.updated_at) : fmtClock(record.updated_at)}</span>
-        </span>
         <MoreMenu label={t("{name} 的更多操作", { name: recordTitle(record) })}>
           {(close) => (
             <>
@@ -2130,7 +2133,7 @@ export default function Home() {
       {screen === "library" ? (
         <section className="library-view">
           {/* 顶上原来的大标题（LOCAL DOCUMENT LIBRARY / 你的分析资料库）占半屏，去掉了；「新转换」在顶栏 */}
-          <h1 className="visually-hidden">{t("你的分析资料库")}</h1>
+          <h1 className="library-title" aria-label={t("你的分析资料库")}>{t("资料库")}<i aria-hidden="true">.</i></h1>
           {/* 搜索框是这页唯一的主角：打字即筛，回车 / 「问 AI」让 AI 按描述找；数量、筛选、整包下载退到下面一行小字 */}
           <form className="library-toolbar" role="search" onSubmit={(event) => { event.preventDefault(); void askLibrary(); }}>
             <label className="library-search">

@@ -306,15 +306,41 @@ export async function searchLibrary(query: string): Promise<SearchResult[]> {
 }
 
 /** 「问」找到的一份：哪份文档、为什么是它。 */
-export type FoundDoc = { id: string; why: string };
+export type FoundDoc = { id: string; why: string; page: number | null };
+/** 「问」查正文时 Claude 每跑一条命令一步：k = search / hits / read / info / list / stats，d = 搜的词或哪份文档 */
+export type FindStep = { k: string; d: string };
+export type FindResult = { results: FoundDoc[]; considered: number; mode: "deep" | "catalog"; note?: string; steps?: number };
 
-/** 「问」：一句话描述要找的文件，服务端把整库目录交给 AI 挑（server/find.mjs）。约 10～30 秒。 */
-export async function findInLibrary(q: string): Promise<{ results: FoundDoc[]; considered: number }> {
-  return asJson(await fetch(`${SERVICE_BASE}/api/library/find`, {
+/**
+ * 「问」：一句话描述要找的文件（server/find.mjs）。有本机 Claude Code 时它自己查正文，每一步经 onStep 实时报回来；
+ * 没有就只看目录。服务端一行一个 JSON 流回来。signal 取消 = 停止（服务端会掐掉 claude 进程）。
+ */
+export async function findInLibrary(q: string, { onStep, signal }: { onStep?: (step: FindStep) => void; signal?: AbortSignal } = {}): Promise<FindResult> {
+  const response = await fetch(`${SERVICE_BASE}/api/library/find`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ q }),
-  }));
+    signal,
+  });
+  if (!response.ok || !response.body) return asJson(response);
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  for (;;) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+    let nl;
+    while ((nl = buffer.indexOf("\n")) !== -1) {
+      const line = buffer.slice(0, nl).trim();
+      buffer = buffer.slice(nl + 1);
+      if (!line) continue;
+      const event = JSON.parse(line) as { step?: FindStep; done?: FindResult; error?: string };
+      if (event.step) onStep?.(event.step);
+      if (event.error) throw new Error(event.error);
+      if (event.done) return event.done;
+    }
+    if (done) throw new Error("「问」的连接断了，没收到结果。");
+  }
 }
 
 export function libraryPdfUrl(id: string): string {

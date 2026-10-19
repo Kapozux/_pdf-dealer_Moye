@@ -157,3 +157,70 @@ export async function claudeVision(prompt, imageBase64, mimeType, { bin = findCl
   const args = [...BASE_ARGS(model, effort), "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"];
   return run(bin, args, JSON.stringify(msg) + "\n", { timeoutMs, record, purpose, model, page });
 }
+
+const AGENT_SYSTEM = "You are the search assistant inside Moye, a local PDF-to-Markdown library. Use only the one command the user message allows, follow its instructions exactly, and output only the final answer it asks for.";
+
+/**
+ * 让 Claude 自己跑命令查资料再答（「问」查正文，server/find.mjs）：只给 Bash，且只放行 allow 开头的命令
+ * （照 Verbatim claude_cli.agent / Ephemeris llm.claude_agent）。onTool(命令) 实时报它跑了什么；signal 取消就掐进程。
+ * 返回最后的回答；失败抛错（原因写进错误里）。
+ */
+export function claudeAgent(prompt, { allow, bin = findClaude(), model = "claude-sonnet-5-5", effort = "medium", timeoutMs = 150000,
+  record = () => {}, purpose = "find", onTool = () => {}, signal } = {}) {
+  if (!bin) return Promise.reject(new Error("找不到 claude 命令（Claude Code 没装？）"));
+  const args = ["-p", "--model", model, "--effort", effort, "--system-prompt", AGENT_SYSTEM, "--tools", "Bash",
+    "--allowedTools", `Bash(${allow}:*)`, "--disable-slash-commands", "--strict-mcp-config", "--setting-sources", "",
+    "--no-session-persistence", "--output-format", "stream-json", "--verbose"];
+  const prio = prioOf(purpose);
+  return withSlot(GATE_APP, purpose, prio, () => new Promise((resolve, reject) => {
+    const cwd = join(homedir(), ".moye-claude");
+    mkdirSync(cwd, { recursive: true });
+    const t0 = Date.now();
+    const child = spawn(bin, args, { cwd, env: { ...process.env, DISABLE_PROMPT_CACHING: "1" } });
+    let buffer = "";
+    let err = "";
+    let final = null;
+    let settled = false;
+    const finish = (fn, value) => { if (!settled) { settled = true; clearTimeout(timer); signal?.removeEventListener("abort", onAbort); fn(value); } };
+    const onAbort = () => { child.kill("SIGKILL"); finish(reject, Object.assign(new Error("已停止"), { stopped: true })); };
+    const timer = setTimeout(() => { child.kill("SIGKILL"); finish(reject, new Error(`Claude Code ${Math.round(timeoutMs / 1000)}s 没找完`)); }, timeoutMs);
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener("abort", onAbort);
+    child.stdout.on("data", (b) => {
+      buffer += b;
+      let nl;
+      while ((nl = buffer.indexOf("\n")) !== -1) {
+        const line = buffer.slice(0, nl);
+        buffer = buffer.slice(nl + 1);
+        let ev;
+        try { ev = JSON.parse(line); } catch { continue; }
+        if (ev.type === "result") final = ev;
+        else if (ev.type === "assistant") {
+          for (const block of ev.message?.content ?? []) if (block.type === "tool_use") onTool(String(block.input?.command ?? ""));
+        }
+      }
+    });
+    child.stderr.on("data", (b) => { err += b; });
+    child.on("error", (e) => finish(reject, e));
+    child.on("close", () => {
+      if (settled) return;
+      if (!final) { finish(reject, new Error(`Claude Code 没给出结果：${err.slice(0, 200) || "（没有输出）"}`)); return; }
+      gateRecord(GATE_APP, purpose, prio, model, final, (Date.now() - t0) / 1000);
+      const u = final.usage || {};
+      record({ provider: "claude-code", model, purpose, inputTokens: (u.input_tokens || 0) + (u.cache_creation_input_tokens || 0),
+        outputTokens: u.output_tokens || 0, cachedTokens: u.cache_read_input_tokens || 0, costUsd: 0 });
+      const text = String(final.result || "").trim();
+      if (final.is_error || !text) {
+        if (LIMIT.test(text)) {
+          const m = text.match(/\|(\d{10})/);
+          pausedUntil = Math.max(m ? Number(m[1]) * 1000 : Date.now() + PAUSE_MS, Date.now() + 60000);
+          gatePause(pausedUntil / 1000, text, GATE_APP);
+        }
+        finish(reject, new Error(`Claude Code：${text.slice(0, 200) || "返回空"}`));
+        return;
+      }
+      finish(resolve, text);
+    });
+    child.stdin.end(prompt);
+  }));
+}

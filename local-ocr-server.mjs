@@ -29,9 +29,9 @@ import { bundledHeadlessShell, forgetChromePath, markdownToPdf, markdownTitle, p
 import { createSetup, findSoffice } from "./server/setup.mjs";
 import { AdaptivePacer } from "./server/pacer.mjs";
 import { createReflect } from "./server/reflect.mjs";
-import { claudeEnabled, claudeStandIn, claudeText, claudeVision, findClaude } from "./server/claude-text.mjs";
+import { claudeAgent, claudeEnabled, claudePaused, claudeStandIn, claudeText, claudeVision, findClaude } from "./server/claude-text.mjs";
 import { createUsage } from "./server/usage.mjs";
-import { findDocuments } from "./server/find.mjs";
+import { findDeep, findDocuments } from "./server/find.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
 // Python 环境（pypdfium2 渲染页面、Pillow 处理图片、可选的 Surya）。
@@ -1104,6 +1104,10 @@ async function generateCardMeta(job) {
 // ===== 服务端编排：存储 + 管线 + 队列 =====
 // Surya 与 AI 调用以依赖注入方式交给管线（同进程直接调用，不再自己请求自己）。
 const jobStore = new JobStore(resolve(root, "data"));
+// 「问」查正文：Claude 只被放行这一条命令（绝对路径；放行规则按前缀匹配，路径里有空格会对不上）。模型照 Verbatim：Sonnet 5.5 medium（它 10-19 真库实测 12～17 秒）
+const LOOK_COMMAND = `${process.execPath} ${resolve(root, "server", "look.mjs")}`;
+const FIND_MODEL = process.env.MOYE_FIND_MODEL || "claude-sonnet-5-5";
+const FIND_EFFORT = process.env.MOYE_FIND_EFFORT || "medium";
 
 // 回顾叙事用的模型。原来配了 OpenRouter 就走 Claude Opus 4.6，一次刷新 4 个时段、
 // 每次转换完还会重算，结果它一家吃掉了 usage.db 里 99% 的花销（58 次 ≈ $5.9）。
@@ -1732,25 +1736,51 @@ const server = createServer(async (request, response) => {
       return;
     }
 
-    // POST /api/library/find { q: "上学期那份热学作业" } → { results: [{ id, why }], considered }
-    // 「问」：整库目录（AI 标题 / 一句话 / 标签）交给当前服务商挑，见 server/find.mjs
+    // POST /api/library/find { q: "上学期那份热学作业" } → 一行一个 JSON（application/x-ndjson）：
+    //   {"step":{"k":"search","d":"latent heat"}} …（查正文时每跑一条命令一行，页面实时显示）
+    //   {"done":{"results":[{id,why,page}],"considered","mode":"deep"|"catalog","note","steps"}} 或 {"error":"…"}
+    // 有 Claude Code 就让它跑只读的 look.mjs 查正文；没有 / 停着 / 失败了退回整库目录交给当前服务商，见 server/find.mjs
+    // 页面断开（点了停止、关了页）就掐掉 claude 进程
     if (request.method === "POST" && path === "/api/library/find") {
       const body = await readJson(request);
       const settings = await loadSettings();
-      if (!providerConfigured(settings, settings.provider)) throw badRequest("「问」要用 AI：先在设置里配好一家服务商。");
+      const canDeep = !!findClaude() && !claudePaused();
+      const canCatalog = providerConfigured(settings, settings.provider);
+      if (!canDeep && !canCatalog) throw badRequest("「问」要用 AI：先在设置里配好一家服务商。");
       const started = Date.now();
+      const abort = new AbortController();
+      response.on("close", () => { if (!response.writableFinished) abort.abort(); });
+      response.writeHead(200, { "Content-Type": "application/x-ndjson; charset=utf-8", "Cache-Control": "no-store" });
+      const line = (payload) => { if (!response.writableEnded) response.write(`${JSON.stringify(payload)}\n`); };
+      const listJobs = () => jobStore.list({ limit: 100000 });
+      const catalog = () => findDocuments(body?.q, {
+        listJobs,
+        ask: (prompt) => usage.scope({ ref: null, purpose: "find" }, () => callTextModel(settings, prompt, { maxTokens: 800, timeoutMs: 90000 })),
+      });
       try {
-        const found = await findDocuments(body?.q, {
-          listJobs: () => jobStore.list({ limit: 100000 }),
-          ask: (prompt) => usage.scope({ ref: null, purpose: "find" }, () =>
-            callTextModel(settings, prompt, { maxTokens: 800, timeoutMs: 90000 })),
-        });
-        console.log(`[问] ${found.results.length}/${found.considered} 份 · ${((Date.now() - started) / 1000).toFixed(1)}s`);
-        sendJson(response, 200, found);
+        let found = null;
+        if (canDeep) {
+          try {
+            found = await findDeep(body?.q, {
+              listJobs,
+              look: LOOK_COMMAND,
+              onStep: (step) => line({ step }),
+              agent: (prompt, onTool) => claudeAgent(prompt, { allow: LOOK_COMMAND, model: FIND_MODEL, effort: FIND_EFFORT, record: usage.record, onTool, signal: abort.signal }),
+            });
+          } catch (error) {
+            if (error?.stopped || error?.httpStatus) throw error;
+            if (!canCatalog) throw error;
+            console.warn(`[问] 查正文失败，退回只看目录：${String(error?.message ?? error).slice(0, 200)}`);
+          }
+        }
+        found ??= await catalog();
+        console.log(`[问] ${found.mode} ${found.results.length}/${found.considered} 份${found.steps ? ` · ${found.steps} 步` : ""} · ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        line({ done: found });
       } catch (error) {
-        console.warn(`[问失败] ${String(error?.message ?? error).slice(0, 200)}`);
-        throw error;
+        if (!error?.stopped) console.warn(`[问失败] ${String(error?.message ?? error).slice(0, 200)}`);
+        line({ error: String(error?.message ?? error) });
       }
+      response.end();
       return;
     }
 

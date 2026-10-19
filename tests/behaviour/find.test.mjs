@@ -18,7 +18,7 @@ test("只把已完成的交给模型，模型选的编号对回真实任务", as
   assert.match(prompt, /热学那份作业/);
   assert.match(prompt, /热传导作业/);
   assert.doesNotMatch(prompt, /还在跑/);
-  assert.deepEqual(found, { results: [{ id: "a", why: "讲热传导" }], considered: 2 });
+  assert.deepEqual(found, { results: [{ id: "a", why: "讲热传导", page: null }], considered: 2, mode: "catalog" });
 });
 
 test("模型编出来的编号、重复的编号都丢掉", async () => {
@@ -26,7 +26,7 @@ test("模型编出来的编号、重复的编号都丢掉", async () => {
     listJobs: () => jobs,
     ask: async () => '{"results":[{"n":9,"why":"编的"},{"n":2,"why":"是它"},{"n":2,"why":"又一次"}]}',
   });
-  assert.deepEqual(found.results, [{ id: "b", why: "是它" }]);
+  assert.deepEqual(found.results, [{ id: "b", why: "是它", page: null }]);
 });
 
 test("一份都不像：空结果，不报错", async () => {

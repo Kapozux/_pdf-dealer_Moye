@@ -7,7 +7,7 @@ import { fallbackCause, isFallback, outcome, parseAiReason } from "../lib/page-r
 import { explainError, summarizeCauses, type ErrorKind } from "../lib/explain-error.mjs";
 import { newRow, rowsFromSaved, rowsToPayload, type KeyRow } from "../lib/key-pool.mjs";
 import {
-  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPageImageUrl, libraryPdfUrl, listJobs, searchLibrary, findInLibrary, type FoundDoc, type SearchResult,
+  cancelJob, deleteLibraryEntry, fetchLibraryEntry, fetchReflect, fetchSpeed, fetchStats, fetchTagBackfillStatus, fetchUsage, libraryPageImageUrl, libraryPdfUrl, listJobs, searchLibrary, findInLibrary, type FindStep, type FoundDoc, type SearchResult,
   exportZipUrl, fetchLibraryDocumentPdf, imagesToPdf, listBatches, listLibraryItems, markdownToPdf, refineCostPerPage, refineLibraryEntry, startTagBackfill, submitJob, subscribeJobs,
   type Batch, type Job, type Reflect, type ReflectRange, type SpeedTable, type Stats, type TagBackfillState, type Usage, type UsageRow,
 } from "../lib/api";
@@ -364,6 +364,9 @@ function fmtDayGroup(iso: string) {
   const md = `${sameYear ? "" : `${date.getFullYear()}年`}${date.getMonth() + 1}月${date.getDate()}日`;
   return recent ? `${md} 周${"日一二三四五六"[date.getDay()]}` : md;
 }
+
+/** 「问」查正文的一步 → 动词（look.mjs 的命令名） */
+const STEP_VERBS: Record<string, string> = { search: "搜", hits: "找", read: "读", info: "看", list: "列", stats: "数" };
 
 function fmtClock(iso: string) {
   const date = new Date(iso);
@@ -753,8 +756,11 @@ export default function Home() {
   const [libraryError, setLibraryError] = useState("");
   const [query, setQuery] = useState("");
   // 「问」：一句话找文件。结果摆在列表上方，清掉就回到普通列表
-  const [ask, setAsk] = useState<{ status: "idle" | "loading" | "done" | "error"; q: string; results: FoundDoc[]; considered: number; error: string; startedAt: number }>(
-    { status: "idle", q: "", results: [], considered: 0, error: "", startedAt: 0 });
+  // 「问」：steps 是查正文时 Claude 跑过的命令（实时显示，找完折起来）；mode = deep 查了正文 / catalog 只看了目录
+  const [ask, setAsk] = useState<{ status: "idle" | "loading" | "done" | "error"; q: string; results: FoundDoc[]; considered: number; error: string;
+    startedAt: number; endedAt: number; steps: FindStep[]; mode: "deep" | "catalog" | ""; note: string }>(
+    { status: "idle", q: "", results: [], considered: 0, error: "", startedAt: 0, endedAt: 0, steps: [], mode: "", note: "" });
+  const askAbort = useRef<AbortController | null>(null);
   // 合集默认折起来；搜索 / 筛选时全部展开（不然命中的那份藏在折叠里看不到）
   const [openBatches, setOpenBatches] = useState<Set<string>>(new Set());
   // 正文全文搜索的结果（id → 命中），和文件名 / 标签过滤合在一起用；quality 是「有回退页 / 建议复核」筛选
@@ -1917,7 +1923,7 @@ export default function Home() {
   }
 
   /** Library 一行：标题 + 标签、一句话（「问」的结果换成 AI 说的理由）、页数 · 日期 · 质量、⋯ */
-  function renderLibraryRow(record: Job, why?: string) {
+  function renderLibraryRow(record: Job, why?: string, page?: number | null) {
     const quality = qualityBadge(record);
     const tags = parseTags(record.tags).slice(0, 3);
     const hits = textHits.get(record.id);
@@ -1931,14 +1937,14 @@ export default function Home() {
             aria-label={t("选中 {name} 用于合并下载", { name: record.filename })}
           />
         </label>
-        <button className="library-row-open" type="button" onClick={() => openRecord(record)} aria-label={t("打开 {name}", { name: record.filename })}>
+        <button className="library-row-open" type="button" onClick={() => openRecord(record, page ?? undefined)} aria-label={t("打开 {name}", { name: record.filename })}>
           <span className="library-row-title">
             <strong title={record.filename}>{recordTitle(record)}</strong>
             {/* 全过的不标：只给要处理的一个小徽记（Verbatim 那里放引擎名的位置） */}
             {quality.tone !== "good" && <span className={`library-badge ${quality.tone}`}>{quality.text}</span>}
           </span>
           <span className="library-row-sub">
-            {why ? <><b aria-label={t("AI：")}>✦</b>{why}</> : record.ai_one_line || record.preview || t("没有可预览的文字")}
+            {why ? <><b aria-label={t("AI：")}>✦</b>{page ? <em className="library-row-page">{t("第 {n} 页", { n: page })}</em> : null}{why}</> : record.ai_one_line || record.preview || t("没有可预览的文字")}
           </span>
           <span className="library-row-meta">
             {[
@@ -1972,25 +1978,37 @@ export default function Home() {
     );
   }
 
-  /** 「问」：把搜索框里的这句话交给 AI，在整库目录里挑 */
+  /** 「问」：把搜索框里的这句话交给 AI。有本机 Claude Code 时它自己查正文（步骤实时显示），没有就只看目录 */
   async function askLibrary() {
     const q = query.trim();
     if (!q || ask.status === "loading") return;
+    const controller = new AbortController();
+    askAbort.current = controller;
     setNow(Date.now());
-    setAsk({ status: "loading", q, results: [], considered: library.length, error: "", startedAt: Date.now() });
+    setAsk({ status: "loading", q, results: [], considered: library.length, error: "", startedAt: Date.now(), endedAt: 0, steps: [], mode: "", note: "" });
     try {
-      const found = await findInLibrary(q);
-      setAsk((prev) => (prev.q === q ? { ...prev, status: "done", results: found.results, considered: found.considered } : prev));
+      const found = await findInLibrary(q, {
+        signal: controller.signal,
+        onStep: (step) => setAsk((prev) => (prev.q === q ? { ...prev, steps: [...prev.steps, step] } : prev)),
+      });
+      setAsk((prev) => (prev.q === q ? { ...prev, status: "done", results: found.results, considered: found.considered, mode: found.mode, note: found.note || "", endedAt: Date.now() } : prev));
     } catch (caught) {
+      if (controller.signal.aborted) {
+        setAsk((prev) => (prev.q === q ? { ...prev, status: "idle" } : prev));
+        return;
+      }
       const message = caught instanceof Error ? tServer(caught.message) : String(caught);
       console.warn("[问] 失败：", caught);
-      setAsk((prev) => (prev.q === q ? { ...prev, status: "error", error: message } : prev));
+      setAsk((prev) => (prev.q === q ? { ...prev, status: "error", error: message, endedAt: Date.now() } : prev));
+    } finally {
+      if (askAbort.current === controller) askAbort.current = null;
     }
   }
 
-  function openRecord(record: Job) {
+  /** page：「问」查正文时 AI 指到的那一页，直接打开到那页的逐页核对 */
+  function openRecord(record: Job, page?: number) {
     setCameFrom("library");
-    navigate({ name: "doc", id: record.id });   // 结果和原始 PDF 都由 loadDoc 从服务端取
+    navigate(page ? { name: "doc", id: record.id, page } : { name: "doc", id: record.id });   // 结果和原始 PDF 都由 loadDoc 从服务端取
   }
 
   async function removeRecord(record: Job) {
@@ -2167,19 +2185,36 @@ export default function Home() {
             <section className={`library-ask ${ask.status}`} aria-live="polite" aria-label={t("「问」的结果")}>
               <div className="library-ask-head">
                 <span>
-                  {ask.status === "loading" && <><i className="library-ask-spinner" aria-hidden="true" />{t("在 {n} 份文档的目录里找「{q}」… {time}", { n: ask.considered, q: ask.q, time: formatElapsed(now - ask.startedAt) })}</>}
+                  {ask.status === "loading" && <><i className="library-ask-spinner" aria-hidden="true" />{t("在 {n} 份文档里找「{q}」… {time}", { n: ask.considered, q: ask.q, time: formatElapsed(now - ask.startedAt) })}</>}
                   {ask.status === "done" && (ask.results.length
                     ? t("AI 找到 {k} 份像「{q}」的", { k: ask.results.length, q: ask.q })
                     : t("AI 在 {n} 份里没找到像「{q}」的，换个说法试试", { n: ask.considered, q: ask.q }))}
                   {ask.status === "error" && t("没找成：{reason}", { reason: ask.error })}
                 </span>
-                <button type="button" className="quiet-button" onClick={() => setAsk((prev) => ({ ...prev, status: "idle" }))}>{t("收起")}</button>
+                {ask.status === "loading"
+                  ? <button type="button" className="quiet-button" onClick={() => askAbort.current?.abort()}>{t("停止")}</button>
+                  : <button type="button" className="quiet-button" onClick={() => setAsk((prev) => ({ ...prev, status: "idle" }))}>{t("收起")}</button>}
               </div>
+              {/* 查的过程：找的时候一步步列出来，找完折成一行「查了 N 步 · 用时」，点开再看 */}
+              {ask.status === "loading" && ask.steps.length > 0 && (
+                <ol className="library-ask-steps">{ask.steps.map((step, index) => <li key={index}><b>{t(STEP_VERBS[step.k] ?? step.k)}</b>{step.d}</li>)}</ol>
+              )}
+              {ask.status === "done" && (
+                <details className="library-ask-trace">
+                  <summary>
+                    {ask.mode === "catalog"
+                      ? t("只看了标题、简介和标签，没查正文 · {time}", { time: formatElapsed(ask.endedAt - ask.startedAt) })
+                      : t("查了正文 {k} 步 · {time}", { k: ask.steps.length, time: formatElapsed(ask.endedAt - ask.startedAt) })}
+                  </summary>
+                  {ask.steps.length > 0 && <ol className="library-ask-steps">{ask.steps.map((step, index) => <li key={index}><b>{t(STEP_VERBS[step.k] ?? step.k)}</b>{step.d}</li>)}</ol>}
+                </details>
+              )}
+              {ask.status === "done" && ask.note && <p className="library-ask-note">{ask.note}</p>}
               {ask.status === "done" && ask.results.length > 0 && (
                 <div className="library-list">
                   {ask.results.map((found) => {
                     const record = library.find((item) => item.id === found.id);
-                    return record ? renderLibraryRow(record, found.why) : null;
+                    return record ? renderLibraryRow(record, found.why, found.page) : null;
                   })}
                 </div>
               )}
